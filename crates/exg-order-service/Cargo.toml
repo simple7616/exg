@@ -1,0 +1,12 @@
+[package]
+name = "exg-order-service"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+exg-protocol = { workspace = true }
+exg-config = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

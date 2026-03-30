@@ -1,0 +1,13 @@
+[package]
+name = "exg-wallet-service"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+exg-ledger = { workspace = true }
+exg-config = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }

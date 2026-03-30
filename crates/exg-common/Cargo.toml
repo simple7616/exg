@@ -1,0 +1,18 @@
+[package]
+name = "exg-common"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+rkyv = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+rand = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "decimal128"
+harness = false

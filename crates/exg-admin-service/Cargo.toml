@@ -1,0 +1,10 @@
+[package]
+name = "exg-admin-service"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

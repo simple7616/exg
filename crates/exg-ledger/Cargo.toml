@@ -1,0 +1,12 @@
+[package]
+name = "exg-ledger"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tracing = { workspace = true }

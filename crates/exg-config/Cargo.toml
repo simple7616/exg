@@ -1,0 +1,10 @@
+[package]
+name = "exg-config"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+serde = { workspace = true }
+config = { workspace = true }
+thiserror = { workspace = true }

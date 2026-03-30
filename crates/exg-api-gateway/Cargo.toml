@@ -1,0 +1,17 @@
+[package]
+name = "exg-api-gateway"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+exg-protocol = { workspace = true }
+exg-ringbuffer = { workspace = true }
+exg-user-service = { workspace = true }
+exg-config = { workspace = true }
+actix-web = { workspace = true }
+actix-ws = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

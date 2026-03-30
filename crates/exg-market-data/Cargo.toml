@@ -1,0 +1,13 @@
+[package]
+name = "exg-market-data"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+exg-protocol = { workspace = true }
+exg-wal = { workspace = true }
+exg-risk-engine = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

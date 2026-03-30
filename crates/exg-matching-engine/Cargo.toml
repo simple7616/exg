@@ -1,0 +1,23 @@
+[package]
+name = "exg-matching-engine"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+exg-protocol = { workspace = true }
+exg-risk-engine = { workspace = true }
+exg-ringbuffer = { workspace = true }
+exg-wal = { workspace = true }
+serde = { workspace = true }
+rkyv = { workspace = true }
+rustc-hash = { workspace = true }
+core_affinity = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "matching"
+harness = false

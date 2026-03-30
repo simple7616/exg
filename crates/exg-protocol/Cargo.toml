@@ -1,0 +1,9 @@
+[package]
+name = "exg-protocol"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+serde = { workspace = true }
+rkyv = { workspace = true }

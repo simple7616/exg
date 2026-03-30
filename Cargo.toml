@@ -1,0 +1,112 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/exg-common",
+    "crates/exg-protocol",
+    "crates/exg-ringbuffer",
+    "crates/exg-wal",
+    "crates/exg-risk-engine",
+    "crates/exg-matching-engine",
+    "crates/exg-ledger",
+    "crates/exg-order-service",
+    "crates/exg-clearing",
+    "crates/exg-market-data",
+    "crates/exg-api-gateway",
+    "crates/exg-user-service",
+    "crates/exg-wallet-service",
+    "crates/exg-admin-service",
+    "crates/exg-config",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "UNLICENSED"
+repository = "https://github.com/example/exg"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web framework
+actix-web = "4"
+actix-ws = "0.3"
+actix-rt = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rkyv = { version = "0.8", features = ["bytecheck"] }
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "postgres", "uuid", "chrono", "rust_decimal"] }
+
+# Cache
+redis = { version = "0.27", features = ["tokio-comp"] }
+
+# Messaging
+async-nats = "0.38"
+
+# Crypto / Auth
+jsonwebtoken = "9"
+argon2 = "0.5"
+totp-rs = { version = "5", features = ["qr"] }
+hmac = "0.12"
+sha2 = "0.10"
+ed25519-dalek = { version = "2", features = ["serde"] }
+
+# Blockchain
+alloy = { version = "0.9", features = ["full"] }
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+opentelemetry = "0.27"
+
+# Utils
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "2"
+anyhow = "1"
+rustc-hash = "2"
+core_affinity = "0.8"
+crc32fast = "1"
+memmap2 = "0.9"
+config = "0.14"
+rand = "0.8"
+parking_lot = "0.12"
+crossbeam-utils = "0.8"
+bytes = "1"
+
+# Testing
+criterion = { version = "0.5", features = ["html_reports"] }
+
+# Workspace crates
+exg-common = { path = "crates/exg-common" }
+exg-protocol = { path = "crates/exg-protocol" }
+exg-ringbuffer = { path = "crates/exg-ringbuffer" }
+exg-wal = { path = "crates/exg-wal" }
+exg-risk-engine = { path = "crates/exg-risk-engine" }
+exg-matching-engine = { path = "crates/exg-matching-engine" }
+exg-ledger = { path = "crates/exg-ledger" }
+exg-order-service = { path = "crates/exg-order-service" }
+exg-clearing = { path = "crates/exg-clearing" }
+exg-market-data = { path = "crates/exg-market-data" }
+exg-api-gateway = { path = "crates/exg-api-gateway" }
+exg-user-service = { path = "crates/exg-user-service" }
+exg-wallet-service = { path = "crates/exg-wallet-service" }
+exg-admin-service = { path = "crates/exg-admin-service" }
+exg-config = { path = "crates/exg-config" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"

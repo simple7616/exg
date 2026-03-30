@@ -1,0 +1,14 @@
+[package]
+name = "exg-clearing"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+exg-common = { workspace = true }
+exg-protocol = { workspace = true }
+exg-ledger = { workspace = true }
+exg-risk-engine = { workspace = true }
+exg-wal = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

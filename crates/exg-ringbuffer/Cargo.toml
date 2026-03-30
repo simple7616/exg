@@ -1,0 +1,16 @@
+[package]
+name = "exg-ringbuffer"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+memmap2 = { workspace = true }
+crossbeam-utils = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "ringbuffer"
+harness = false
