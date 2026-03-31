@@ -6,8 +6,16 @@ version.workspace = true
 [dependencies]
 exg-common = { workspace = true }
 serde = { workspace = true }
-tokio = { workspace = true }
-tracing = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 jsonwebtoken = { workspace = true }
 argon2 = { workspace = true }
-thiserror = { workspace = true }
+rand = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+rustc-hash = { workspace = true }
+totp-rs = { workspace = true }
+
+[dev-dependencies]

@@ -181,9 +181,11 @@ Price-Time Priority：
 - 多仓追踪止损：追踪最高 Mark Price，触发价 = highest_mark × (1 - callback_rate)
 - 空仓追踪止损：追踪最低 Mark Price，触发价 = lowest_mark × (1 + callback_rate)
 - 激活条件：可选设置 `activation_price`，Mark Price 达到激活价后才开始追踪
+- **状态持久化**：Order 结构体必须持久化 `trailing_peak_price` 字段（多仓为追踪过程中的最高 Mark Price，空仓为最低 Mark Price），用于崩溃恢复后从断点继续追踪，而非从当前 Mark Price 重新开始。WAL 事件中同步记录该字段。
 
 **ICEBERG（冰山单）**：
 - 参数：`total_quantity`（总数量）、`visible_quantity`（每次显示数量）
+- **约束**：`visible_quantity >= lot_size × 10`（防止过小的可见量导致频繁刷新，增加撮合引擎负担并泄露冰山单特征）
 - 当可见部分完全成交后，自动生成新的可见订单（原价格，新时间优先级）
 - 直到 `total_quantity` 全部成交或用户取消
 - OrderBook 中仅显示 `visible_quantity`
@@ -242,7 +244,9 @@ Liquidation Price (Short) = Entry Price × (1 + 1/Leverage - MMR)
 
 ### 3.4.1 ADL（自动减仓）机制
 
-- **排名指标**：盈利率 = (Mark Price - Entry Price) / Entry Price × Leverage × Side
+- **排名指标**：盈利率 = (Mark Price - Entry Price) / Entry Price × Leverage × Side，其中 Side: Long = +1, Short = -1
+  - 示例（空仓）：Entry Price = 50,000, Mark Price = 48,000, Leverage = 10x
+    盈利率 = (48,000 - 50,000) / 50,000 × 10 × (-1) = 0.4 = 40%
 - **执行顺序**：按盈利率从高到低选择对手方
 - **执行价格**：破产价格（Bankruptcy Price）
 - **通知**：ADL 事件实时推送给被减仓用户（WebSocket user data stream + 站内信）
@@ -257,6 +261,16 @@ Price_2 = Index Price + MA(Basis, 5min)
 Price_3 = Index Price
 Index Price = 加权平均(多交易所现货价)
 ```
+
+**Index Price 过期保护**：
+- 当所有外部价格源最后更新时间距当前时刻 > 30 秒，Index Price 标记为 STALE
+- Index Price STALE 时，Mark Price 同步标记为 STALE
+- **Mark Price STALE 期间的行为**：
+  - 暂停强制平仓执行（已排队的强平订单挂起，不撤销）
+  - 暂停资金费率结算（延迟到 Mark Price 恢复后执行）
+  - 暂停新开仓（新订单中 reduce_only=false 的拒绝，reduce_only=true 的允许）
+  - 继续允许撤单和减仓操作
+- Mark Price 恢复后，挂起的操作按原始时间戳顺序补执行
 
 ### 3.6 资金费率
 
@@ -340,8 +354,11 @@ System Accounts:
 **资金费率结算**：
 ```
 正费率（多头付空头）:
+  扣款优先级: Available → Margin（若 Available 不足则从 Margin 扣减，扣减后立即触发保证金率检查，
+             可能导致强平）
   DR Long.Futures.Available  → CR System.FundingPool   (收取)
   DR System.FundingPool      → CR Short.Futures.Available (发放)
+  幂等键: (funding_period_id, user_id, symbol)，防止重启或重放导致重复扣款
 ```
 
 ### 4.4 Invariant

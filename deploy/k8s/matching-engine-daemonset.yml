@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: exg-matching-engine
+  namespace: exg
+  labels:
+    app: exg-matching-engine
+spec:
+  selector:
+    matchLabels:
+      app: exg-matching-engine
+  template:
+    metadata:
+      labels:
+        app: exg-matching-engine
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9000"
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      nodeSelector:
+        node-role.exg.io/matching-engine: "true"
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: matching-engine
+          effect: NoSchedule
+      containers:
+        - name: matching-engine
+          image: exg/server:latest
+          command: ["exg-server", "--mode", "matching-engine"]
+          ports:
+            - containerPort: 9000
+              name: metrics
+              protocol: TCP
+          resources:
+            requests:
+              cpu: "4"
+              memory: 8Gi
+            limits:
+              cpu: "4"
+              memory: 8Gi
+          securityContext:
+            capabilities:
+              add:
+                - SYS_NICE  # for CPU affinity
+          env:
+            - name: RUST_LOG
+              value: "info"
+            - name: EXG_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: wal-data
+              mountPath: /data/wal
+      volumes:
+        - name: wal-data
+          hostPath:
+            path: /data/exg/wal
+            type: DirectoryOrCreate

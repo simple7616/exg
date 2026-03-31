@@ -4,7 +4,9 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-exg-common = { workspace = true }
-serde = { workspace = true }
 config = { workspace = true }
+serde = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

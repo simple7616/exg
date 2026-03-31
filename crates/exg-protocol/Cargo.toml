@@ -7,3 +7,7 @@ version.workspace = true
 exg-common = { workspace = true }
 serde = { workspace = true }
 rkyv = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+rkyv = { workspace = true, features = ["bytecheck"] }

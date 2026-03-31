@@ -1,0 +1,101 @@
+[server]
+host = "127.0.0.1"
+port = 8080
+ws_port = 8081
+admin_port = 9090
+node_id = 1
+
+[database]
+url = "postgres://exg:exg@localhost:5432/exg"
+max_connections = 20
+min_connections = 2
+
+[redis]
+url = "redis://localhost:6379"
+pool_size = 8
+
+[nats]
+url = "nats://localhost:4222"
+
+[wal]
+dir = "./data/wal"
+segment_size_mb = 64
+flush_interval_us = 1000
+flush_every_n = 1000
+
+[ringbuffer]
+slot_count = 65536
+slot_size = 4096
+
+[risk]
+max_orders_per_second = 300
+max_cancels_per_second = 600
+price_band_pct = "0.05"
+max_position_notional = "10000000"
+funding_interval_hours = 8
+interest_rate = "0.0001"
+impact_notional = "200"
+
+# ── Symbols ─────────────────────────────────────────────────────────────────
+
+[[trading.symbols]]
+id = 1
+name = "BTCUSDT"
+base_asset = "BTC"
+quote_asset = "USDT"
+symbol_type = "perpetual_linear"
+status = "trading"
+tick_size = "0.01"
+lot_size = "0.001"
+min_notional = "10"
+max_leverage = "125"
+maker_fee = "0.0002"
+taker_fee = "0.0005"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "0"
+notional_cap = "50000"
+maintenance_margin_rate = "0.004"
+maintenance_amount = "0"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "50000"
+notional_cap = "250000"
+maintenance_margin_rate = "0.005"
+maintenance_amount = "50"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "250000"
+notional_cap = "1000000"
+maintenance_margin_rate = "0.01"
+maintenance_amount = "1300"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "1000000"
+notional_cap = "5000000"
+maintenance_margin_rate = "0.025"
+maintenance_amount = "16300"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "5000000"
+notional_cap = "20000000"
+maintenance_margin_rate = "0.05"
+maintenance_amount = "141300"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "20000000"
+notional_cap = "100000000"
+maintenance_margin_rate = "0.1"
+maintenance_amount = "1141300"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "100000000"
+notional_cap = "200000000"
+maintenance_margin_rate = "0.125"
+maintenance_amount = "3641300"
+
+[[trading.symbols.margin_tiers]]
+notional_floor = "200000000"
+notional_cap = "500000000"
+maintenance_margin_rate = "0.25"
+maintenance_amount = "28641300"

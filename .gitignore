@@ -34,3 +34,6 @@ wal/
 # Logs
 logs/
 *.log
+
+# Claude
+.claude/

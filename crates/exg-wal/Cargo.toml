@@ -4,14 +4,13 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
-memmap2 = { workspace = true }
 crc32fast = { workspace = true }
 thiserror = { workspace = true }
-parking_lot = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-tempfile = "3"
+tempfile = { workspace = true }
 
 [[bench]]
 name = "wal"

@@ -1,0 +1,8 @@
+target/
+.git/
+*.md
+.claude/
+web/trading/node_modules/
+web/trading/.next/
+web/admin/node_modules/
+web/admin/.next/

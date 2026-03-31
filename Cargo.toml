@@ -16,6 +16,7 @@ members = [
     "crates/exg-wallet-service",
     "crates/exg-admin-service",
     "crates/exg-config",
+    "crates/exg-server",
 ]
 
 [workspace.package]
@@ -82,6 +83,7 @@ bytes = "1"
 
 # Testing
 criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3"
 
 # Workspace crates
 exg-common = { path = "crates/exg-common" }

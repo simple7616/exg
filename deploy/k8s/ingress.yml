@@ -1,0 +1,36 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: exg-ingress
+  namespace: exg
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+    nginx.ingress.kubernetes.io/websocket-services: "exg-server"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.exg.io
+        - ws.exg.io
+        - admin.exg.io
+      secretName: exg-tls-secret
+  rules:
+    - host: api.exg.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: exg-server
+                port:
+                  name: http
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: exg-server
+                port:
+                  name: ws

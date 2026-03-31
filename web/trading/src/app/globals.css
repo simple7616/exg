@@ -1,0 +1,23 @@
+@import "tailwindcss";
+
+@theme inline {
+  --color-background: #0B0E11;
+  --color-card: #1E2329;
+  --color-border: #2B3139;
+  --color-primary: #EAECEF;
+  --color-secondary: #848E9C;
+  --color-green: #0ECB81;
+  --color-red: #F6465D;
+  --color-accent: #F0B90B;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2B3139 transparent;
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-primary);
+  font-family: system-ui, -apple-system, sans-serif;
+}

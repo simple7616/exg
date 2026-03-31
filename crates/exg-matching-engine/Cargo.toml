@@ -10,6 +10,7 @@ exg-risk-engine = { workspace = true }
 exg-ringbuffer = { workspace = true }
 exg-wal = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 rkyv = { workspace = true }
 rustc-hash = { workspace = true }
 core_affinity = { workspace = true }
