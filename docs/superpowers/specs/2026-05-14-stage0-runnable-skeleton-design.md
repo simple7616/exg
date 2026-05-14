@@ -77,6 +77,8 @@ The consumer is moved (not shared) into the matching thread closure — there is
 1. `tracing_subscriber::fmt().with_env_filter(RUST_LOG||"info").json().init()`
 2. `ExgConfig::load("config/default.toml")` → `validate()` → panic on failure
 3. **Host-binding invariant**: assert `cfg.server.host ∈ {"127.0.0.1", "::1", "localhost"}`. Stage 0 has no auth — binding to a public interface would let any attacker forge `X-User-Id`. Violation panics at startup with a clear message. This assert is removed in Stage 1 once JWT middleware lands.
+3a. **Symbol whitelist invariant**: assert `cfg.trading.symbols.len() == 1`. Stage 0's `MatchingEngine` is single-symbol; silently dropping additional config entries is a footgun. Violation panics. Stage 2 (multi-symbol routing) removes this assert.
+3b. **WAL freshness invariant**: assert the WAL dir is empty (or does not exist). If it contains prior segments, `WalWriter::open` would append-continue the sequence, splicing fresh in-memory state onto an old event timeline silently. Stage 0 has no replay, so this would produce a Frankenstein WAL that confuses Stage 1's future replay. Violation panics with a message instructing the operator to clear the WAL dir. Stage 1 (snapshot + replay) replaces this assert with a real recovery path.
 4. Build `exg_wal::WalConfig` from `cfg.wal` (convert `segment_size_mb` → bytes)
 5. `WalWriter::open(wal_cfg)` → `Arc<Mutex<WalWriter>>`
 6. `RingBuffer::new(slot_count, slot_size)` → `split()` → `(Producer, Consumer)`
@@ -251,6 +253,9 @@ Production-grade instrumentation lands in Stage 7, but Stage 0 still needs enoug
 | `exg-api-gateway/src/state.rs` | `AppState::clone` shares the same `Producer` lock and snowflake |
 | `exg-wal-dump` | given a temp WAL with 3 known events, the dump helper outputs 3 JSON lines with correct field values |
 | `exg-protocol` (new property test) | for every `Command` variant constructed at maximal-field size (e.g. NewOrder with Iceberg + StopLimit + leverage + client_order_id), `rkyv::to_bytes(&cmd).len() <= 4096`. Catches the hidden coupling between protocol field growth and `cfg.ringbuffer.slot_size`. |
+| `exg-api-gateway::handlers` | `X-User-Id: abc` (non-numeric) → 401 code=-2014 (covers the parse-fail branch separately from missing-header). |
+| `exg-wal-dump` (extended) | (a) corrupting one byte mid-record → dump tool exits non-zero, stderr mentions corruption. (b) empty WAL dir → exit 0, zero output lines. (c) `--from-seq 5` over an 8-event WAL → exactly 3 output lines starting at sequence 5. |
+| `exg-server` boot-panic suite (§9 invariants 1-4 guards) | Four `#[test]`s that spawn `cargo run -p exg-server` (or call an extracted `run_with_config(cfg)` library function) with specific malformed configs and assert panic/exit:<br>(a) `EXG_SERVER_HOST=0.0.0.0` → panic mentioning host invariant<br>(b) WAL dir pre-populated with a segment → panic mentioning WAL freshness<br>(c) `cfg.trading.symbols.len() == 2` → panic mentioning symbol whitelist<br>(d) `cfg.trading.symbols[0].mark_price = "-1"` → `ExgConfig::validate` returns error, `main` panics with the validation message.<br>Implementation note: extract `pub fn run_with_config(cfg) -> Handle` from `main` so tests can call it directly without spawning a subprocess; subprocess form is acceptable but `cargo build --bin exg-server` becomes a test prerequisite. |
 
 ### 8.2 Integration test
 
@@ -259,6 +264,7 @@ Production-grade instrumentation lands in Stage 7, but Stage 0 still needs enoug
 - **Backpressure**: spin up the server with `cfg.ringbuffer.slot_count = 4` (override for test), block the matching thread (e.g. send a sentinel command the test holds), then fire 5 concurrent `POST /order` requests. The 5th should respond `503` with `code = -1015`.
 - **IDOR**: place an order as `X-User-Id: 42`, then send `POST /order/cancel` for that `order_id` with `X-User-Id: 999`. The cancel should produce an `OrderRejected { OrderNotFound }` event in WAL; the original order must remain (verifiable by a subsequent legitimate cancel that succeeds).
 - **Shutdown ordering**: fire N concurrent `POST /order`, then `SIGTERM` mid-flight; assert WAL contains exactly the events for the requests that received `200 ACCEPTED` (no fewer, no more) — see §4.6.
+- **Duplicate `client_order_id` is accepted twice**: fire two `POST /order` with identical `client_order_id`, assert both responses `200 ACCEPTED` with distinct `orderId`s, and both `OrderAccepted` events land in WAL. Guards invariant §9 #9 against future silent dedup additions.
 
 ### 8.3 Demo script
 
@@ -293,6 +299,7 @@ Drawn from `CLAUDE.md` and the original system spec — violations block merge r
 7. `gen` is reserved in Rust 2024 — use `id_gen` / `sf` / `rng` for generator variable names.
 8. **IDOR guard**: when `MatchingEngine` processes `CancelOrder` / `AmendOrder`, if the command's `user_id` does not match the order owner recorded in the orderbook, it must emit `OrderRejected { OrderNotFound }` and leave the order untouched. Stage 0 has no auth, so an attacker forging `X-User-Id` must not be able to cancel another user's resting orders even on a local host. (If the engine's current implementation already enforces this, the integration test below merely verifies it; if not, this is a bug to fix as part of Stage 0.)
 9. **Duplicate `client_order_id` are NOT deduplicated** in Stage 0. Two POSTs with identical `client_order_id` create two distinct `order_id`s. Stage 1+ adds dedup at the auth/middleware layer once a per-user index exists. Clients in Stage 0 must not rely on `client_order_id` for idempotency.
+10. **Two distinct sequence counters exist** — do not conflate them. `MatchingEngine.sequence` (engine internal, command count, increments per `process_command` call) is logically separate from the WAL byte-stream sequence (`WalWriter::current_sequence`, event write index). Most spec references to "sequence" mean the WAL sequence (the one `WalReader::read_from(seq, ...)` and `exg-wal-dump --from-seq <N>` use). When a future spec needs to reference engine-internal `sequence`, qualify it as "engine command sequence" explicitly.
 
 ## 10. Open Questions (resolved during plan stage, not blocking spec approval)
 
@@ -310,3 +317,15 @@ When Stage 1 lands, the following Stage 0 shortcuts must be replaced:
 - `client_order_id` deduplication (per §9 invariant 9) added at the auth/middleware layer when a per-user index becomes available.
 
 These are explicit forward-pointers, not Stage 0 technical debt.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (HOLD_SCOPE) | mode: HOLD_SCOPE, 0 critical gaps, 6 findings raised+fixed |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (FULL_REVIEW) | 9 issues raised, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | n/a (no UI scope) |
+| Outside Voice | `/codex` plan review | Independent 2nd opinion | 0 | SKIPPED | offered, user deferred |
+
+- **UNRESOLVED:** 0 across all reviews.
+- **VERDICT:** CEO + Eng CLEARED — ready for implementation plan. Next: `superpowers:writing-plans` to produce the step-by-step task list, then TDD implementation.
