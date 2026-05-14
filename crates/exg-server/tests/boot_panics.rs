@@ -30,7 +30,13 @@ async fn boot_panics_on_non_loopback_host() {
 async fn boot_panics_on_multiple_symbols() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = base_cfg(tmp.path());
-    let extra = cfg.trading.symbols[0].clone();
+    // Give the duplicate a distinct id + name so ExgConfig::validate (now
+    // called from inside run_with_config) doesn't trip on its duplicate-id
+    // check before the symbol-count check fires. This test verifies the
+    // count check specifically.
+    let mut extra = cfg.trading.symbols[0].clone();
+    extra.id = 2;
+    extra.name = "ETHUSDT".into();
     cfg.trading.symbols.push(extra);
     let result = exg_server::run_with_config(cfg).await;
     let err = result.err().expect("expected Err from run_with_config");
@@ -67,10 +73,11 @@ async fn boot_panics_on_invalid_mark_price() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = base_cfg(tmp.path());
     cfg.trading.symbols[0].mark_price = "-1".into();
-    // ExgConfig::validate should reject this. Boot path doesn't call validate
-    // explicitly (config::Builder::try_deserialize runs it only via the load
-    // path), so call it directly to confirm.
-    let err = cfg.validate().unwrap_err();
-    let msg = format!("{err}");
+    // run_with_config now calls ExgConfig::validate(), so the boot path
+    // itself rejects an invalid mark price — covering the in-process /
+    // programmatic-mutation path as well as the file-load path.
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err from run_with_config");
+    let msg = format!("{err:#}");
     assert!(msg.contains("mark_price"), "got: {msg}");
 }

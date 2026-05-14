@@ -44,6 +44,7 @@ pub struct AmendOrderRequest {
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CancelOrderResponse {
     pub order_id: String,
     pub symbol: String,

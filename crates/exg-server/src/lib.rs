@@ -73,6 +73,13 @@ impl ServerHandle {
 // ── Startup invariant validation (spec §4.5) ──────────────────────────────
 
 fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
+    // Invariant 0: structural config validation (decimal parses, ranges, etc.)
+    // ExgConfig::load runs this automatically, but in-process callers
+    // (notably integration tests and Stage 1 reload paths) construct
+    // ExgConfig values programmatically and bypass load. Run it here so the
+    // invariant holds regardless of the construction path.
+    cfg.validate().with_context(|| "config validation failed")?;
+
     // Invariant 1: host must be loopback (Stage 0 — no external exposure).
     let host = &cfg.server.host;
     match host.as_str() {
@@ -230,45 +237,47 @@ pub async fn run_with_config(cfg: ExgConfig) -> anyhow::Result<ServerHandle> {
 
             let mut buf = vec![0u8; slot_size];
 
-            loop {
-                // Check shutdown flag first.
-                if matching_shutdown.load(Ordering::Acquire) {
-                    // Final WAL flush before exit (spec §4.6 step 5).
-                    if let Err(e) = matching_wal.lock().flush() {
-                        error!("matching thread: final WAL flush failed: {e}");
+            // Inline closure that processes one popped command. Used both on
+            // the steady-state path and during the post-shutdown drain so the
+            // logic stays in one place.
+            let mut process_one = |n: usize, buf: &[u8]| {
+                let owned: Vec<u8> = buf[..n].to_vec();
+                let cmd: Command = match rkyv::from_bytes::<Command, rkyv::rancor::Error>(&owned) {
+                    Ok(c) => c,
+                    Err(e) => panic!("matching thread: rkyv decode Command failed: {e}"),
+                };
+                let events: Vec<Event> = engine.process_command(&cmd);
+                for evt in &events {
+                    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(evt) {
+                        Ok(b) => b,
+                        Err(e) => panic!("matching thread: rkyv encode Event failed: {e}"),
+                    };
+                    if let Err(e) = matching_wal.lock().append(&bytes) {
+                        panic!("matching thread: WAL append failed: {e}");
                     }
-                    info!("matching thread: shutdown complete");
-                    return;
                 }
+            };
 
+            loop {
                 match consumer.try_pop(&mut buf) {
-                    Ok(n) => {
-                        // rkyv alignment: use an owned Vec to guarantee alignment.
-                        let owned: Vec<u8> = buf[..n].to_vec();
-                        let cmd: Command =
-                            match rkyv::from_bytes::<Command, rkyv::rancor::Error>(&owned) {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    panic!("matching thread: rkyv decode Command failed: {e}");
-                                }
-                            };
-
-                        let events: Vec<Event> = engine.process_command(&cmd);
-
-                        for evt in &events {
-                            let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(evt) {
-                                Ok(b) => b,
-                                Err(e) => {
-                                    panic!("matching thread: rkyv encode Event failed: {e}");
-                                }
-                            };
-                            if let Err(e) = matching_wal.lock().append(&bytes) {
-                                panic!("matching thread: WAL append failed: {e}");
-                            }
-                        }
-                    }
+                    Ok(n) => process_one(n, &buf),
                     Err(exg_ringbuffer::RingBufferError::Empty) => {
-                        // No messages — spin hint then re-check.
+                        // Only consult shutdown_flag when ring buffer is empty.
+                        // This guarantees the drain semantic: HTTP 200 means
+                        // the command sits in the ring buffer, and the
+                        // matching thread will not exit until every such
+                        // command has been popped and WAL-appended. Checking
+                        // the flag at the top of the loop would race with
+                        // last-millisecond pushes (spec §4.6 step 4).
+                        if matching_shutdown.load(Ordering::Acquire) {
+                            // Final WAL flush before exit (spec §4.6 step 5).
+                            if let Err(e) = matching_wal.lock().flush() {
+                                error!("matching thread: final WAL flush failed: {e}");
+                            }
+                            info!("matching thread: shutdown complete");
+                            return;
+                        }
+                        // No messages and no shutdown — spin hint and retry.
                         std::hint::spin_loop();
                     }
                     Err(e) => {
