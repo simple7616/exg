@@ -89,22 +89,23 @@ fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
     }
 
     // Invariant 3: WAL directory must be empty or not yet created.
+    // Stage 0 has no replay/snapshot; an existing WAL would silently splice
+    // a fresh in-memory state onto an old event timeline. Reject anything
+    // resembling prior data: WAL segments are `wal-N.log`, snapshots are
+    // `snapshot-*`. We treat ANY file in the dir as evidence of prior use
+    // (including stray `.DS_Store`, sentinels from tests, etc.) — the
+    // operator must clear the dir to confirm intent.
     let wal_dir = PathBuf::from(&cfg.wal.dir);
     if wal_dir.exists() {
-        let segment_count = std::fs::read_dir(&wal_dir)
+        let entry_count = std::fs::read_dir(&wal_dir)
             .with_context(|| format!("cannot read WAL dir: {}", wal_dir.display()))?
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".wal")
-            })
             .count();
-        if segment_count > 0 {
+        if entry_count > 0 {
             bail!(
-                "WAL directory {} is non-empty ({} segment(s)); Stage 0 requires a fresh WAL",
+                "WAL directory {} is non-empty ({} entries); Stage 0 requires a fresh WAL. Clear the dir or pick a new path. (Spec §4.5 step 3b.)",
                 wal_dir.display(),
-                segment_count
+                entry_count
             );
         }
     }
