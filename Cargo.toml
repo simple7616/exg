@@ -5,6 +5,7 @@ members = [
     "crates/exg-protocol",
     "crates/exg-ringbuffer",
     "crates/exg-wal",
+    "crates/exg-wal-dump",
     "crates/exg-risk-engine",
     "crates/exg-matching-engine",
     "crates/exg-ledger",
@@ -90,6 +91,7 @@ exg-common = { path = "crates/exg-common" }
 exg-protocol = { path = "crates/exg-protocol" }
 exg-ringbuffer = { path = "crates/exg-ringbuffer" }
 exg-wal = { path = "crates/exg-wal" }
+exg-wal-dump = { path = "crates/exg-wal-dump" }
 exg-risk-engine = { path = "crates/exg-risk-engine" }
 exg-matching-engine = { path = "crates/exg-matching-engine" }
 exg-ledger = { path = "crates/exg-ledger" }

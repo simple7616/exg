@@ -1,11 +1,17 @@
+pub mod app_factory;
 pub mod conversion;
 pub mod error;
+pub mod handlers;
 pub mod middleware;
+pub mod state;
 pub mod types;
 pub mod ws;
 
 pub use conversion::*;
-pub use error::{ApiError, ERR_INSUFFICIENT_BALANCE, ERR_INVALID_PARAMETER, ERR_ORDER_NOT_FOUND, ERR_TOO_MANY_REQUESTS, ERR_UNAUTHORIZED, ERR_UNKNOWN};
+pub use error::{
+    ApiError, ERR_INSUFFICIENT_BALANCE, ERR_INVALID_PARAMETER, ERR_ORDER_NOT_FOUND,
+    ERR_TOO_MANY_REQUESTS, ERR_UNAUTHORIZED, ERR_UNKNOWN,
+};
 pub use middleware::{ApiKeyAuth, RateLimiter, validate_timestamp};
 pub use types::*;
 pub use ws::{SubscriptionManager, WsRequest, WsResponse, parse_stream_name};
@@ -13,7 +19,7 @@ pub use ws::{SubscriptionManager, WsRequest, WsResponse, parse_stream_name};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exg_common::{OrderId, OrderType, Side, TimeInForce, UnixMicros, UserId};
+    use exg_common::{OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
     use exg_protocol::Command;
 
     // ── Conversion tests ─────────────────────────────────────────────────
@@ -33,15 +39,17 @@ mod tests {
         };
 
         let user_id = UserId::new(42);
+        let symbol = SymbolId::new(1);
         let order_id = OrderId::new(1001);
         let ts = UnixMicros::from_micros(1_700_000_000_000_000);
 
-        let cmd = to_new_order_command(&req, user_id, order_id, ts).unwrap();
+        let cmd = to_new_order_command(&req, user_id, symbol, order_id, ts).unwrap();
 
         match cmd {
             Command::NewOrder {
                 order_id: oid,
                 user_id: uid,
+                symbol: sid,
                 side,
                 order_type,
                 time_in_force,
@@ -53,6 +61,7 @@ mod tests {
             } => {
                 assert_eq!(oid, OrderId::new(1001));
                 assert_eq!(uid, UserId::new(42));
+                assert_eq!(sid, SymbolId::new(1));
                 assert_eq!(side, Side::Buy);
                 assert_eq!(order_type, OrderType::Limit);
                 assert_eq!(time_in_force, TimeInForce::Gtc);
@@ -82,6 +91,7 @@ mod tests {
         let cmd = to_new_order_command(
             &req,
             UserId::new(1),
+            SymbolId::new(1),
             OrderId::new(2),
             UnixMicros::from_micros(0),
         )
@@ -137,12 +147,17 @@ mod tests {
         let result = to_new_order_command(
             &req,
             UserId::new(1),
+            SymbolId::new(1),
             OrderId::new(1),
             UnixMicros::from_micros(0),
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.msg.contains("price"), "Error should mention price: {}", err.msg);
+        assert!(
+            err.msg.contains("price"),
+            "Error should mention price: {}",
+            err.msg
+        );
     }
 
     // ── Rate limiter tests ───────────────────────────────────────────────
@@ -251,7 +266,10 @@ mod tests {
     fn test_subscription_manager_subscribe_and_get_clients() {
         let mut mgr = SubscriptionManager::new();
 
-        let newly = mgr.subscribe(1, &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()]);
+        let newly = mgr.subscribe(
+            1,
+            &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()],
+        );
         assert_eq!(newly.len(), 2);
 
         // Re-subscribing should not return duplicates
@@ -273,7 +291,10 @@ mod tests {
     #[test]
     fn test_subscription_manager_unsubscribe_and_remove_client() {
         let mut mgr = SubscriptionManager::new();
-        mgr.subscribe(1, &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()]);
+        mgr.subscribe(
+            1,
+            &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()],
+        );
         mgr.subscribe(2, &["btcusdt@depth20".to_owned()]);
 
         // Unsubscribe client 1 from one stream
@@ -302,6 +323,84 @@ mod tests {
         assert_eq!(parse_stream_name("invalid"), None);
         assert_eq!(parse_stream_name("@channel"), None);
         assert_eq!(parse_stream_name("symbol@"), None);
+    }
+
+    // ── Cancel / Amend conversion tests ─────────────────────────────────
+
+    #[test]
+    fn to_cancel_order_command_happy() {
+        let req = CancelOrderRequest {
+            order_id: 12345,
+            symbol: "BTCUSDT".into(),
+        };
+        let cmd = to_cancel_order_command(
+            &req,
+            UserId::new(42),
+            SymbolId::new(1),
+            UnixMicros::from_micros(1),
+        )
+        .unwrap();
+        match cmd {
+            Command::CancelOrder {
+                order_id,
+                user_id,
+                symbol,
+                ..
+            } => {
+                assert_eq!(order_id, OrderId::new(12345));
+                assert_eq!(user_id, UserId::new(42));
+                assert_eq!(symbol, SymbolId::new(1));
+            }
+            _ => panic!("expected CancelOrder"),
+        }
+    }
+
+    #[test]
+    fn to_amend_order_command_happy_price_only() {
+        let req = AmendOrderRequest {
+            order_id: 99,
+            symbol: "BTCUSDT".into(),
+            new_price: Some("60500".into()),
+            new_quantity: None,
+        };
+        let cmd = to_amend_order_command(
+            &req,
+            UserId::new(7),
+            SymbolId::new(1),
+            UnixMicros::from_micros(2),
+        )
+        .unwrap();
+        match cmd {
+            Command::AmendOrder {
+                order_id,
+                new_price,
+                new_quantity,
+                ..
+            } => {
+                assert_eq!(order_id, OrderId::new(99));
+                assert!(new_price.is_some());
+                assert!(new_quantity.is_none());
+            }
+            _ => panic!("expected AmendOrder"),
+        }
+    }
+
+    #[test]
+    fn to_amend_order_command_rejects_empty_amend() {
+        let req = AmendOrderRequest {
+            order_id: 99,
+            symbol: "BTCUSDT".into(),
+            new_price: None,
+            new_quantity: None,
+        };
+        let err = to_amend_order_command(
+            &req,
+            UserId::new(7),
+            SymbolId::new(1),
+            UnixMicros::from_micros(2),
+        )
+        .unwrap_err();
+        assert!(err.msg.contains("at least one of"), "msg: {}", err.msg);
     }
 
     // ── API error tests ──────────────────────────────────────────────────

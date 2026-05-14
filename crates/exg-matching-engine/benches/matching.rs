@@ -24,13 +24,7 @@ fn test_config() -> SymbolConfig {
     }
 }
 
-fn make_new_order(
-    id: u64,
-    user: u64,
-    side: Side,
-    price: &str,
-    qty: &str,
-) -> Command {
+fn make_new_order(id: u64, user: u64, side: Side, price: &str, qty: &str) -> Command {
     Command::NewOrder {
         order_id: OrderId::new(id),
         user_id: UserId::new(user),
@@ -112,7 +106,12 @@ fn bench_insert_and_match_all(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_single_match, bench_insert_and_match_all, bench_100k_orders);
+criterion_group!(
+    benches,
+    bench_single_match,
+    bench_insert_and_match_all,
+    bench_100k_orders
+);
 criterion_main!(benches);
 
 fn bench_100k_orders(c: &mut Criterion) {

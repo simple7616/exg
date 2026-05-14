@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 // ── Order endpoints ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaceOrderRequest {
     pub symbol: String,
     pub side: String,
@@ -15,32 +16,52 @@ pub struct PlaceOrderRequest {
     pub client_order_id: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaceOrderResponse {
+    /// Stringified u64 per Binance convention (avoids JS 53-bit precision loss).
     pub order_id: String,
-    pub client_order_id: Option<String>,
-    pub symbol: String,
-    pub side: String,
-    pub order_type: String,
-    pub quantity: String,
-    pub price: Option<String>,
-    pub status: String,
-    pub timestamp: u64,
+    pub client_order_id: Option<u64>,
+    pub status: &'static str,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CancelOrderRequest {
+    /// Server-generated order ID returned by the place call.
+    pub order_id: u64,
     pub symbol: String,
-    pub order_id: Option<String>,
-    pub client_order_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AmendOrderRequest {
+    pub order_id: u64,
+    pub symbol: String,
+    /// Decimal as string, e.g. "59500".
+    pub new_price: Option<String>,
+    pub new_quantity: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CancelOrderResponse {
     pub order_id: String,
     pub symbol: String,
     pub status: String,
     pub timestamp: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AckResponse {
+    pub order_id: String,
+    pub status: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
 }
 
 // ── Account endpoints ────────────────────────────────────────────────────

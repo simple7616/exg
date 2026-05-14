@@ -212,9 +212,21 @@ mod tests {
         let base = 1_000_000_000_000u64;
 
         agg.add_trade(dec("100"), dec("1"), UnixMicros::from_micros(base));
-        agg.add_trade(dec("110"), dec("2"), UnixMicros::from_micros(base + 100_000));
-        agg.add_trade(dec("90"), dec("0.5"), UnixMicros::from_micros(base + 200_000));
-        agg.add_trade(dec("105"), dec("3"), UnixMicros::from_micros(base + 300_000));
+        agg.add_trade(
+            dec("110"),
+            dec("2"),
+            UnixMicros::from_micros(base + 100_000),
+        );
+        agg.add_trade(
+            dec("90"),
+            dec("0.5"),
+            UnixMicros::from_micros(base + 200_000),
+        );
+        agg.add_trade(
+            dec("105"),
+            dec("3"),
+            UnixMicros::from_micros(base + 300_000),
+        );
 
         let kline = agg.current_kline(KlineInterval::S1).unwrap();
         assert_eq!(kline.open, dec("100"));
@@ -261,7 +273,11 @@ mod tests {
         // Trade 1: price=100, qty=2 → quote=200
         agg.add_trade(dec("100"), dec("2"), UnixMicros::from_micros(base));
         // Trade 2: price=150, qty=3 → quote=450
-        agg.add_trade(dec("150"), dec("3"), UnixMicros::from_micros(base + 100_000));
+        agg.add_trade(
+            dec("150"),
+            dec("3"),
+            UnixMicros::from_micros(base + 100_000),
+        );
 
         let kline = agg.current_kline(KlineInterval::M1).unwrap();
         assert_eq!(kline.volume, dec("5"));

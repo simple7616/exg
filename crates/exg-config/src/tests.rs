@@ -36,8 +36,8 @@ fn test_env_override() {
     // SAFETY: This test is single-threaded with respect to this env var name.
     unsafe { std::env::set_var("TESTCFG1_SERVER_PORT", "9999") };
 
-    let cfg = ExgConfig::load_with_prefix(&path, "TESTCFG1")
-        .expect("should load with env override");
+    let cfg =
+        ExgConfig::load_with_prefix(&path, "TESTCFG1").expect("should load with env override");
     assert_eq!(cfg.server.port, 9999);
 
     // SAFETY: Restoring env state; no concurrent readers of this var.
@@ -108,7 +108,10 @@ fn test_duplicate_symbol_ids() {
     // Same id=1
     cfg.trading.symbols.push(dup);
     let err = cfg.validate().unwrap_err();
-    assert!(err.to_string().contains("duplicate symbol id"), "error: {err}");
+    assert!(
+        err.to_string().contains("duplicate symbol id"),
+        "error: {err}"
+    );
 }
 
 #[test]
@@ -141,6 +144,29 @@ fn test_toml_parsing_all_types() {
     assert_eq!(cfg.ringbuffer.slot_count, 65536);
     assert_eq!(cfg.risk.funding_interval_hours, 8);
     assert_eq!(cfg.trading.symbols[0].margin_tiers.len(), 2);
+}
+
+#[test]
+fn test_symbol_mark_price_field_parses() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.trading.symbols[0].mark_price = "60000".into();
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn test_symbol_mark_price_must_be_positive() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.trading.symbols[0].mark_price = "0".into();
+    let err = cfg.validate().unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("mark_price"), "msg: {msg}");
+}
+
+#[test]
+fn test_symbol_mark_price_must_parse_as_decimal() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.trading.symbols[0].mark_price = "not-a-number".into();
+    assert!(cfg.validate().is_err());
 }
 
 /// Write a minimal valid TOML config for testing.
@@ -197,6 +223,7 @@ min_notional = "10"
 max_leverage = "125"
 maker_fee = "0.0002"
 taker_fee = "0.0005"
+mark_price = "60000"
 
 [[trading.symbols.margin_tiers]]
 notional_floor = "0"

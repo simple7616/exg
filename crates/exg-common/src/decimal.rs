@@ -14,7 +14,18 @@ const SCALE_DIGITS: u32 = 18;
 ///
 /// Range: roughly ±1.7 × 10^20 (the integer part can be up to ~170 quintillion).
 /// This covers any realistic price, quantity, or balance in a perpetual futures exchange.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Hash,
+    Default,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[rkyv(derive(Debug))]
 pub struct Decimal128 {
     /// Raw value = real_value × 10^18
@@ -132,20 +143,12 @@ impl Decimal128 {
 
     #[inline]
     pub const fn min(self, other: Self) -> Self {
-        if self.raw <= other.raw {
-            self
-        } else {
-            other
-        }
+        if self.raw <= other.raw { self } else { other }
     }
 
     #[inline]
     pub const fn max(self, other: Self) -> Self {
-        if self.raw >= other.raw {
-            self
-        } else {
-            other
-        }
+        if self.raw >= other.raw { self } else { other }
     }
 }
 
@@ -312,7 +315,8 @@ impl Mul for Decimal128 {
 
     #[inline]
     fn mul(self, rhs: Self) -> Self {
-        self.checked_mul(rhs).expect("Decimal128 multiplication overflow")
+        self.checked_mul(rhs)
+            .expect("Decimal128 multiplication overflow")
     }
 }
 
@@ -321,7 +325,8 @@ impl Div for Decimal128 {
 
     #[inline]
     fn div(self, rhs: Self) -> Self {
-        self.checked_div(rhs).expect("Decimal128 division by zero or overflow")
+        self.checked_div(rhs)
+            .expect("Decimal128 division by zero or overflow")
     }
 }
 
@@ -774,7 +779,10 @@ mod tests {
     #[test]
     fn test_display_trailing_zeros_trimmed() {
         assert_eq!(dec("1.100").to_string(), "1.1");
-        assert_eq!(dec("3.000000000000000001").to_string(), "3.000000000000000001");
+        assert_eq!(
+            dec("3.000000000000000001").to_string(),
+            "3.000000000000000001"
+        );
     }
 
     // ── FromStr ─────────────────────────────────────────────────────

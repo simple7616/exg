@@ -3,7 +3,19 @@ use serde::{Deserialize, Serialize};
 // ── Side ────────────────────────────────────────────────────────────────
 
 /// Order / position side.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum Side {
@@ -34,7 +46,19 @@ impl Side {
 // ── OrderType ───────────────────────────────────────────────────────────
 
 /// Supported order types.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum OrderType {
@@ -83,7 +107,19 @@ impl OrderType {
 // ── OrderStatus ─────────────────────────────────────────────────────────
 
 /// Order lifecycle status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum OrderStatus {
@@ -116,14 +152,29 @@ impl OrderStatus {
     /// Whether the order is active on the book or awaiting trigger.
     #[inline]
     pub const fn is_active(self) -> bool {
-        matches!(self, Self::New | Self::PartiallyFilled | Self::PendingTrigger)
+        matches!(
+            self,
+            Self::New | Self::PartiallyFilled | Self::PendingTrigger
+        )
     }
 }
 
 // ── TimeInForce ─────────────────────────────────────────────────────────
 
 /// Time-in-force policies.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum TimeInForce {
@@ -142,7 +193,19 @@ pub enum TimeInForce {
 // ── MarginMode ──────────────────────────────────────────────────────────
 
 /// Margin mode for a position.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum MarginMode {
@@ -155,7 +218,19 @@ pub enum MarginMode {
 // ── PositionSide ────────────────────────────────────────────────────────
 
 /// Position direction in hedge mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum PositionSide {
@@ -182,7 +257,19 @@ impl PositionSide {
 // ── SymbolType ──────────────────────────────────────────────────────────
 
 /// Type of trading pair / contract.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum SymbolType {
@@ -197,7 +284,19 @@ pub enum SymbolType {
 // ── SymbolStatus ────────────────────────────────────────────────────────
 
 /// Trading status of a symbol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 #[rkyv(derive(Debug))]
 pub enum SymbolStatus {

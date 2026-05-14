@@ -1,8 +1,10 @@
-use exg_common::{Decimal128, MarginMode, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
+use exg_common::{
+    Decimal128, MarginMode, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId,
+};
 use exg_protocol::Command;
 
 use crate::error::ApiError;
-use crate::types::PlaceOrderRequest;
+use crate::types::{AmendOrderRequest, CancelOrderRequest, PlaceOrderRequest};
 
 // ── Side conversion ──────────────────────────────────────────────────────
 
@@ -89,6 +91,7 @@ fn parse_decimal(s: &str, field: &str) -> Result<Decimal128, ApiError> {
 pub fn to_new_order_command(
     req: &PlaceOrderRequest,
     user_id: UserId,
+    symbol: SymbolId,
     order_id: OrderId,
     timestamp: UnixMicros,
 ) -> Result<Command, ApiError> {
@@ -121,10 +124,6 @@ pub fn to_new_order_command(
         .map(|p| parse_decimal(p, "stop_price"))
         .transpose()?;
 
-    // Symbol is passed as string in the API; we use SymbolId(0) as placeholder.
-    // Real symbol resolution happens at the gateway layer with a symbol registry.
-    let symbol = SymbolId::new(0);
-
     let client_order_id = req
         .client_order_id
         .as_deref()
@@ -151,5 +150,56 @@ pub fn to_new_order_command(
         leverage: None,
         client_order_id,
         timestamp,
+    })
+}
+
+// ── CancelOrderRequest -> Command::CancelOrder ───────────────────────────
+
+pub fn to_cancel_order_command(
+    req: &CancelOrderRequest,
+    user_id: UserId,
+    symbol: SymbolId,
+    ts: UnixMicros,
+) -> Result<Command, ApiError> {
+    Ok(Command::CancelOrder {
+        order_id: OrderId::new(req.order_id),
+        user_id,
+        symbol,
+        timestamp: ts,
+    })
+}
+
+// ── AmendOrderRequest -> Command::AmendOrder ─────────────────────────────
+
+pub fn to_amend_order_command(
+    req: &AmendOrderRequest,
+    user_id: UserId,
+    symbol: SymbolId,
+    ts: UnixMicros,
+) -> Result<Command, ApiError> {
+    if req.new_price.is_none() && req.new_quantity.is_none() {
+        return Err(ApiError::bad_request(
+            "amend: at least one of newPrice or newQuantity must be present",
+        ));
+    }
+    let new_price = req
+        .new_price
+        .as_deref()
+        .map(|s| s.parse::<Decimal128>())
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("newPrice: {e}")))?;
+    let new_quantity = req
+        .new_quantity
+        .as_deref()
+        .map(|s| s.parse::<Decimal128>())
+        .transpose()
+        .map_err(|e| ApiError::bad_request(format!("newQuantity: {e}")))?;
+    Ok(Command::AmendOrder {
+        order_id: OrderId::new(req.order_id),
+        user_id,
+        symbol,
+        new_price,
+        new_quantity,
+        timestamp: ts,
     })
 }

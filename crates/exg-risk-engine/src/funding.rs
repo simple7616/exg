@@ -165,12 +165,12 @@ mod tests {
     fn test_impact_mid_price_normal() {
         // Use smaller values to avoid Decimal128 overflow in intermediate calculations.
         let bids = vec![
-            (dec("100"), dec("10")),   // 1000
-            (dec("99"), dec("20")),    // 1980
+            (dec("100"), dec("10")), // 1000
+            (dec("99"), dec("20")),  // 1980
         ];
         let asks = vec![
-            (dec("101"), dec("10")),   // 1010
-            (dec("102"), dec("20")),   // 2040
+            (dec("101"), dec("10")), // 1010
+            (dec("102"), dec("20")), // 2040
         ];
         let impact_notional = dec("1000");
         let result = calc_impact_mid_price(&bids, &asks, impact_notional);
@@ -198,12 +198,12 @@ mod tests {
     #[test]
     fn test_impact_mid_price_partial_fill_across_levels() {
         let bids = vec![
-            (dec("100"), dec("5")),   // 500
-            (dec("99"), dec("10")),   // 990
+            (dec("100"), dec("5")), // 500
+            (dec("99"), dec("10")), // 990
         ];
         let asks = vec![
-            (dec("101"), dec("5")),   // 505
-            (dec("102"), dec("10")),  // 1020
+            (dec("101"), dec("5")),  // 505
+            (dec("102"), dec("10")), // 1020
         ];
         let impact_notional = dec("1000");
 

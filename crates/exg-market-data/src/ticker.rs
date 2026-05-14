@@ -201,7 +201,9 @@ impl MarkPriceCalculator {
     /// Also checks staleness of the index price.
     pub fn recalculate(&mut self, now: UnixMicros) -> Decimal128 {
         // Check staleness.
-        let age = now.as_micros().saturating_sub(self.index_last_updated.as_micros());
+        let age = now
+            .as_micros()
+            .saturating_sub(self.index_last_updated.as_micros());
         self.is_stale = age > self.max_stale_us;
 
         // Median of three values.
@@ -257,9 +259,21 @@ mod tests {
         let base = HOUR_US; // start at 1 hour
 
         agg.add_trade(dec("100"), dec("1"), UnixMicros::from_micros(base));
-        agg.add_trade(dec("120"), dec("2"), UnixMicros::from_micros(base + 1_000_000));
-        agg.add_trade(dec("80"), dec("0.5"), UnixMicros::from_micros(base + 2_000_000));
-        agg.add_trade(dec("110"), dec("1.5"), UnixMicros::from_micros(base + 3_000_000));
+        agg.add_trade(
+            dec("120"),
+            dec("2"),
+            UnixMicros::from_micros(base + 1_000_000),
+        );
+        agg.add_trade(
+            dec("80"),
+            dec("0.5"),
+            UnixMicros::from_micros(base + 2_000_000),
+        );
+        agg.add_trade(
+            dec("110"),
+            dec("1.5"),
+            UnixMicros::from_micros(base + 3_000_000),
+        );
 
         let t = agg.ticker();
         assert_eq!(t.open_24h, dec("100"));
@@ -295,7 +309,11 @@ mod tests {
         let base = HOUR_US;
 
         agg.add_trade(dec("200"), dec("1"), UnixMicros::from_micros(base));
-        agg.add_trade(dec("250"), dec("1"), UnixMicros::from_micros(base + 1_000_000));
+        agg.add_trade(
+            dec("250"),
+            dec("1"),
+            UnixMicros::from_micros(base + 1_000_000),
+        );
 
         let t = agg.ticker();
         assert_eq!(t.price_change_24h, dec("50"));

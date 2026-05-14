@@ -6,7 +6,6 @@ use crate::ids::{OrderId, SymbolId, UserId};
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExgError {
     // ── Order errors ────────────────────────────────────────────────────
-
     #[error("order not found: {0}")]
     OrderNotFound(OrderId),
 
@@ -32,7 +31,6 @@ pub enum ExgError {
     SelfTradePrevented(UserId),
 
     // ── Risk / margin errors ────────────────────────────────────────────
-
     #[error("insufficient margin: required {required}, available {available}")]
     InsufficientMargin { required: String, available: String },
 
@@ -52,7 +50,6 @@ pub enum ExgError {
     RateLimitExceeded(UserId),
 
     // ── Account / ledger errors ─────────────────────────────────────────
-
     #[error("insufficient balance: required {required}, available {available}")]
     InsufficientBalance { required: String, available: String },
 
@@ -66,7 +63,6 @@ pub enum ExgError {
     BalanceInvariantViolation(String),
 
     // ── Symbol / market errors ──────────────────────────────────────────
-
     #[error("symbol not found: {0}")]
     SymbolNotFound(SymbolId),
 
@@ -80,7 +76,6 @@ pub enum ExgError {
     NotionalTooSmall(String),
 
     // ── System errors ───────────────────────────────────────────────────
-
     #[error("internal error: {0}")]
     Internal(String),
 
@@ -94,7 +89,6 @@ pub enum ExgError {
     MarkPriceStale(SymbolId),
 
     // ── Liquidation / ADL ─────────────────���─────────────────────────────
-
     #[error("liquidation triggered for user {user} on symbol {symbol}")]
     LiquidationTriggered { user: UserId, symbol: SymbolId },
 

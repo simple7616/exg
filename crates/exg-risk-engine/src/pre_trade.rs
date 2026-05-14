@@ -48,10 +48,7 @@ pub fn check_price_band(
 
 /// Check whether the incoming order would self-trade with an existing order
 /// from the same user on the opposite side for the same symbol.
-pub fn check_self_trade(
-    order: &OrderInfo,
-    existing_orders: &[OrderInfo],
-) -> ExgResult<()> {
+pub fn check_self_trade(order: &OrderInfo, existing_orders: &[OrderInfo]) -> ExgResult<()> {
     let opposite_side = order.side.opposite();
     for existing in existing_orders {
         if existing.user_id == order.user_id
@@ -65,10 +62,7 @@ pub fn check_self_trade(
 }
 
 /// Check rate limits for orders.
-pub fn check_rate_limit(
-    state: &RateLimitState,
-    config: &RateLimitConfig,
-) -> ExgResult<()> {
+pub fn check_rate_limit(state: &RateLimitState, config: &RateLimitConfig) -> ExgResult<()> {
     if state.orders_in_window >= config.max_orders_per_second {
         return Err(ExgError::RateLimitExceeded(UserId::new(0)));
     }
@@ -81,8 +75,10 @@ pub fn check_rate_limit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exg_common::{Decimal128, MarginMode, OrderId, OrderType, PositionSide, Side, SymbolId, UserId};
     use crate::Position;
+    use exg_common::{
+        Decimal128, MarginMode, OrderId, OrderType, PositionSide, Side, SymbolId, UserId,
+    };
 
     fn dec(s: &str) -> Decimal128 {
         s.parse().unwrap()

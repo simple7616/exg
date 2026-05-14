@@ -188,11 +188,7 @@ impl OrderService {
     /// Cancel all orders for a user on a symbol.
     ///
     /// Returns the order IDs that were canceled.
-    pub fn cancel_user_symbol_orders(
-        &mut self,
-        user_id: UserId,
-        symbol: SymbolId,
-    ) -> Vec<OrderId> {
+    pub fn cancel_user_symbol_orders(&mut self, user_id: UserId, symbol: SymbolId) -> Vec<OrderId> {
         let order_ids: Vec<OrderId> = self
             .user_active_orders
             .get(&user_id)
@@ -233,11 +229,7 @@ impl OrderService {
     }
 
     /// Get order by client order ID.
-    pub fn get_order_by_client_id(
-        &self,
-        user_id: UserId,
-        client_order_id: u64,
-    ) -> Option<&Order> {
+    pub fn get_order_by_client_id(&self, user_id: UserId, client_order_id: u64) -> Option<&Order> {
         self.client_order_map
             .get(&(user_id, client_order_id))
             .and_then(|oid| self.orders.get(oid))
@@ -247,11 +239,7 @@ impl OrderService {
     pub fn get_user_active_orders(&self, user_id: UserId) -> Vec<&Order> {
         self.user_active_orders
             .get(&user_id)
-            .map(|ids| {
-                ids.iter()
-                    .filter_map(|oid| self.orders.get(oid))
-                    .collect()
-            })
+            .map(|ids| ids.iter().filter_map(|oid| self.orders.get(oid)).collect())
             .unwrap_or_default()
     }
 
@@ -378,12 +366,7 @@ impl OrderService {
         }
     }
 
-    fn handle_order_rejected(
-        &mut self,
-        order_id: OrderId,
-        user_id: UserId,
-        timestamp: UnixMicros,
-    ) {
+    fn handle_order_rejected(&mut self, order_id: OrderId, user_id: UserId, timestamp: UnixMicros) {
         if let Some(order) = self.orders.get_mut(&order_id) {
             // Idempotency: already terminal.
             if order.status.is_terminal() {
@@ -394,11 +377,7 @@ impl OrderService {
             self.move_to_completed(order_id, user_id);
         } else {
             // Idempotency: check if already in completed orders.
-            if self
-                .completed_orders
-                .iter()
-                .any(|o| o.order_id == order_id)
-            {
+            if self.completed_orders.iter().any(|o| o.order_id == order_id) {
                 return;
             }
 
@@ -585,9 +564,13 @@ mod tests {
     fn test_create_order_from_command() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.5",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.5",
             Some(9999),
         );
         let order = svc.create_order(&cmd).unwrap();
@@ -612,9 +595,13 @@ mod tests {
     fn test_order_accepted_status_new() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.5",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.5",
             None,
         );
         svc.create_order(&cmd);
@@ -676,9 +663,13 @@ mod tests {
     fn test_partial_fill() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "2.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "2.0",
             None,
         );
         svc.create_order(&cmd);
@@ -712,9 +703,13 @@ mod tests {
     fn test_full_fill_moved_to_completed() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             None,
         );
         svc.create_order(&cmd);
@@ -750,9 +745,13 @@ mod tests {
     fn test_order_canceled() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             None,
         );
         svc.create_order(&cmd);
@@ -780,9 +779,13 @@ mod tests {
     fn test_order_rejected() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             None,
         );
         svc.create_order(&cmd);
@@ -825,9 +828,13 @@ mod tests {
     fn test_avg_fill_price_vwap() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("51000"), "3.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("51000"),
+            "3.0",
             None,
         );
         svc.create_order(&cmd);
@@ -882,9 +889,13 @@ mod tests {
     fn test_client_order_id_lookup() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             Some(12345),
         );
         svc.create_order(&cmd);
@@ -906,14 +917,35 @@ mod tests {
 
         // User 42: two orders.
         svc.create_order(&make_new_order_cmd(
-            1, 42, 1, Side::Buy, OrderType::Limit, Some("50000"), "1.0", None,
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
+            None,
         ));
         svc.create_order(&make_new_order_cmd(
-            2, 42, 2, Side::Sell, OrderType::Market, None, "0.5", None,
+            2,
+            42,
+            2,
+            Side::Sell,
+            OrderType::Market,
+            None,
+            "0.5",
+            None,
         ));
         // User 43: one order.
         svc.create_order(&make_new_order_cmd(
-            3, 43, 1, Side::Buy, OrderType::Limit, Some("49000"), "2.0", None,
+            3,
+            43,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("49000"),
+            "2.0",
+            None,
         ));
 
         let user42_orders = svc.get_user_active_orders(UserId::new(42));
@@ -933,13 +965,34 @@ mod tests {
         let mut svc = OrderService::new(100);
 
         svc.create_order(&make_new_order_cmd(
-            1, 42, 1, Side::Buy, OrderType::Limit, Some("50000"), "1.0", None,
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
+            None,
         ));
         svc.create_order(&make_new_order_cmd(
-            2, 42, 2, Side::Sell, OrderType::Limit, Some("3000"), "5.0", None,
+            2,
+            42,
+            2,
+            Side::Sell,
+            OrderType::Limit,
+            Some("3000"),
+            "5.0",
+            None,
         ));
         svc.create_order(&make_new_order_cmd(
-            3, 42, 1, Side::Sell, OrderType::Limit, Some("51000"), "0.5", None,
+            3,
+            42,
+            1,
+            Side::Sell,
+            OrderType::Limit,
+            Some("51000"),
+            "0.5",
+            None,
         ));
 
         let sym1_orders = svc.get_user_symbol_orders(UserId::new(42), SymbolId::new(1));
@@ -960,7 +1013,14 @@ mod tests {
 
         for i in 1..=5u64 {
             svc.create_order(&make_new_order_cmd(
-                i, 42, 1, Side::Buy, OrderType::Limit, Some("50000"), "1.0", None,
+                i,
+                42,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                Some("50000"),
+                "1.0",
+                None,
             ));
             let cancel = Event::OrderCanceled {
                 order_id: OrderId::new(i),
@@ -988,7 +1048,14 @@ mod tests {
         let mut svc = OrderService::new(100);
 
         svc.create_order(&make_new_order_cmd(
-            1, 42, 1, Side::Buy, OrderType::Limit, Some("50000"), "2.0", Some(111),
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "2.0",
+            Some(111),
         ));
 
         // Partial fill.
@@ -1008,7 +1075,14 @@ mod tests {
 
         // Add a second order and cancel it.
         svc.create_order(&make_new_order_cmd(
-            2, 42, 1, Side::Sell, OrderType::Limit, Some("51000"), "0.5", None,
+            2,
+            42,
+            1,
+            Side::Sell,
+            OrderType::Limit,
+            Some("51000"),
+            "0.5",
+            None,
         ));
         let cancel = Event::OrderCanceled {
             order_id: OrderId::new(2),
@@ -1034,7 +1108,11 @@ mod tests {
         assert_eq!(order.fills.len(), 1);
 
         // Verify client order ID lookup still works.
-        assert!(restored.get_order_by_client_id(UserId::new(42), 111).is_some());
+        assert!(
+            restored
+                .get_order_by_client_id(UserId::new(42), 111)
+                .is_some()
+        );
 
         // Verify completed orders.
         let completed = restored.get_user_completed_orders(UserId::new(42));
@@ -1049,9 +1127,13 @@ mod tests {
     fn test_idempotent_fill_event() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "2.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "2.0",
             None,
         );
         svc.create_order(&cmd);
@@ -1082,9 +1164,13 @@ mod tests {
     fn test_idempotent_cancel_event() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             None,
         );
         svc.create_order(&cmd);
@@ -1108,9 +1194,13 @@ mod tests {
     fn test_idempotent_reject_event() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             None,
         );
         svc.create_order(&cmd);
@@ -1133,9 +1223,13 @@ mod tests {
     fn test_idempotent_create_order() {
         let mut svc = OrderService::new(100);
         let cmd = make_new_order_cmd(
-            1, 42, 1,
-            Side::Buy, OrderType::Limit,
-            Some("50000"), "1.0",
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
             Some(555),
         );
 
@@ -1167,7 +1261,14 @@ mod tests {
     fn test_ignored_events() {
         let mut svc = OrderService::new(100);
         svc.create_order(&make_new_order_cmd(
-            1, 42, 1, Side::Buy, OrderType::Limit, Some("50000"), "1.0", None,
+            1,
+            42,
+            1,
+            Side::Buy,
+            OrderType::Limit,
+            Some("50000"),
+            "1.0",
+            None,
         ));
 
         let mark_event = Event::MarkPriceUpdate {
@@ -1198,8 +1299,26 @@ mod tests {
         let mut svc = OrderService::new(100);
 
         let cmds = vec![
-            make_new_order_cmd(1, 42, 1, Side::Buy, OrderType::Limit, Some("50000"), "1.0", None),
-            make_new_order_cmd(2, 42, 1, Side::Sell, OrderType::Limit, Some("51000"), "2.0", None),
+            make_new_order_cmd(
+                1,
+                42,
+                1,
+                Side::Buy,
+                OrderType::Limit,
+                Some("50000"),
+                "1.0",
+                None,
+            ),
+            make_new_order_cmd(
+                2,
+                42,
+                1,
+                Side::Sell,
+                OrderType::Limit,
+                Some("51000"),
+                "2.0",
+                None,
+            ),
             // Non-NewOrder command — should return None.
             Command::CancelOrder {
                 order_id: OrderId::new(99),

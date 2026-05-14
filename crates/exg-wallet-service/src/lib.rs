@@ -33,16 +33,28 @@ mod tests {
     fn test_generate_address_same_user_chain_returns_same() {
         let mut mgr = AddressManager::new();
         let user = UserId::new(1);
-        let addr1 = mgr.get_or_create_address(user, Chain::Ethereum).address.clone();
-        let addr2 = mgr.get_or_create_address(user, Chain::Ethereum).address.clone();
+        let addr1 = mgr
+            .get_or_create_address(user, Chain::Ethereum)
+            .address
+            .clone();
+        let addr2 = mgr
+            .get_or_create_address(user, Chain::Ethereum)
+            .address
+            .clone();
         assert_eq!(addr1, addr2);
     }
 
     #[test]
     fn test_different_user_gets_different_address() {
         let mut mgr = AddressManager::new();
-        let addr1 = mgr.get_or_create_address(UserId::new(1), Chain::Ethereum).address.clone();
-        let addr2 = mgr.get_or_create_address(UserId::new(2), Chain::Ethereum).address.clone();
+        let addr1 = mgr
+            .get_or_create_address(UserId::new(1), Chain::Ethereum)
+            .address
+            .clone();
+        let addr2 = mgr
+            .get_or_create_address(UserId::new(2), Chain::Ethereum)
+            .address
+            .clone();
         assert_ne!(addr1, addr2);
     }
 
@@ -77,8 +89,15 @@ mod tests {
     fn test_record_deposit_first_time_succeeds() {
         let mut tracker = DepositTracker::new();
         let result = tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("100"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("100"),
+            "USDT",
+            ts(1000),
         );
         assert!(result.is_some());
         let deposit = result.unwrap();
@@ -90,12 +109,26 @@ mod tests {
     fn test_record_duplicate_deposit_returns_none() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("100"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("100"),
+            "USDT",
+            ts(1000),
         );
         let dup = tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("100"), "USDT", ts(2000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("100"),
+            "USDT",
+            ts(2000),
         );
         assert!(dup.is_none());
     }
@@ -104,8 +137,15 @@ mod tests {
     fn test_update_confirmations_transitions_to_confirmed() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("50"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("50"),
+            "USDT",
+            ts(1000),
         );
         // Not enough confirmations
         let changed = tracker.update_confirmations(Chain::Ethereum, "0xabc", 0, 5);
@@ -120,8 +160,15 @@ mod tests {
     fn test_mark_credited_after_confirmed() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("50"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("50"),
+            "USDT",
+            ts(1000),
         );
         tracker.update_confirmations(Chain::Ethereum, "0xabc", 0, 12);
         let credited = tracker.mark_credited(Chain::Ethereum, "0xabc", 0);
@@ -132,8 +179,15 @@ mod tests {
     fn test_mark_credited_before_confirmed_fails() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("50"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("50"),
+            "USDT",
+            ts(1000),
         );
         let credited = tracker.mark_credited(Chain::Ethereum, "0xabc", 0);
         assert!(!credited);
@@ -143,12 +197,26 @@ mod tests {
     fn test_pending_deposits_filter() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("50"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("50"),
+            "USDT",
+            ts(1000),
         );
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xdef", 0,
-            "0xfrom", "0xto", dec("100"), "USDT", ts(2000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdef",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("100"),
+            "USDT",
+            ts(2000),
         );
         // Confirm first deposit
         tracker.update_confirmations(Chain::Ethereum, "0xabc", 0, 12);
@@ -162,8 +230,15 @@ mod tests {
     fn test_confirmed_uncredited() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("50"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("50"),
+            "USDT",
+            ts(1000),
         );
         tracker.update_confirmations(Chain::Ethereum, "0xabc", 0, 12);
 
@@ -179,12 +254,26 @@ mod tests {
     fn test_user_deposits() {
         let mut tracker = DepositTracker::new();
         tracker.record_deposit(
-            UserId::new(1), Chain::Ethereum, "0xabc", 0,
-            "0xfrom", "0xto", dec("50"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xabc",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("50"),
+            "USDT",
+            ts(1000),
         );
         tracker.record_deposit(
-            UserId::new(2), Chain::Ethereum, "0xdef", 0,
-            "0xfrom", "0xto", dec("100"), "USDT", ts(2000),
+            UserId::new(2),
+            Chain::Ethereum,
+            "0xdef",
+            0,
+            "0xfrom",
+            "0xto",
+            dec("100"),
+            "USDT",
+            ts(2000),
         );
         let deposits = tracker.user_deposits(UserId::new(1));
         assert_eq!(deposits.len(), 1);
@@ -196,8 +285,13 @@ mod tests {
     fn test_submit_withdrawal_auto_approve_below_threshold() {
         let mut proc = WithdrawalProcessor::new(dec("1000"));
         let w = proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("500"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("500"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
         assert_eq!(w.status, WithdrawalStatus::Approved);
     }
@@ -206,8 +300,13 @@ mod tests {
     fn test_submit_withdrawal_pending_review_above_threshold() {
         let mut proc = WithdrawalProcessor::new(dec("1000"));
         let w = proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("5000"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("5000"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
         assert_eq!(w.status, WithdrawalStatus::PendingReview);
     }
@@ -216,8 +315,13 @@ mod tests {
     fn test_withdrawal_approve_processing_completed_lifecycle() {
         let mut proc = WithdrawalProcessor::new(dec("100"));
         let w = proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("500"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("500"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
         let id = w.id;
         assert_eq!(w.status, WithdrawalStatus::PendingReview);
@@ -235,8 +339,13 @@ mod tests {
     fn test_reject_withdrawal() {
         let mut proc = WithdrawalProcessor::new(dec("100"));
         let w = proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("500"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("500"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
         let id = w.id;
 
@@ -250,8 +359,13 @@ mod tests {
     fn test_invalid_status_transition() {
         let mut proc = WithdrawalProcessor::new(dec("100"));
         let w = proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("500"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("500"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
         let id = w.id;
 
@@ -276,12 +390,22 @@ mod tests {
     fn test_pending_review_filter() {
         let mut proc = WithdrawalProcessor::new(dec("100"));
         proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("500"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("500"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
         proc.submit(
-            UserId::new(2), Chain::Ethereum, "0xdest2",
-            dec("50"), dec("1"), "USDT", ts(2000),
+            UserId::new(2),
+            Chain::Ethereum,
+            "0xdest2",
+            dec("50"),
+            dec("1"),
+            "USDT",
+            ts(2000),
         );
 
         let pending = proc.pending_review();
@@ -294,8 +418,13 @@ mod tests {
         let mut proc = WithdrawalProcessor::new(dec("100"));
         // Auto-approved
         proc.submit(
-            UserId::new(1), Chain::Ethereum, "0xdest",
-            dec("50"), dec("1"), "USDT", ts(1000),
+            UserId::new(1),
+            Chain::Ethereum,
+            "0xdest",
+            dec("50"),
+            dec("1"),
+            "USDT",
+            ts(1000),
         );
 
         let ready = proc.approved_ready();
@@ -307,7 +436,10 @@ mod tests {
     #[test]
     fn test_hot_wallet_balance_tracking() {
         let mut monitor = HotWalletMonitor::new(dec("1000"));
-        assert_eq!(monitor.get_balance(Chain::Ethereum, "USDT"), Decimal128::ZERO);
+        assert_eq!(
+            monitor.get_balance(Chain::Ethereum, "USDT"),
+            Decimal128::ZERO
+        );
 
         monitor.update_balance(Chain::Ethereum, "USDT", dec("500"));
         assert_eq!(monitor.get_balance(Chain::Ethereum, "USDT"), dec("500"));

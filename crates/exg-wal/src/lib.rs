@@ -245,11 +245,7 @@ mod tests {
         let snap_count = fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("snapshot-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("snapshot-"))
             .count();
 
         assert_eq!(snap_count, 3);

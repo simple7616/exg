@@ -97,13 +97,7 @@ mod tests {
         let mut svc = MarketDataService::new(sym());
 
         let ts = UnixMicros::from_micros(1_000_000_000_000);
-        let completed = svc.on_trade(
-            TradeId::new(1),
-            dec("50000"),
-            dec("1.5"),
-            Side::Buy,
-            ts,
-        );
+        let completed = svc.on_trade(TradeId::new(1), dec("50000"), dec("1.5"), Side::Buy, ts);
         assert!(completed.is_empty()); // first trade, no rollover
 
         // Kline updated.

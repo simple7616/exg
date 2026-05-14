@@ -57,7 +57,10 @@ pub fn save_snapshot(dir: &Path, sequence: u64, data: &[u8]) -> Result<(), WalEr
     writer.write_all(&crc.to_le_bytes())?;
     writer.flush()?;
     // fsync data + metadata before rename
-    writer.into_inner().map_err(|e| e.into_error())?.sync_all()?;
+    writer
+        .into_inner()
+        .map_err(|e| e.into_error())?
+        .sync_all()?;
 
     // Atomic rename
     fs::rename(&tmp_path, &final_path)?;

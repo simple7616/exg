@@ -23,8 +23,7 @@ impl HotWalletMonitor {
     }
 
     pub fn update_balance(&mut self, chain: Chain, asset: &str, balance: Decimal128) {
-        self.balances
-            .insert((chain, asset.to_string()), balance);
+        self.balances.insert((chain, asset.to_string()), balance);
     }
 
     pub fn get_balance(&self, chain: Chain, asset: &str) -> Decimal128 {

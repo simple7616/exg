@@ -100,6 +100,9 @@ pub struct SymbolConfigEntry {
     pub maker_fee: String,
     /// Decimal as string, e.g. "0.0005".
     pub taker_fee: String,
+    /// Static mark price for Stage 0; replaced by oracle/mark service in Stage 2.
+    /// Decimal as string, e.g. "60000".
+    pub mark_price: String,
     pub margin_tiers: Vec<MarginTierEntry>,
 }
 
@@ -214,6 +217,7 @@ impl ExgConfig {
             max_leverage: "125".into(),
             maker_fee: "0.0002".into(),
             taker_fee: "0.0005".into(),
+            mark_price: "60000".into(),
             margin_tiers: vec![
                 MarginTierEntry {
                     notional_floor: "0".into(),

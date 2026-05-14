@@ -102,7 +102,10 @@ mod tests {
 
         let result = sm.add_symbol(make_symbol(2, "BTCUSDT", SymbolStatus::Trading));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), AdminError::DuplicateSymbol(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            AdminError::DuplicateSymbol(_)
+        ));
     }
 
     // ── 6. Risk monitor: record liquidation, check count ───────────────
@@ -150,10 +153,8 @@ mod tests {
         rg.record_funding_income(dec("1.0"), UnixMicros::from_micros(600));
 
         // Report for [100, 300) — includes first two fees and first funding.
-        let report = rg.generate_fee_report(
-            UnixMicros::from_micros(100),
-            UnixMicros::from_micros(300),
-        );
+        let report =
+            rg.generate_fee_report(UnixMicros::from_micros(100), UnixMicros::from_micros(300));
 
         assert_eq!(report.total_maker_fees, dec("3.5"));
         assert_eq!(report.total_taker_fees, dec("7.0"));

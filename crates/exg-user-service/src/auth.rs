@@ -3,7 +3,7 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use hmac::{Hmac, Mac};
-use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, Algorithm};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rustc_hash::FxHashMap;
 use sha2::Sha256;
 use uuid::Uuid;
@@ -91,7 +91,10 @@ impl AuthService {
             .users_by_email
             .get(email)
             .ok_or(AuthError::InvalidCredentials)?;
-        let user = self.users.get(user_id).ok_or(AuthError::InvalidCredentials)?;
+        let user = self
+            .users
+            .get(user_id)
+            .ok_or(AuthError::InvalidCredentials)?;
 
         if !user.is_active {
             return Err(AuthError::InvalidCredentials);
@@ -143,7 +146,10 @@ impl AuthService {
 
     /// Enable TOTP 2FA. Returns the secret (base32) for QR code generation.
     pub fn enable_2fa(&mut self, user_id: UserId) -> Result<String, AuthError> {
-        let user = self.users.get_mut(&user_id).ok_or(AuthError::UserNotFound)?;
+        let user = self
+            .users
+            .get_mut(&user_id)
+            .ok_or(AuthError::UserNotFound)?;
 
         // Generate 20-byte random secret for TOTP (standard RFC 4226 key length)
         let secret_bytes: [u8; 20] = rand::random();
@@ -314,7 +320,10 @@ impl AuthService {
         verify_password(old_password, &user.password_hash)?;
 
         let new_hash = hash_password(new_password)?;
-        let user = self.users.get_mut(&user_id).ok_or(AuthError::UserNotFound)?;
+        let user = self
+            .users
+            .get_mut(&user_id)
+            .ok_or(AuthError::UserNotFound)?;
         user.password_hash = new_hash;
         user.updated_at = UnixMicros::now();
 
@@ -343,7 +352,8 @@ fn hash_password(password: &str) -> Result<String, AuthError> {
 }
 
 fn verify_password(password: &str, hash: &str) -> Result<(), AuthError> {
-    let parsed = PasswordHash::new(hash).map_err(|e| AuthError::Internal(format!("parse hash: {e}")))?;
+    let parsed =
+        PasswordHash::new(hash).map_err(|e| AuthError::Internal(format!("parse hash: {e}")))?;
     Argon2::default()
         .verify_password(password.as_bytes(), &parsed)
         .map_err(|_| AuthError::InvalidCredentials)
@@ -390,7 +400,9 @@ mod tests {
     fn test_register_duplicate_email() {
         let mut svc = make_service();
         svc.register("alice@example.com", "strongpass1").unwrap();
-        let err = svc.register("alice@example.com", "strongpass2").unwrap_err();
+        let err = svc
+            .register("alice@example.com", "strongpass2")
+            .unwrap_err();
         assert!(matches!(err, AuthError::EmailAlreadyExists));
     }
 
@@ -473,9 +485,7 @@ mod tests {
             6,
             1,
             30,
-            totp_rs::Secret::Encoded(secret_b32)
-                .to_bytes()
-                .unwrap(),
+            totp_rs::Secret::Encoded(secret_b32).to_bytes().unwrap(),
             Some("exg".to_string()),
             String::new(),
         )

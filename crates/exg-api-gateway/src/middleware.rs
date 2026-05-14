@@ -70,7 +70,9 @@ impl RateLimiter {
 }
 
 fn refill(bucket: &mut TokenBucket, now: UnixMicros, max: f64, rate: f64) {
-    let elapsed_us = now.as_micros().saturating_sub(bucket.last_refill.as_micros());
+    let elapsed_us = now
+        .as_micros()
+        .saturating_sub(bucket.last_refill.as_micros());
     if elapsed_us > 0 {
         let elapsed_secs = elapsed_us as f64 / 1_000_000.0;
         bucket.tokens = (bucket.tokens + elapsed_secs * rate).min(max);

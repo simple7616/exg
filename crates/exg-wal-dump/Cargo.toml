@@ -1,0 +1,19 @@
+[package]
+name = "exg-wal-dump"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "exg-wal-dump"
+path = "src/main.rs"
+
+[dependencies]
+exg-wal = { workspace = true }
+exg-protocol = { workspace = true }
+exg-common = { workspace = true }
+rkyv = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

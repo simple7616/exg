@@ -40,12 +40,8 @@ pub fn match_order(book: &mut OrderBook, order: &mut BookOrder) -> MatchResult {
     // POST_ONLY takes precedence: if order would match, reject it
     if order.time_in_force == TimeInForce::PostOnly {
         let would_match = match order.side {
-            Side::Buy => book
-                .best_ask()
-                .is_some_and(|ask| order.price >= ask),
-            Side::Sell => book
-                .best_bid()
-                .is_some_and(|bid| order.price <= bid),
+            Side::Buy => book.best_ask().is_some_and(|ask| order.price >= ask),
+            Side::Sell => book.best_bid().is_some_and(|bid| order.price <= bid),
         };
         if would_match {
             return MatchResult {
@@ -97,10 +93,7 @@ pub fn match_order(book: &mut OrderBook, order: &mut BookOrder) -> MatchResult {
 /// Match a buy order against ask side of the book.
 fn match_against_asks(book: &mut OrderBook, taker: &mut BookOrder, fills: &mut Vec<Fill>) {
     // Collect the ask prices to iterate (avoid borrow issues)
-    let ask_prices: Vec<Decimal128> = book
-        .ask_levels()
-        .map(|l| l.price)
-        .collect();
+    let ask_prices: Vec<Decimal128> = book.ask_levels().map(|l| l.price).collect();
 
     for ask_price in ask_prices {
         if taker.remaining_qty.is_zero() {
@@ -158,10 +151,7 @@ fn match_against_asks(book: &mut OrderBook, taker: &mut BookOrder, fills: &mut V
 /// Match a sell order against bid side of the book.
 fn match_against_bids(book: &mut OrderBook, taker: &mut BookOrder, fills: &mut Vec<Fill>) {
     // Collect the bid prices to iterate (avoid borrow issues)
-    let bid_prices: Vec<Decimal128> = book
-        .bid_levels()
-        .map(|l| l.price)
-        .collect();
+    let bid_prices: Vec<Decimal128> = book.bid_levels().map(|l| l.price).collect();
 
     for bid_price in bid_prices {
         if taker.remaining_qty.is_zero() {
@@ -257,7 +247,15 @@ mod tests {
     }
 
     fn make_limit(id: u64, user: u64, side: Side, price: &str, qty: &str) -> BookOrder {
-        make_order(id, user, side, price, qty, OrderType::Limit, TimeInForce::Gtc)
+        make_order(
+            id,
+            user,
+            side,
+            price,
+            qty,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+        )
     }
 
     fn setup_book_with_asks() -> OrderBook {
@@ -317,8 +315,13 @@ mod tests {
         let mut book = setup_book_with_asks();
         // Market buy 600 — total available is 100+200+300=600
         let mut taker = make_order(
-            100, 20, Side::Buy, "0", "600",
-            OrderType::Market, TimeInForce::Ioc,
+            100,
+            20,
+            Side::Buy,
+            "0",
+            "600",
+            OrderType::Market,
+            TimeInForce::Ioc,
         );
 
         let result = match_order(&mut book, &mut taker);
@@ -333,8 +336,13 @@ mod tests {
     fn test_post_only_rejected_when_would_take() {
         let mut book = setup_book_with_asks();
         let mut taker = make_order(
-            100, 20, Side::Buy, "51000", "10",
-            OrderType::Limit, TimeInForce::PostOnly,
+            100,
+            20,
+            Side::Buy,
+            "51000",
+            "10",
+            OrderType::Limit,
+            TimeInForce::PostOnly,
         );
 
         let result = match_order(&mut book, &mut taker);
@@ -350,8 +358,13 @@ mod tests {
     fn test_post_only_accepted_when_rests() {
         let mut book = setup_book_with_asks();
         let mut taker = make_order(
-            100, 20, Side::Buy, "50000", "10",
-            OrderType::Limit, TimeInForce::PostOnly,
+            100,
+            20,
+            Side::Buy,
+            "50000",
+            "10",
+            OrderType::Limit,
+            TimeInForce::PostOnly,
         );
 
         let result = match_order(&mut book, &mut taker);
@@ -366,8 +379,13 @@ mod tests {
         let mut book = setup_book_with_asks();
         // IOC buy 150 @ 51000 — only 100 available at that price
         let mut taker = make_order(
-            100, 20, Side::Buy, "51000", "150",
-            OrderType::Limit, TimeInForce::Ioc,
+            100,
+            20,
+            Side::Buy,
+            "51000",
+            "150",
+            OrderType::Limit,
+            TimeInForce::Ioc,
         );
 
         let result = match_order(&mut book, &mut taker);
@@ -385,8 +403,13 @@ mod tests {
         let mut book = setup_book_with_asks();
         // FOK buy 100 @ 51000 — exactly available
         let mut taker = make_order(
-            100, 20, Side::Buy, "51000", "100",
-            OrderType::Limit, TimeInForce::Fok,
+            100,
+            20,
+            Side::Buy,
+            "51000",
+            "100",
+            OrderType::Limit,
+            TimeInForce::Fok,
         );
 
         let result = match_order(&mut book, &mut taker);
@@ -403,8 +426,13 @@ mod tests {
         let mut book = setup_book_with_asks();
         // FOK buy 150 @ 51000 — only 100 available
         let mut taker = make_order(
-            100, 20, Side::Buy, "51000", "150",
-            OrderType::Limit, TimeInForce::Fok,
+            100,
+            20,
+            Side::Buy,
+            "51000",
+            "150",
+            OrderType::Limit,
+            TimeInForce::Fok,
         );
 
         let result = match_order(&mut book, &mut taker);
@@ -506,8 +534,13 @@ mod tests {
     fn test_post_only_sell_rejected() {
         let mut book = setup_book_with_bids();
         let mut taker = make_order(
-            100, 20, Side::Sell, "49000", "10",
-            OrderType::Limit, TimeInForce::PostOnly,
+            100,
+            20,
+            Side::Sell,
+            "49000",
+            "10",
+            OrderType::Limit,
+            TimeInForce::PostOnly,
         );
         let result = match_order(&mut book, &mut taker);
         assert!(result.rejected);
@@ -518,8 +551,13 @@ mod tests {
         let mut book = setup_book_with_bids();
         // FOK sell 300 @ 49000
         let mut taker = make_order(
-            100, 20, Side::Sell, "49000", "300",
-            OrderType::Limit, TimeInForce::Fok,
+            100,
+            20,
+            Side::Sell,
+            "49000",
+            "300",
+            OrderType::Limit,
+            TimeInForce::Fok,
         );
         let result = match_order(&mut book, &mut taker);
         assert!(!result.rejected);

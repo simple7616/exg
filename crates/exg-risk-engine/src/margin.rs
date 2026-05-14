@@ -43,12 +43,8 @@ pub fn calc_liquidation_price(
     let funding_per_unit = accumulated_funding / size;
 
     match side {
-        PositionSide::Long => {
-            entry_price * (one - inv_leverage + mmr) - funding_per_unit
-        }
-        PositionSide::Short => {
-            entry_price * (one + inv_leverage - mmr) + funding_per_unit
-        }
+        PositionSide::Long => entry_price * (one - inv_leverage + mmr) - funding_per_unit,
+        PositionSide::Short => entry_price * (one + inv_leverage - mmr) + funding_per_unit,
         PositionSide::Both => {
             // For one-way mode, treat as long if positive. Caller should resolve.
             entry_price * (one - inv_leverage + mmr) - funding_per_unit
@@ -123,8 +119,10 @@ pub fn check_margin_sufficient(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exg_common::{Decimal128, MarginMode, OrderId, OrderType, PositionSide, Side, SymbolId, UserId};
     use crate::{Account, MarginTier, OrderInfo, Position, SymbolConfig};
+    use exg_common::{
+        Decimal128, MarginMode, OrderId, OrderType, PositionSide, Side, SymbolId, UserId,
+    };
 
     fn dec(s: &str) -> Decimal128 {
         s.parse().unwrap()

@@ -49,10 +49,8 @@ impl RiskMonitor {
         use rustc_hash::FxHashMap;
 
         // Build lookup maps.
-        let balance_map: FxHashMap<UserId, Decimal128> =
-            wallet_balances.iter().copied().collect();
-        let price_map: FxHashMap<SymbolId, Decimal128> =
-            mark_prices.iter().copied().collect();
+        let balance_map: FxHashMap<UserId, Decimal128> = wallet_balances.iter().copied().collect();
+        let price_map: FxHashMap<SymbolId, Decimal128> = mark_prices.iter().copied().collect();
 
         // Group positions by user, updating unrealized PnL with current mark prices.
         let mut user_positions: FxHashMap<UserId, Vec<Position>> = FxHashMap::default();
@@ -73,7 +71,10 @@ impl RiskMonitor {
         let mut liquidation_orders = Vec::new();
 
         for (user_id, user_pos) in &user_positions {
-            let wallet_balance = balance_map.get(user_id).copied().unwrap_or(Decimal128::ZERO);
+            let wallet_balance = balance_map
+                .get(user_id)
+                .copied()
+                .unwrap_or(Decimal128::ZERO);
             let ratio = calc_margin_ratio(user_pos, wallet_balance, tiers);
 
             if ratio >= self.liquidation_threshold {
@@ -125,7 +126,14 @@ mod tests {
         }]
     }
 
-    fn make_position(user_id: u64, symbol: u16, side: PositionSide, size: &str, entry: &str, margin: &str) -> Position {
+    fn make_position(
+        user_id: u64,
+        symbol: u16,
+        side: PositionSide,
+        size: &str,
+        entry: &str,
+        margin: &str,
+    ) -> Position {
         Position {
             user_id: UserId::new(user_id),
             symbol: SymbolId::new(symbol),
