@@ -112,6 +112,7 @@ fn validate_symbol(sym: &crate::SymbolConfigEntry) -> Result<(), ConfigError> {
     parse_decimal(&format!("{prefix}.max_leverage"), &sym.max_leverage)?;
     require_non_negative(&format!("{prefix}.maker_fee"), &sym.maker_fee)?;
     require_non_negative(&format!("{prefix}.taker_fee"), &sym.taker_fee)?;
+    require_positive(&format!("{prefix}.mark_price"), &sym.mark_price)?;
 
     // Validate margin tiers
     if sym.margin_tiers.is_empty() {

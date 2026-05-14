@@ -143,6 +143,29 @@ fn test_toml_parsing_all_types() {
     assert_eq!(cfg.trading.symbols[0].margin_tiers.len(), 2);
 }
 
+#[test]
+fn test_symbol_mark_price_field_parses() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.trading.symbols[0].mark_price = "60000".into();
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn test_symbol_mark_price_must_be_positive() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.trading.symbols[0].mark_price = "0".into();
+    let err = cfg.validate().unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("mark_price"), "msg: {msg}");
+}
+
+#[test]
+fn test_symbol_mark_price_must_parse_as_decimal() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.trading.symbols[0].mark_price = "not-a-number".into();
+    assert!(cfg.validate().is_err());
+}
+
 /// Write a minimal valid TOML config for testing.
 fn write_minimal_toml(path: &Path) {
     let toml = r#"
@@ -197,6 +220,7 @@ min_notional = "10"
 max_leverage = "125"
 maker_fee = "0.0002"
 taker_fee = "0.0005"
+mark_price = "60000"
 
 [[trading.symbols.margin_tiers]]
 notional_floor = "0"

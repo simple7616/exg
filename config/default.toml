@@ -51,6 +51,7 @@ min_notional = "10"
 max_leverage = "125"
 maker_fee = "0.0002"
 taker_fee = "0.0005"
+mark_price = "60000"
 
 [[trading.symbols.margin_tiers]]
 notional_floor = "0"
