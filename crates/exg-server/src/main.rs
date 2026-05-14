@@ -1,66 +1,51 @@
+//! Stage 0 server binary. Delegates to `exg_server::run_with_config`.
+
+use std::path::PathBuf;
+
+use anyhow::Result;
 use metrics_exporter_prometheus::PrometheusBuilder;
 
-#[tokio::main]
-async fn main() {
-    // Initialize tracing
+#[actix_web::main]
+async fn main() -> Result<()> {
+    // Tracing
     tracing_subscriber::fmt()
-        .with_env_filter("info")
+        .with_env_filter(
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
+        )
         .json()
         .init();
 
-    tracing::info!("EXG Exchange Server starting...");
-    tracing::info!("Version: {}", env!("CARGO_PKG_VERSION"));
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        "exg-server stage 0 starting"
+    );
 
-    // Initialize Prometheus metrics exporter on port 9000
-    let builder = PrometheusBuilder::new();
-    builder
+    // Prometheus exporter (preserved from prior main.rs; spec §4.5 step 12)
+    PrometheusBuilder::new()
         .with_http_listener(([0, 0, 0, 0], 9000))
         .install()
         .expect("Failed to install Prometheus exporter");
 
-    tracing::info!("Prometheus metrics exporter listening on :9000");
-
-    // Register key metrics
+    metrics::describe_counter!("exg_api_requests_total", "Total API requests");
     metrics::describe_histogram!(
         "exg_matching_engine_latency_seconds",
         "Matching engine order processing latency"
     );
-    metrics::describe_counter!(
-        "exg_orders_total",
-        "Total number of orders processed"
-    );
-    metrics::describe_gauge!(
-        "exg_active_positions",
-        "Number of active positions"
-    );
-    metrics::describe_gauge!(
-        "exg_insurance_fund_balance",
-        "Insurance fund balance in quote currency"
-    );
-    metrics::describe_counter!(
-        "exg_api_requests_total",
-        "Total API requests"
-    );
-    metrics::describe_gauge!(
-        "exg_websocket_connections",
-        "Active WebSocket connections"
-    );
 
-    // TODO: Initialize exchange components
-    // 1. Load config
-    // 2. Initialize WAL
-    // 3. Initialize Ring Buffers
-    // 4. Start Matching Engine
-    // 5. Start Clearing Service
-    // 6. Start Market Data Service
-    // 7. Start API Gateway (HTTP + WS)
-    // 8. Start Wallet Service scanners
+    // Config
+    let cfg_path: PathBuf = std::env::var_os("EXG_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("config/default.toml"));
+    let cfg = exg_config::ExgConfig::load(&cfg_path)?;
 
-    tracing::info!("EXG Exchange Server ready");
+    // Boot
+    let handle = exg_server::run_with_config(cfg).await?;
+    tracing::info!(port = handle.bound_port, "exg-server ready");
 
-    // Keep running until signal
-    tokio::signal::ctrl_c()
-        .await
-        .expect("Failed to listen for ctrl+c");
-    tracing::info!("Shutting down...");
+    // Wait for ctrl_c, then graceful shutdown (spec §4.6).
+    tokio::signal::ctrl_c().await.expect("ctrl_c handler");
+    tracing::info!("ctrl_c received, shutting down");
+    handle.shutdown().await?;
+    tracing::info!("exg-server stage 0 stopped");
+    Ok(())
 }
