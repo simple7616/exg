@@ -1,3 +1,4 @@
+use actix_web::HttpResponse;
 use serde::Serialize;
 
 // ── Standard error codes (Binance-compatible) ────────────────────────────
@@ -61,3 +62,18 @@ impl std::fmt::Display for ApiError {
 }
 
 impl std::error::Error for ApiError {}
+
+impl actix_web::ResponseError for ApiError {
+    fn status_code(&self) -> actix_web::http::StatusCode {
+        match self.code {
+            ERR_UNAUTHORIZED => actix_web::http::StatusCode::UNAUTHORIZED,
+            ERR_TOO_MANY_REQUESTS => actix_web::http::StatusCode::TOO_MANY_REQUESTS,
+            ERR_ORDER_NOT_FOUND => actix_web::http::StatusCode::NOT_FOUND,
+            _ => actix_web::http::StatusCode::BAD_REQUEST,
+        }
+    }
+
+    fn error_response(&self) -> HttpResponse {
+        HttpResponse::build(self.status_code()).json(self)
+    }
+}
