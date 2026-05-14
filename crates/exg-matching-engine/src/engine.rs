@@ -961,6 +961,12 @@ impl MatchingEngine {
         self.mark_price
     }
 
+    /// Set the mark price used by pre-trade risk checks. Stage 0 injects this
+    /// once at boot from config; Stage 2+ replaces this with a real feed.
+    pub fn set_mark_price(&mut self, price: Decimal128) {
+        self.mark_price = price;
+    }
+
     /// Current index price.
     pub fn index_price(&self) -> Decimal128 {
         self.index_price
@@ -1487,5 +1493,13 @@ mod tests {
         );
         let events = engine.process_command(&cmd);
         assert!(is_rejected(&events[0]));
+    }
+
+    #[test]
+    fn set_mark_price_updates_internal_state() {
+        let mut engine = MatchingEngine::new(test_config(), 1);
+        assert_eq!(engine.mark_price(), Decimal128::ZERO);
+        engine.set_mark_price(dec("60000"));
+        assert_eq!(engine.mark_price(), dec("60000"));
     }
 }
