@@ -64,8 +64,10 @@ Stage 0 step 3a  symbols.len() == 1
 Stage 0 step 3b  WAL dir empty
 NEW   step 3.5   let pool = PgPool::connect(cfg.database.url).await?
 NEW   step 3.6   sqlx::query("SELECT 1").execute(&pool).await?
-NEW   step 3.7   DUMMY_ARGON2_HASH.set(hash_password("__dummy_constant_for_timing_equalization__")?)
-                 — OnceCell init for constant-time login (per §4.3.2 + §9 #20)
+NEW   step 3.7   DUMMY_ARGON2_HASH.get_or_init(|| hash_password("__dummy_constant_for_timing_equalization__").expect("argon2 dummy hash"))
+                 — OnceCell init for constant-time login (per §4.3.2 + §9 #20).
+                 Use get_or_init not set: integration tests call run_with_config
+                 multiple times in the same process, set() would panic on 2nd call.
 Stage 0 step 4   WAL open
 Stage 0 step 5   RingBuffer + Producer/Consumer (Box::leak)
 Stage 0 step 6   SymbolConfig conversion
@@ -220,6 +222,7 @@ The dedup table grows monotonically in Stage 1a. Stage 7 adds a cleanup job (del
 | `crates/exg-server/Cargo.toml` | Add `sqlx` with features `runtime-tokio,postgres,macros`. |
 | `crates/exg-server/src/lib.rs` | `run_with_config` adds steps 2.5, 2.6, 3.5, 3.6, 11.5 per §4.2. Pass `pool` + `auth_cfg` into `AppState`. |
 | `crates/exg-server/tests/boot_panics.rs` | Add 3 tests: `boot_panics_on_short_jwt_secret`, `boot_panics_on_default_jwt_secret`, `boot_panics_on_db_unreachable`. Existing 4 tests gain `cfg.auth.jwt_secret` field for compile compatibility. |
+| `crates/exg-server/tests/stage0_e2e.rs` | **Rewrite all 7 tests to use JWT bearer instead of `X-User-Id` header** (eng-review finding 3.1 regression). Add shared `login_helper(client, base, email, password) -> token` fixture that calls register + login and returns the access token. Each test that previously sent `X-User-Id: 42` now calls `login_helper` once and sends `Authorization: Bearer <token>`. The IDOR scenario registers two users and uses each user's distinct token. Preserves all Stage 0 acceptance points (backpressure, IDOR, shutdown drain, dup coid). |
 
 ### 5.3 New
 
@@ -341,7 +344,7 @@ Stage 0 §9 #1-10 unchanged. Stage 1a adds:
 
 19. **Login endpoint rate-limit keys**: per-email (normalized lowercase) AND per-IP, both checked via the in-memory `RateLimiter`. Either bucket exhausted → 429 + `-1003`. This guards against single-email brute force and same-IP scan-multiple-emails. Per-user-id rate limit (on authenticated endpoints) is separate and continues to use `user_id` as key.
 
-20. **Login response time must be constant regardless of email existence**. `login_user` always invokes `verify_password` exactly once — when the email is not found, it runs against a precomputed constant dummy hash (one-time computed at boot, stored in `OnceCell<String>`). Verified by integration test: median response time for "unknown email" and "known email + wrong password" must be within ±5ms.
+20. **Login response time must be constant regardless of email existence**. `login_user` always invokes `verify_password` exactly once — when the email is not found, it runs against a precomputed constant dummy hash (one-time computed at boot, stored in `OnceCell<String>`). Verified by **unit test on the `login_user` fn directly** (not e2e HTTP, where network/Actix overhead would mask the timing signal): 100 sample runs for each branch, assert median difference < 5ms. e2e tests verify only correctness of the 401 response, not timing.
 
 ## 10. Open Questions (resolved during plan stage)
 
@@ -367,4 +370,5 @@ Stage 2 will:
 Stage 7 will:
 - Replace in-memory `RateLimiter` with Redis backend.
 - KMS-managed JWT secret (rejecting plaintext config).
+- **JWT secret rotation support**: maintain `Vec<JwtSecret>` with `active` and `previous` slots; `verify_jwt` tries each in order so tokens signed under the previous secret remain valid through a rotation window. Stage 1a is single-secret; this is the rotation forward path.
 - Cleanup job for `user_client_order_ids` rows older than 30 days.
