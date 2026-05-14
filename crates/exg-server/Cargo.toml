@@ -3,13 +3,34 @@ name = "exg-server"
 edition.workspace = true
 version.workspace = true
 
+[lib]
+path = "src/lib.rs"
+
 [[bin]]
 name = "exg-server"
 path = "src/main.rs"
 
 [dependencies]
+exg-common = { workspace = true }
+exg-config = { workspace = true }
+exg-protocol = { workspace = true }
+exg-ringbuffer = { workspace = true }
+exg-wal = { workspace = true }
+exg-matching-engine = { workspace = true }
+exg-risk-engine = { workspace = true }
+exg-api-gateway = { workspace = true }
 tokio = { workspace = true }
+actix-web = { workspace = true }
+parking_lot = { workspace = true }
+core_affinity = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+anyhow = { workspace = true }
+rkyv = { workspace = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = { workspace = true }
+serde_json = { workspace = true }
