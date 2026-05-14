@@ -36,15 +36,17 @@ mod tests {
         };
 
         let user_id = UserId::new(42);
+        let symbol = SymbolId::new(1);
         let order_id = OrderId::new(1001);
         let ts = UnixMicros::from_micros(1_700_000_000_000_000);
 
-        let cmd = to_new_order_command(&req, user_id, order_id, ts).unwrap();
+        let cmd = to_new_order_command(&req, user_id, symbol, order_id, ts).unwrap();
 
         match cmd {
             Command::NewOrder {
                 order_id: oid,
                 user_id: uid,
+                symbol: sid,
                 side,
                 order_type,
                 time_in_force,
@@ -56,6 +58,7 @@ mod tests {
             } => {
                 assert_eq!(oid, OrderId::new(1001));
                 assert_eq!(uid, UserId::new(42));
+                assert_eq!(sid, SymbolId::new(1));
                 assert_eq!(side, Side::Buy);
                 assert_eq!(order_type, OrderType::Limit);
                 assert_eq!(time_in_force, TimeInForce::Gtc);
@@ -85,6 +88,7 @@ mod tests {
         let cmd = to_new_order_command(
             &req,
             UserId::new(1),
+            SymbolId::new(1),
             OrderId::new(2),
             UnixMicros::from_micros(0),
         )
@@ -140,6 +144,7 @@ mod tests {
         let result = to_new_order_command(
             &req,
             UserId::new(1),
+            SymbolId::new(1),
             OrderId::new(1),
             UnixMicros::from_micros(0),
         );

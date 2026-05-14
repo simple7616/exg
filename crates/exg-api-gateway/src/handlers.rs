@@ -72,10 +72,7 @@ pub async fn place_order(
     body: web::Json<PlaceOrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
     let user_id = extract_user_id(&req)?;
-    // Validate symbol exists; to_new_order_command uses SymbolId(0) as placeholder
-    // (real resolution wired in Stage 2), but we still reject unknown symbols at the
-    // gateway boundary.
-    let _symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
+    let symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
     let order_id = OrderId::new(state.snowflake.next_id());
     let ts = now();
     info!(
@@ -83,10 +80,11 @@ pub async fn place_order(
         path = "/order",
         user_id = user_id.value(),
         order_id = order_id.value(),
+        symbol_id = symbol.value(),
         "place_order in"
     );
 
-    let cmd = to_new_order_command(&body, user_id, order_id, ts).inspect_err(|e| {
+    let cmd = to_new_order_command(&body, user_id, symbol, order_id, ts).inspect_err(|e| {
         warn!(target: "conversion", reason = %e.msg, "to_new_order_command failed");
     })?;
     enqueue(&state, &cmd)?;

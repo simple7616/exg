@@ -89,6 +89,7 @@ fn parse_decimal(s: &str, field: &str) -> Result<Decimal128, ApiError> {
 pub fn to_new_order_command(
     req: &PlaceOrderRequest,
     user_id: UserId,
+    symbol: SymbolId,
     order_id: OrderId,
     timestamp: UnixMicros,
 ) -> Result<Command, ApiError> {
@@ -120,10 +121,6 @@ pub fn to_new_order_command(
         .as_deref()
         .map(|p| parse_decimal(p, "stop_price"))
         .transpose()?;
-
-    // Symbol is passed as string in the API; we use SymbolId(0) as placeholder.
-    // Real symbol resolution happens at the gateway layer with a symbol registry.
-    let symbol = SymbolId::new(0);
 
     let client_order_id = req
         .client_order_id
