@@ -3,9 +3,7 @@ use exg_common::{OrderId, SymbolId, UnixMicros, UserId};
 use exg_protocol::Command;
 use tracing::{info, warn};
 
-use crate::conversion::{
-    to_amend_order_command, to_cancel_order_command, to_new_order_command,
-};
+use crate::conversion::{to_amend_order_command, to_cancel_order_command, to_new_order_command};
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::types::{
@@ -239,7 +237,11 @@ mod tests {
             .set_payload("not json")
             .to_request();
         let resp = test::call_service(&app, req).await;
-        assert!(resp.status().is_client_error(), "got status {}", resp.status());
+        assert!(
+            resp.status().is_client_error(),
+            "got status {}",
+            resp.status()
+        );
     }
 
     #[actix_web::test]

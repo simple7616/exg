@@ -1,4 +1,6 @@
-use exg_common::{Decimal128, MarginMode, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
+use exg_common::{
+    Decimal128, MarginMode, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId,
+};
 use exg_protocol::Command;
 
 use crate::error::ApiError;

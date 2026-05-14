@@ -1,4 +1,7 @@
-use exg_common::{Decimal128, ExgError, ExgResult, MarginMode, PositionSide, SymbolId, TradeId, UnixMicros, UserId};
+use exg_common::{
+    Decimal128, ExgError, ExgResult, MarginMode, PositionSide, SymbolId, TradeId, UnixMicros,
+    UserId,
+};
 use exg_ledger::{Ledger, WalletType};
 use exg_risk_engine::{MarginTier, Position, SymbolConfig, funding::calc_funding_fee};
 use serde::{Deserialize, Serialize};
@@ -143,8 +146,9 @@ impl ClearingService {
                 .calc_margin_released(user_id, symbol, close_qty)
                 .unwrap_or(Decimal128::ZERO);
 
-            let (realized_pnl, _remaining) =
-                self.position_manager.reduce_or_close(user_id, symbol, close_qty, price)?;
+            let (realized_pnl, _remaining) = self
+                .position_manager
+                .reduce_or_close(user_id, symbol, close_qty, price)?;
 
             // Fee is proportionally split: close gets close_qty/qty share.
             let close_fee = if qty.is_positive() {
@@ -212,18 +216,18 @@ impl ClearingService {
         let position = self
             .position_manager
             .force_close(user_id, symbol)
-            .ok_or_else(|| ExgError::Internal(format!(
-                "no position to liquidate for user {user_id} symbol {symbol}"
-            )))?;
+            .ok_or_else(|| {
+                ExgError::Internal(format!(
+                    "no position to liquidate for user {user_id} symbol {symbol}"
+                ))
+            })?;
 
         // Calculate realized PnL.
         let realized_pnl = match position.side {
             PositionSide::Long | PositionSide::Both => {
                 (exit_price - position.entry_price) * position.size
             }
-            PositionSide::Short => {
-                (position.entry_price - exit_price) * position.size
-            }
+            PositionSide::Short => (position.entry_price - exit_price) * position.size,
         };
 
         // surplus = margin + realized_pnl
@@ -281,7 +285,8 @@ impl ClearingService {
             let idemp_key = format!("funding_{funding_period_id}_{user_id}_{sym}");
 
             // Settle in ledger.
-            self.ledger.settle_funding(user_id, payment, &idemp_key, timestamp)?;
+            self.ledger
+                .settle_funding(user_id, payment, &idemp_key, timestamp)?;
 
             // Check if margin was touched (user needs liquidation check).
             if payment.is_positive() {
@@ -294,7 +299,9 @@ impl ClearingService {
             }
 
             // Update accumulated funding on position.
-            if let Some(pos) = self.position_manager.all_positions_mut()
+            if let Some(pos) = self
+                .position_manager
+                .all_positions_mut()
                 .find(|p| p.user_id == user_id && p.symbol == *sym)
             {
                 pos.accumulated_funding = pos.accumulated_funding + payment;
@@ -393,9 +400,12 @@ impl ClearingService {
                 .calc_margin_released(*cp_user_id, symbol, reduce_qty)
                 .unwrap_or(Decimal128::ZERO);
 
-            let (realized_pnl, _remaining) =
-                self.position_manager
-                    .reduce_or_close(*cp_user_id, symbol, reduce_qty, mark_price)?;
+            let (realized_pnl, _remaining) = self.position_manager.reduce_or_close(
+                *cp_user_id,
+                symbol,
+                reduce_qty,
+                mark_price,
+            )?;
 
             let idemp_key = format!("adl-{bankrupt_user}-{cp_user_id}-{symbol}-{timestamp}");
 
@@ -484,8 +494,12 @@ mod tests {
             .unwrap();
         ledger
             .transfer(
-                user_id, WalletType::Funding, WalletType::Futures,
-                amount, &format!("xfer-{user_id}"), ts(2),
+                user_id,
+                WalletType::Funding,
+                WalletType::Futures,
+                amount,
+                &format!("xfer-{user_id}"),
+                ts(2),
             )
             .unwrap();
     }
@@ -546,7 +560,10 @@ mod tests {
         let trade = make_trade(1, buyer, seller, "100", "10", "0.4", "0.4", "10", "10");
         cs.process_trade(&trade, &config).unwrap();
 
-        let pos = cs.position_manager.get_position(buyer, SymbolId::new(1)).unwrap();
+        let pos = cs
+            .position_manager
+            .get_position(buyer, SymbolId::new(1))
+            .unwrap();
         assert_eq!(pos.side, PositionSide::Long);
         assert_eq!(pos.size, dec("10"));
         assert_eq!(pos.entry_price, dec("100"));
@@ -576,7 +593,10 @@ mod tests {
         let trade2 = make_trade(2, buyer, seller, "120", "10", "0", "0", "10", "10");
         cs.process_trade(&trade2, &config).unwrap();
 
-        let pos = cs.position_manager.get_position(buyer, SymbolId::new(1)).unwrap();
+        let pos = cs
+            .position_manager
+            .get_position(buyer, SymbolId::new(1))
+            .unwrap();
         assert_eq!(pos.size, dec("20"));
         // avg = (10*100 + 10*120) / 20 = 110
         assert_eq!(pos.entry_price, dec("110"));
@@ -607,7 +627,11 @@ mod tests {
         cs.process_trade(&trade2, &config).unwrap();
 
         // Buyer's long should be closed.
-        assert!(cs.position_manager.get_position(buyer, SymbolId::new(1)).is_none());
+        assert!(
+            cs.position_manager
+                .get_position(buyer, SymbolId::new(1))
+                .is_none()
+        );
         // PnL = (110 - 100) * 10 = 100 — reflected in available balance.
     }
 
@@ -635,7 +659,11 @@ mod tests {
         let trade2 = make_trade(2, seller, buyer, "90", "10", "0", "0", "10", "10");
         cs.process_trade(&trade2, &config).unwrap();
 
-        assert!(cs.position_manager.get_position(buyer, SymbolId::new(1)).is_none());
+        assert!(
+            cs.position_manager
+                .get_position(buyer, SymbolId::new(1))
+                .is_none()
+        );
         // PnL = (90 - 100) * 10 = -100
     }
 
@@ -657,7 +685,10 @@ mod tests {
         let trade1 = make_trade(1, buyer, seller, "100", "10", "0", "0", "10", "10");
         cs.process_trade(&trade1, &config).unwrap();
 
-        let pos = cs.position_manager.get_position(seller, SymbolId::new(1)).unwrap();
+        let pos = cs
+            .position_manager
+            .get_position(seller, SymbolId::new(1))
+            .unwrap();
         assert_eq!(pos.side, PositionSide::Short);
         assert_eq!(pos.size, dec("10"));
 
@@ -668,7 +699,11 @@ mod tests {
         cs.process_trade(&trade2, &config).unwrap();
 
         // Seller's short is closed; PnL = (100-90)*10 = 100
-        assert!(cs.position_manager.get_position(seller, SymbolId::new(1)).is_none());
+        assert!(
+            cs.position_manager
+                .get_position(seller, SymbolId::new(1))
+                .is_none()
+        );
     }
 
     // ── 6. Partial close ───────────────────────────────────────────────
@@ -695,7 +730,10 @@ mod tests {
         let trade2 = make_trade(2, seller, buyer, "110", "3", "0", "0", "10", "10");
         cs.process_trade(&trade2, &config).unwrap();
 
-        let pos = cs.position_manager.get_position(buyer, SymbolId::new(1)).unwrap();
+        let pos = cs
+            .position_manager
+            .get_position(buyer, SymbolId::new(1))
+            .unwrap();
         assert_eq!(pos.size, dec("7"));
         assert_eq!(pos.entry_price, dec("100")); // Entry unchanged.
     }
@@ -718,7 +756,11 @@ mod tests {
         let trade1 = make_trade(1, buyer, seller, "100", "10", "0", "0", "10", "10");
         cs.process_trade(&trade1, &config).unwrap();
 
-        assert!(cs.position_manager.get_position(buyer, SymbolId::new(1)).is_some());
+        assert!(
+            cs.position_manager
+                .get_position(buyer, SymbolId::new(1))
+                .is_some()
+        );
 
         // Sell 15 at 110 — close long 10, open short 5
         freeze(&mut cs.ledger, seller, dec("500"), "freeze-s2");
@@ -727,7 +769,10 @@ mod tests {
         cs.process_trade(&trade2, &config).unwrap();
 
         // Buyer (who was long, now sold 15) should have a short position of 5.
-        let pos = cs.position_manager.get_position(buyer, SymbolId::new(1)).unwrap();
+        let pos = cs
+            .position_manager
+            .get_position(buyer, SymbolId::new(1))
+            .unwrap();
         assert_eq!(pos.side, PositionSide::Short);
         assert_eq!(pos.size, dec("5"));
         assert_eq!(pos.entry_price, dec("110"));
@@ -776,7 +821,9 @@ mod tests {
         cs.process_trade(&trade, &config).unwrap();
 
         // Liquidate at 95 (loss = 50). Margin was 100. Surplus = 100 + (-50) = 50.
-        let surplus = cs.process_liquidation(user, SymbolId::new(1), dec("95"), &config).unwrap();
+        let surplus = cs
+            .process_liquidation(user, SymbolId::new(1), dec("95"), &config)
+            .unwrap();
         assert_eq!(surplus, dec("50"));
         assert!(cs.insurance_fund_balance().is_positive());
     }
@@ -794,8 +841,12 @@ mod tests {
         let seed_user = uid(99);
         setup_user(&mut cs.ledger, seed_user, dec("5000"));
         freeze(&mut cs.ledger, seed_user, dec("500"), "freeze-seed");
-        cs.ledger.open_position(seed_user, dec("500"), dec("0"), "open-seed", ts(5)).unwrap();
-        cs.ledger.liquidate(seed_user, dec("500"), dec("200"), "liq-seed", ts(6)).unwrap();
+        cs.ledger
+            .open_position(seed_user, dec("500"), dec("0"), "open-seed", ts(5))
+            .unwrap();
+        cs.ledger
+            .liquidate(seed_user, dec("500"), dec("200"), "liq-seed", ts(6))
+            .unwrap();
         assert_eq!(cs.insurance_fund_balance(), dec("200"));
 
         // Now main user.
@@ -808,7 +859,9 @@ mod tests {
         cs.process_trade(&trade, &config).unwrap();
 
         // Liquidate at 85 (loss = 150). Margin was 100. Deficit = 100 + (-150) = -50.
-        let surplus = cs.process_liquidation(user, SymbolId::new(1), dec("85"), &config).unwrap();
+        let surplus = cs
+            .process_liquidation(user, SymbolId::new(1), dec("85"), &config)
+            .unwrap();
         assert_eq!(surplus, dec("-50"));
         // Insurance fund: 200 - 50 = 150
         assert_eq!(cs.insurance_fund_balance(), dec("150"));
@@ -831,16 +884,24 @@ mod tests {
         let trade = make_trade(1, buyer, seller, "100", "10", "0", "0", "10", "10");
         cs.process_trade(&trade, &config).unwrap();
 
-        let available_before = cs.ledger.get_balance(buyer, WalletType::Futures).unwrap().available;
+        let available_before = cs
+            .ledger
+            .get_balance(buyer, WalletType::Futures)
+            .unwrap()
+            .available;
 
         // Positive rate: longs pay. fee = 10 * 100 * 0.001 = 1
-        let result = cs.settle_funding(
-            SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(200),
-        ).unwrap();
+        let result = cs
+            .settle_funding(SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(200))
+            .unwrap();
 
         assert!(result.total_long_payment.is_positive());
 
-        let available_after = cs.ledger.get_balance(buyer, WalletType::Futures).unwrap().available;
+        let available_after = cs
+            .ledger
+            .get_balance(buyer, WalletType::Futures)
+            .unwrap()
+            .available;
         assert!(available_after < available_before);
     }
 
@@ -861,17 +922,25 @@ mod tests {
         let trade = make_trade(1, buyer, seller, "100", "10", "0", "0", "10", "10");
         cs.process_trade(&trade, &config).unwrap();
 
-        let available_before = cs.ledger.get_balance(seller, WalletType::Futures).unwrap().available;
+        let available_before = cs
+            .ledger
+            .get_balance(seller, WalletType::Futures)
+            .unwrap()
+            .available;
 
         // Positive rate: shorts receive. fee for short = -(10 * 100 * 0.001) = -1
-        let result = cs.settle_funding(
-            SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(200),
-        ).unwrap();
+        let result = cs
+            .settle_funding(SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(200))
+            .unwrap();
 
         // Short payment is negative (receiving).
         assert!(result.total_short_payment.is_negative());
 
-        let available_after = cs.ledger.get_balance(seller, WalletType::Futures).unwrap().available;
+        let available_after = cs
+            .ledger
+            .get_balance(seller, WalletType::Futures)
+            .unwrap()
+            .available;
         assert!(available_after > available_before);
     }
 
@@ -916,9 +985,9 @@ mod tests {
         // Funding = 10 * 100 * 0.01 = 10. Available (10) covers it exactly.
         // But let's use a bigger rate so margin is touched.
         // Funding = 10 * 100 * 0.02 = 20. Available = 10, so 10 from margin.
-        let result = cs2.settle_funding(
-            SymbolId::new(1), dec("0.02"), dec("100"), 1, ts(200),
-        ).unwrap();
+        let result = cs2
+            .settle_funding(SymbolId::new(1), dec("0.02"), dec("100"), 1, ts(200))
+            .unwrap();
 
         // User should be flagged for liquidation check.
         assert!(result.users_needing_liquidation_check.contains(&buyer));
@@ -945,15 +1014,29 @@ mod tests {
         let trade = make_trade(1, buyer, seller, "100", "10", "0", "0", "10", "10");
         cs.process_trade(&trade, &config).unwrap();
 
-        let available_before = cs.ledger.get_balance(buyer, WalletType::Futures).unwrap().available;
+        let available_before = cs
+            .ledger
+            .get_balance(buyer, WalletType::Futures)
+            .unwrap()
+            .available;
 
         // First settlement.
-        cs.settle_funding(SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(200)).unwrap();
-        let available_after_first = cs.ledger.get_balance(buyer, WalletType::Futures).unwrap().available;
+        cs.settle_funding(SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(200))
+            .unwrap();
+        let available_after_first = cs
+            .ledger
+            .get_balance(buyer, WalletType::Futures)
+            .unwrap()
+            .available;
 
         // Same period_id again — should be idempotent.
-        cs.settle_funding(SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(201)).unwrap();
-        let available_after_second = cs.ledger.get_balance(buyer, WalletType::Futures).unwrap().available;
+        cs.settle_funding(SymbolId::new(1), dec("0.001"), dec("100"), 1, ts(201))
+            .unwrap();
+        let available_after_second = cs
+            .ledger
+            .get_balance(buyer, WalletType::Futures)
+            .unwrap()
+            .available;
 
         // Balance shouldn't change on second call.
         assert_eq!(available_after_first, available_after_second);
@@ -991,8 +1074,14 @@ mod tests {
             cs.position_manager.position_count()
         );
 
-        let orig_pos = cs.position_manager.get_position(buyer, SymbolId::new(1)).unwrap();
-        let rest_pos = restored.position_manager.get_position(buyer, SymbolId::new(1)).unwrap();
+        let orig_pos = cs
+            .position_manager
+            .get_position(buyer, SymbolId::new(1))
+            .unwrap();
+        let rest_pos = restored
+            .position_manager
+            .get_position(buyer, SymbolId::new(1))
+            .unwrap();
         assert_eq!(orig_pos.size, rest_pos.size);
         assert_eq!(orig_pos.entry_price, rest_pos.entry_price);
         assert_eq!(orig_pos.side, rest_pos.side);
@@ -1004,8 +1093,8 @@ mod tests {
     fn test_adl_selects_highest_ranked_counterparty() {
         let mut cs = ClearingService::new();
         let bankrupt = uid(1);
-        let cp_high = uid(2);  // high profit => high ADL score
-        let cp_low = uid(3);   // low profit => low ADL score
+        let cp_high = uid(2); // high profit => high ADL score
+        let cp_low = uid(3); // low profit => low ADL score
         let config = default_symbol_config();
 
         setup_user(&mut cs.ledger, bankrupt, dec("10000"));
@@ -1039,15 +1128,17 @@ mod tests {
         //   score = (100 * 400) / (250 * 250) = 0.64
         //
         // cp_high has much higher score => selected first.
-        let result = cs.execute_adl(
-            bankrupt,
-            SymbolId::new(1),
-            PositionSide::Long,   // bankrupt was long
-            dec("50"),            // deficit
-            dec("80"),            // mark price
-            &config.margin_tiers,
-            ts(500),
-        ).unwrap();
+        let result = cs
+            .execute_adl(
+                bankrupt,
+                SymbolId::new(1),
+                PositionSide::Long, // bankrupt was long
+                dec("50"),          // deficit
+                dec("80"),          // mark price
+                &config.margin_tiers,
+                ts(500),
+            )
+            .unwrap();
 
         // Should select cp_high first (highest ADL score).
         assert!(!result.is_empty());

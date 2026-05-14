@@ -18,12 +18,8 @@ pub fn calc_adl_ranking(
         .iter()
         .filter(|p| !p.margin.is_zero())
         .map(|p| {
-            let unrealized_pnl = crate::margin::calc_unrealized_pnl(
-                p.entry_price,
-                mark_price,
-                p.size,
-                p.side,
-            );
+            let unrealized_pnl =
+                crate::margin::calc_unrealized_pnl(p.entry_price, mark_price, p.size, p.side);
             let notional = p.size * mark_price;
             // ADL score = (upnl / margin) * (notional / margin)
             //           = (upnl * notional) / (margin * margin)
@@ -42,8 +38,8 @@ pub fn calc_adl_ranking(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exg_common::{Decimal128, MarginMode, PositionSide, SymbolId, UserId};
     use crate::Position;
+    use exg_common::{Decimal128, MarginMode, PositionSide, SymbolId, UserId};
 
     fn dec(s: &str) -> Decimal128 {
         s.parse().unwrap()

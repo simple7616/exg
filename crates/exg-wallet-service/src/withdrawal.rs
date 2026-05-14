@@ -115,25 +115,25 @@ impl WithdrawalProcessor {
     }
 
     /// Approve a pending withdrawal.
-    pub fn approve(
-        &mut self,
-        withdrawal_id: u64,
-        reviewer: UserId,
-    ) -> Result<(), WalletError> {
+    pub fn approve(&mut self, withdrawal_id: u64, reviewer: UserId) -> Result<(), WalletError> {
         let withdrawal = self.find_mut(withdrawal_id)?;
-        Self::transition(withdrawal, WithdrawalStatus::PendingReview, WithdrawalStatus::Approved)?;
+        Self::transition(
+            withdrawal,
+            WithdrawalStatus::PendingReview,
+            WithdrawalStatus::Approved,
+        )?;
         withdrawal.reviewed_by = Some(reviewer);
         Ok(())
     }
 
     /// Reject a pending withdrawal.
-    pub fn reject(
-        &mut self,
-        withdrawal_id: u64,
-        reviewer: UserId,
-    ) -> Result<(), WalletError> {
+    pub fn reject(&mut self, withdrawal_id: u64, reviewer: UserId) -> Result<(), WalletError> {
         let withdrawal = self.find_mut(withdrawal_id)?;
-        Self::transition(withdrawal, WithdrawalStatus::PendingReview, WithdrawalStatus::Rejected)?;
+        Self::transition(
+            withdrawal,
+            WithdrawalStatus::PendingReview,
+            WithdrawalStatus::Rejected,
+        )?;
         withdrawal.reviewed_by = Some(reviewer);
         Ok(())
     }
@@ -145,7 +145,11 @@ impl WithdrawalProcessor {
         tx_hash: &str,
     ) -> Result<(), WalletError> {
         let withdrawal = self.find_mut(withdrawal_id)?;
-        Self::transition(withdrawal, WithdrawalStatus::Approved, WithdrawalStatus::Processing)?;
+        Self::transition(
+            withdrawal,
+            WithdrawalStatus::Approved,
+            WithdrawalStatus::Processing,
+        )?;
         withdrawal.tx_hash = Some(tx_hash.to_string());
         Ok(())
     }
@@ -153,13 +157,21 @@ impl WithdrawalProcessor {
     /// Mark as completed (tx confirmed).
     pub fn mark_completed(&mut self, withdrawal_id: u64) -> Result<(), WalletError> {
         let withdrawal = self.find_mut(withdrawal_id)?;
-        Self::transition(withdrawal, WithdrawalStatus::Processing, WithdrawalStatus::Completed)
+        Self::transition(
+            withdrawal,
+            WithdrawalStatus::Processing,
+            WithdrawalStatus::Completed,
+        )
     }
 
     /// Mark as failed.
     pub fn mark_failed(&mut self, withdrawal_id: u64) -> Result<(), WalletError> {
         let withdrawal = self.find_mut(withdrawal_id)?;
-        Self::transition(withdrawal, WithdrawalStatus::Processing, WithdrawalStatus::Failed)
+        Self::transition(
+            withdrawal,
+            WithdrawalStatus::Processing,
+            WithdrawalStatus::Failed,
+        )
     }
 
     /// Get pending review withdrawals.

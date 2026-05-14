@@ -89,12 +89,11 @@ impl PositionManager {
         exit_price: Decimal128,
     ) -> ExgResult<(Decimal128, Option<&Position>)> {
         let key = (user_id, symbol);
-        let position = self
-            .positions
-            .get(&key)
-            .ok_or_else(|| ExgError::Internal(format!(
+        let position = self.positions.get(&key).ok_or_else(|| {
+            ExgError::Internal(format!(
                 "no position found for user {user_id} symbol {symbol}"
-            )))?;
+            ))
+        })?;
 
         if qty > position.size {
             return Err(ExgError::Internal(format!(
@@ -203,7 +202,13 @@ mod tests {
         let sym = SymbolId::new(1);
 
         let pos = pm.open_or_increase(
-            uid, sym, PositionSide::Long, dec("10"), dec("100"), dec("10"), MarginMode::Cross,
+            uid,
+            sym,
+            PositionSide::Long,
+            dec("10"),
+            dec("100"),
+            dec("10"),
+            MarginMode::Cross,
         );
         assert_eq!(pos.size, dec("10"));
         assert_eq!(pos.entry_price, dec("100"));
@@ -216,8 +221,24 @@ mod tests {
         let uid = UserId::new(1);
         let sym = SymbolId::new(1);
 
-        pm.open_or_increase(uid, sym, PositionSide::Long, dec("10"), dec("100"), dec("10"), MarginMode::Cross);
-        let pos = pm.open_or_increase(uid, sym, PositionSide::Long, dec("10"), dec("120"), dec("10"), MarginMode::Cross);
+        pm.open_or_increase(
+            uid,
+            sym,
+            PositionSide::Long,
+            dec("10"),
+            dec("100"),
+            dec("10"),
+            MarginMode::Cross,
+        );
+        let pos = pm.open_or_increase(
+            uid,
+            sym,
+            PositionSide::Long,
+            dec("10"),
+            dec("120"),
+            dec("10"),
+            MarginMode::Cross,
+        );
 
         assert_eq!(pos.size, dec("20"));
         // avg = (10*100 + 10*120) / 20 = 2200/20 = 110
@@ -232,7 +253,15 @@ mod tests {
         let uid = UserId::new(1);
         let sym = SymbolId::new(1);
 
-        pm.open_or_increase(uid, sym, PositionSide::Long, dec("10"), dec("100"), dec("10"), MarginMode::Cross);
+        pm.open_or_increase(
+            uid,
+            sym,
+            PositionSide::Long,
+            dec("10"),
+            dec("100"),
+            dec("10"),
+            MarginMode::Cross,
+        );
 
         let (pnl, remaining) = pm.reduce_or_close(uid, sym, dec("3"), dec("110")).unwrap();
         // PnL = (110 - 100) * 3 = 30
@@ -247,7 +276,15 @@ mod tests {
         let uid = UserId::new(1);
         let sym = SymbolId::new(1);
 
-        pm.open_or_increase(uid, sym, PositionSide::Long, dec("10"), dec("100"), dec("10"), MarginMode::Cross);
+        pm.open_or_increase(
+            uid,
+            sym,
+            PositionSide::Long,
+            dec("10"),
+            dec("100"),
+            dec("10"),
+            MarginMode::Cross,
+        );
 
         let (pnl, remaining) = pm.reduce_or_close(uid, sym, dec("10"), dec("90")).unwrap();
         // PnL = (90 - 100) * 10 = -100
@@ -261,7 +298,15 @@ mod tests {
         let uid = UserId::new(1);
         let sym = SymbolId::new(1);
 
-        pm.open_or_increase(uid, sym, PositionSide::Short, dec("5"), dec("200"), dec("20"), MarginMode::Isolated);
+        pm.open_or_increase(
+            uid,
+            sym,
+            PositionSide::Short,
+            dec("5"),
+            dec("200"),
+            dec("20"),
+            MarginMode::Isolated,
+        );
 
         let closed = pm.force_close(uid, sym);
         assert!(closed.is_some());
@@ -275,18 +320,36 @@ mod tests {
     fn test_snapshot_roundtrip() {
         let mut pm = PositionManager::new();
         pm.open_or_increase(
-            UserId::new(1), SymbolId::new(1), PositionSide::Long,
-            dec("10"), dec("100"), dec("10"), MarginMode::Cross,
+            UserId::new(1),
+            SymbolId::new(1),
+            PositionSide::Long,
+            dec("10"),
+            dec("100"),
+            dec("10"),
+            MarginMode::Cross,
         );
         pm.open_or_increase(
-            UserId::new(2), SymbolId::new(1), PositionSide::Short,
-            dec("5"), dec("200"), dec("20"), MarginMode::Isolated,
+            UserId::new(2),
+            SymbolId::new(1),
+            PositionSide::Short,
+            dec("5"),
+            dec("200"),
+            dec("20"),
+            MarginMode::Isolated,
         );
 
         let snap = pm.take_snapshot();
         let restored = PositionManager::restore_from_snapshot(snap);
         assert_eq!(restored.position_count(), 2);
-        assert!(restored.get_position(UserId::new(1), SymbolId::new(1)).is_some());
-        assert!(restored.get_position(UserId::new(2), SymbolId::new(1)).is_some());
+        assert!(
+            restored
+                .get_position(UserId::new(1), SymbolId::new(1))
+                .is_some()
+        );
+        assert!(
+            restored
+                .get_position(UserId::new(2), SymbolId::new(1))
+                .is_some()
+        );
     }
 }

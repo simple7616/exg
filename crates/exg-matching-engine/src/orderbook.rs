@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
-use exg_common::{Decimal128, OrderId, Side, SymbolId, TimeInForce, UnixMicros, UserId, OrderType};
+use exg_common::{Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
@@ -77,18 +77,18 @@ impl OrderBook {
         let qty = order.remaining_qty;
 
         self.orders.insert(order_id, order);
-        self.user_orders
-            .entry(user_id)
-            .or_default()
-            .push(order_id);
+        self.user_orders.entry(user_id).or_default().push(order_id);
 
         match side {
             Side::Buy => {
-                let level = self.bids.entry(Reverse(price)).or_insert_with(|| PriceLevel {
-                    price,
-                    total_qty: Decimal128::ZERO,
-                    orders: Vec::new(),
-                });
+                let level = self
+                    .bids
+                    .entry(Reverse(price))
+                    .or_insert_with(|| PriceLevel {
+                        price,
+                        total_qty: Decimal128::ZERO,
+                        orders: Vec::new(),
+                    });
                 level.total_qty = level.total_qty + qty;
                 level.orders.push(order_id);
             }
@@ -320,13 +320,7 @@ mod tests {
         s.parse().unwrap()
     }
 
-    fn make_order(
-        id: u64,
-        user: u64,
-        side: Side,
-        price: &str,
-        qty: &str,
-    ) -> BookOrder {
+    fn make_order(id: u64, user: u64, side: Side, price: &str, qty: &str) -> BookOrder {
         BookOrder {
             order_id: OrderId::new(id),
             user_id: UserId::new(user),

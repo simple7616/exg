@@ -61,7 +61,12 @@ fn happy_dump_three_events() {
     dump(tmp.path(), 0, &mut out).unwrap();
     let s = String::from_utf8(out).unwrap();
     let lines: Vec<&str> = s.lines().collect();
-    assert_eq!(lines.len(), 3, "expected 3 JSON lines, got {}: {s}", lines.len());
+    assert_eq!(
+        lines.len(),
+        3,
+        "expected 3 JSON lines, got {}: {s}",
+        lines.len()
+    );
     assert!(lines[0].contains("OrderAccepted"));
     assert!(lines[1].contains("OrderRejected"));
     assert!(lines[1].contains("InsufficientMargin"));

@@ -36,8 +36,8 @@ fn test_env_override() {
     // SAFETY: This test is single-threaded with respect to this env var name.
     unsafe { std::env::set_var("TESTCFG1_SERVER_PORT", "9999") };
 
-    let cfg = ExgConfig::load_with_prefix(&path, "TESTCFG1")
-        .expect("should load with env override");
+    let cfg =
+        ExgConfig::load_with_prefix(&path, "TESTCFG1").expect("should load with env override");
     assert_eq!(cfg.server.port, 9999);
 
     // SAFETY: Restoring env state; no concurrent readers of this var.
@@ -108,7 +108,10 @@ fn test_duplicate_symbol_ids() {
     // Same id=1
     cfg.trading.symbols.push(dup);
     let err = cfg.validate().unwrap_err();
-    assert!(err.to_string().contains("duplicate symbol id"), "error: {err}");
+    assert!(
+        err.to_string().contains("duplicate symbol id"),
+        "error: {err}"
+    );
 }
 
 #[test]

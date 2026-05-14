@@ -92,7 +92,11 @@ async fn place_cancel_amend_happy_path() {
         .send()
         .await
         .unwrap();
-    assert!(amend.status().is_success(), "amend status {}", amend.status());
+    assert!(
+        amend.status().is_success(),
+        "amend status {}",
+        amend.status()
+    );
 
     // Cancel
     let cancel = client
@@ -102,7 +106,11 @@ async fn place_cancel_amend_happy_path() {
         .send()
         .await
         .unwrap();
-    assert!(cancel.status().is_success(), "cancel status {}", cancel.status());
+    assert!(
+        cancel.status().is_success(),
+        "cancel status {}",
+        cancel.status()
+    );
 
     // Give the matching thread a moment to drain.
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -113,7 +121,9 @@ async fn place_cancel_amend_happy_path() {
     assert!(!events.is_empty(), "WAL should contain events");
     // At minimum we expect OrderAccepted from the place call.
     assert!(
-        events.iter().any(|e| matches!(e, Event::OrderAccepted { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, Event::OrderAccepted { .. })),
         "expected at least one OrderAccepted, got: {events:?}"
     );
 }
@@ -146,13 +156,20 @@ async fn missing_x_user_id_returns_401() {
 async fn backpressure_returns_429() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = base_cfg(tmp.path());
-    cfg.ringbuffer.slot_count = 4; // force tiny buffer
+    // Smallest legal slot_count (must be power of 2, >=2). Combined with
+    // many concurrent requests this reliably observes ring-buffer-full even
+    // when other workspace tests are running and the matching thread drains
+    // fast.
+    cfg.ringbuffer.slot_count = 2;
     let (handle, base) = boot_server(cfg).await;
     let client = Client::new();
 
-    // Fire many concurrent requests, expect at least one 429.
+    // Fire MANY concurrent requests, expect at least one 429. The matching
+    // thread drains at ~10us/cmd, so we need enough requests to keep the
+    // ring buffer full faster than draining (especially under parallel test
+    // load).
     let mut joinset = tokio::task::JoinSet::new();
-    for _ in 0..64 {
+    for _ in 0..512 {
         let c = client.clone();
         let url = format!("{base}/api/v1/order");
         joinset.spawn(async move {
@@ -174,7 +191,10 @@ async fn backpressure_returns_429() {
             saw_backpressure = true;
         }
     }
-    assert!(saw_backpressure, "expected at least one 429 under backpressure");
+    assert!(
+        saw_backpressure,
+        "expected at least one 429 under backpressure"
+    );
     handle.shutdown().await.unwrap();
 }
 

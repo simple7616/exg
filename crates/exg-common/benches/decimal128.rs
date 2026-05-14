@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use exg_common::Decimal128;
 
 fn bench_add(c: &mut Criterion) {
@@ -27,7 +27,11 @@ fn bench_div(c: &mut Criterion) {
 
 fn bench_parse(c: &mut Criterion) {
     c.bench_function("decimal128_parse", |bencher| {
-        bencher.iter(|| black_box("12345.678901234567").parse::<Decimal128>().unwrap())
+        bencher.iter(|| {
+            black_box("12345.678901234567")
+                .parse::<Decimal128>()
+                .unwrap()
+        })
     });
 }
 
@@ -38,5 +42,12 @@ fn bench_display(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_add, bench_mul, bench_div, bench_parse, bench_display);
+criterion_group!(
+    benches,
+    bench_add,
+    bench_mul,
+    bench_div,
+    bench_parse,
+    bench_display
+);
 criterion_main!(benches);

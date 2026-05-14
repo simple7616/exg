@@ -63,7 +63,10 @@ impl Ledger {
 
     /// Add to system account balance.
     fn add_system_balance(&mut self, wallet: WalletType, amount: Decimal128) {
-        let entry = self.system_accounts.entry(wallet).or_insert(Decimal128::ZERO);
+        let entry = self
+            .system_accounts
+            .entry(wallet)
+            .or_insert(Decimal128::ZERO);
         *entry = *entry + amount;
     }
 
@@ -76,7 +79,10 @@ impl Ledger {
                 available: current.to_string(),
             });
         }
-        let entry = self.system_accounts.entry(wallet).or_insert(Decimal128::ZERO);
+        let entry = self
+            .system_accounts
+            .entry(wallet)
+            .or_insert(Decimal128::ZERO);
         *entry = *entry - amount;
         Ok(())
     }
@@ -92,7 +98,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !amount.is_positive() {
-            return Err(ExgError::InvalidQuantity("deposit amount must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "deposit amount must be positive".into(),
+            ));
         }
         if self.check_idempotency(idempotency_key) {
             return Ok(());
@@ -129,7 +137,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !amount.is_positive() {
-            return Err(ExgError::InvalidQuantity("withdrawal amount must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "withdrawal amount must be positive".into(),
+            ));
         }
         if self.check_idempotency(idempotency_key) {
             return Ok(());
@@ -181,7 +191,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !amount.is_positive() {
-            return Err(ExgError::InvalidQuantity("transfer amount must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "transfer amount must be positive".into(),
+            ));
         }
         if self.check_idempotency(idempotency_key) {
             return Ok(());
@@ -233,7 +245,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !amount.is_positive() {
-            return Err(ExgError::InvalidQuantity("freeze amount must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "freeze amount must be positive".into(),
+            ));
         }
         if self.check_idempotency(idempotency_key) {
             return Ok(());
@@ -284,7 +298,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !amount.is_positive() {
-            return Err(ExgError::InvalidQuantity("unfreeze amount must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "unfreeze amount must be positive".into(),
+            ));
         }
         if self.check_idempotency(idempotency_key) {
             return Ok(());
@@ -335,7 +351,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !margin_amount.is_positive() {
-            return Err(ExgError::InvalidQuantity("margin amount must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "margin amount must be positive".into(),
+            ));
         }
         if fee.is_negative() {
             return Err(ExgError::InvalidQuantity("fee cannot be negative".into()));
@@ -421,7 +439,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !margin_released.is_positive() {
-            return Err(ExgError::InvalidQuantity("margin released must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "margin released must be positive".into(),
+            ));
         }
         if fee.is_negative() {
             return Err(ExgError::InvalidQuantity("fee cannot be negative".into()));
@@ -590,7 +610,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !margin_released.is_positive() {
-            return Err(ExgError::InvalidQuantity("margin released must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "margin released must be positive".into(),
+            ));
         }
         if fee.is_negative() {
             return Err(ExgError::InvalidQuantity("fee cannot be negative".into()));
@@ -730,7 +752,9 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<()> {
         if !margin_seized.is_positive() {
-            return Err(ExgError::InvalidQuantity("margin seized must be positive".into()));
+            return Err(ExgError::InvalidQuantity(
+                "margin seized must be positive".into(),
+            ));
         }
         if self.check_idempotency(idempotency_key) {
             return Ok(());
@@ -960,7 +984,10 @@ impl Ledger {
         timestamp: UnixMicros,
     ) -> ExgResult<bool> {
         let idemp_key = format!(
-            "funding_{}_{}_{}", funding_period_id, user_id.value(), symbol.value()
+            "funding_{}_{}_{}",
+            funding_period_id,
+            user_id.value(),
+            symbol.value()
         );
 
         // Capture margin before settlement.
@@ -1162,10 +1189,7 @@ mod tests {
         assert_eq!(bal.margin, dec("100"));
 
         // Fee collected.
-        assert_eq!(
-            ledger.system_balance(WalletType::FeeCollection),
-            dec("10")
-        );
+        assert_eq!(ledger.system_balance(WalletType::FeeCollection), dec("10"));
 
         ledger.verify_all_invariants().unwrap();
     }
@@ -1190,7 +1214,13 @@ mod tests {
             .unwrap();
 
         ledger
-            .freeze_for_order(counterparty, WalletType::Futures, dec("100"), "f-u2", ts(10))
+            .freeze_for_order(
+                counterparty,
+                WalletType::Futures,
+                dec("100"),
+                "f-u2",
+                ts(10),
+            )
             .unwrap();
         ledger
             .open_position(counterparty, dec("100"), dec("0"), "o-u2", ts(11))
@@ -1198,7 +1228,15 @@ mod tests {
 
         // Close: user profits 50, fee 5.
         ledger
-            .close_position(user, dec("100"), dec("50"), dec("5"), counterparty, "close-1", ts(20))
+            .close_position(
+                user,
+                dec("100"),
+                dec("50"),
+                dec("5"),
+                counterparty,
+                "close-1",
+                ts(20),
+            )
             .unwrap();
 
         let bal = ledger.get_balance(user, WalletType::Futures).unwrap();
@@ -1207,7 +1245,9 @@ mod tests {
         assert_eq!(bal.margin, dec("0"));
 
         // Counterparty lost 50 from margin.
-        let cp_bal = ledger.get_balance(counterparty, WalletType::Futures).unwrap();
+        let cp_bal = ledger
+            .get_balance(counterparty, WalletType::Futures)
+            .unwrap();
         assert_eq!(cp_bal.margin, dec("50"));
 
         ledger.verify_all_invariants().unwrap();
@@ -1232,7 +1272,13 @@ mod tests {
             .unwrap();
 
         ledger
-            .freeze_for_order(counterparty, WalletType::Futures, dec("100"), "f-u2", ts(10))
+            .freeze_for_order(
+                counterparty,
+                WalletType::Futures,
+                dec("100"),
+                "f-u2",
+                ts(10),
+            )
             .unwrap();
         ledger
             .open_position(counterparty, dec("100"), dec("0"), "o-u2", ts(11))
@@ -1257,7 +1303,9 @@ mod tests {
         assert_eq!(bal.margin, dec("0"));
 
         // Counterparty gains 30 in margin.
-        let cp_bal = ledger.get_balance(counterparty, WalletType::Futures).unwrap();
+        let cp_bal = ledger
+            .get_balance(counterparty, WalletType::Futures)
+            .unwrap();
         assert_eq!(cp_bal.margin, dec("130"));
 
         ledger.verify_all_invariants().unwrap();
@@ -1432,7 +1480,14 @@ mod tests {
         ledger.verify_all_invariants().unwrap();
 
         ledger
-            .transfer(u1, WalletType::Funding, WalletType::Futures, dec("2000"), "t1", ts(3))
+            .transfer(
+                u1,
+                WalletType::Funding,
+                WalletType::Futures,
+                dec("2000"),
+                "t1",
+                ts(3),
+            )
             .unwrap();
         ledger.verify_all_invariants().unwrap();
 

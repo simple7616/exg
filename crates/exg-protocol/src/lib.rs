@@ -293,10 +293,9 @@ mod tests {
         for (i, reason) in all_reject_reasons().into_iter().enumerate() {
             let json = serde_json::to_string(&reason)
                 .unwrap_or_else(|e| panic!("serialize RejectReason[{i}] failed: {e}"));
-            let deserialized: RejectReason = serde_json::from_str(&json)
-                .unwrap_or_else(|e| {
-                    panic!("deserialize RejectReason[{i}] failed: {e}\njson: {json}")
-                });
+            let deserialized: RejectReason = serde_json::from_str(&json).unwrap_or_else(|e| {
+                panic!("deserialize RejectReason[{i}] failed: {e}\njson: {json}")
+            });
             assert_eq!(reason, deserialized, "RejectReason[{i}] roundtrip mismatch");
         }
     }
@@ -308,9 +307,8 @@ mod tests {
         for (i, cmd) in all_commands().into_iter().enumerate() {
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&cmd)
                 .unwrap_or_else(|e| panic!("rkyv serialize Command[{i}] failed: {e}"));
-            let deserialized: Command =
-                rkyv::from_bytes::<Command, rkyv::rancor::Error>(&bytes)
-                    .unwrap_or_else(|e| panic!("rkyv deserialize Command[{i}] failed: {e}"));
+            let deserialized: Command = rkyv::from_bytes::<Command, rkyv::rancor::Error>(&bytes)
+                .unwrap_or_else(|e| panic!("rkyv deserialize Command[{i}] failed: {e}"));
             assert_eq!(cmd, deserialized, "Command[{i}] rkyv roundtrip mismatch");
         }
     }
@@ -320,9 +318,8 @@ mod tests {
         for (i, evt) in all_events().into_iter().enumerate() {
             let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&evt)
                 .unwrap_or_else(|e| panic!("rkyv serialize Event[{i}] failed: {e}"));
-            let deserialized: Event =
-                rkyv::from_bytes::<Event, rkyv::rancor::Error>(&bytes)
-                    .unwrap_or_else(|e| panic!("rkyv deserialize Event[{i}] failed: {e}"));
+            let deserialized: Event = rkyv::from_bytes::<Event, rkyv::rancor::Error>(&bytes)
+                .unwrap_or_else(|e| panic!("rkyv deserialize Event[{i}] failed: {e}"));
             assert_eq!(evt, deserialized, "Event[{i}] rkyv roundtrip mismatch");
         }
     }
@@ -334,9 +331,7 @@ mod tests {
                 .unwrap_or_else(|e| panic!("rkyv serialize RejectReason[{i}] failed: {e}"));
             let deserialized: RejectReason =
                 rkyv::from_bytes::<RejectReason, rkyv::rancor::Error>(&bytes)
-                    .unwrap_or_else(|e| {
-                        panic!("rkyv deserialize RejectReason[{i}] failed: {e}")
-                    });
+                    .unwrap_or_else(|e| panic!("rkyv deserialize RejectReason[{i}] failed: {e}"));
             assert_eq!(
                 reason, deserialized,
                 "RejectReason[{i}] rkyv roundtrip mismatch"

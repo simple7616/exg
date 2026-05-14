@@ -40,9 +40,8 @@ fn parse_decimal(field: &str, value: &str) -> Result<f64, ConfigError> {
         )));
     }
 
-    f64::from_str(value.trim()).map_err(|_| {
-        ConfigError::Validation(format!("{field}: invalid decimal '{value}'"))
-    })
+    f64::from_str(value.trim())
+        .map_err(|_| ConfigError::Validation(format!("{field}: invalid decimal '{value}'")))
 }
 
 fn require_positive(field: &str, value: &str) -> Result<(), ConfigError> {
@@ -84,7 +83,10 @@ pub(crate) fn validate(cfg: &ExgConfig) -> Result<(), ConfigError> {
 
     // Risk config decimal fields
     parse_decimal("risk.price_band_pct", &cfg.risk.price_band_pct)?;
-    parse_decimal("risk.max_position_notional", &cfg.risk.max_position_notional)?;
+    parse_decimal(
+        "risk.max_position_notional",
+        &cfg.risk.max_position_notional,
+    )?;
     parse_decimal("risk.interest_rate", &cfg.risk.interest_rate)?;
     parse_decimal("risk.impact_notional", &cfg.risk.impact_notional)?;
 
@@ -122,7 +124,10 @@ fn validate_symbol(sym: &crate::SymbolConfigEntry) -> Result<(), ConfigError> {
     let mut prev_cap: Option<f64> = None;
     for (i, tier) in sym.margin_tiers.iter().enumerate() {
         let tier_prefix = format!("{prefix}.margin_tiers[{i}]");
-        let floor = parse_decimal(&format!("{tier_prefix}.notional_floor"), &tier.notional_floor)?;
+        let floor = parse_decimal(
+            &format!("{tier_prefix}.notional_floor"),
+            &tier.notional_floor,
+        )?;
         let cap = parse_decimal(&format!("{tier_prefix}.notional_cap"), &tier.notional_cap)?;
         parse_decimal(
             &format!("{tier_prefix}.maintenance_margin_rate"),

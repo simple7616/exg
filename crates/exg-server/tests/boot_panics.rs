@@ -47,7 +47,11 @@ async fn boot_panics_on_nonempty_wal_dir() {
     // Drop a sentinel file with the actual segment filename pattern. The
     // freshness check rejects any entry now (per the fix), so any name works,
     // but using a realistic name documents intent.
-    std::fs::write(tmp.path().join("wal-00000000000000000000.log"), b"stale data").unwrap();
+    std::fs::write(
+        tmp.path().join("wal-00000000000000000000.log"),
+        b"stale data",
+    )
+    .unwrap();
     let cfg = base_cfg(tmp.path());
     let result = exg_server::run_with_config(cfg).await;
     let err = result.err().expect("expected Err from run_with_config");

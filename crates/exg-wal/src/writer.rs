@@ -2,13 +2,13 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 
+use crate::WalConfig;
 use crate::error::WalError;
 use crate::segment::{
     self, DecodeError, RECORD_OVERHEAD, decode_record, encode_record, list_segments,
     segment_filename,
 };
 use crate::snapshot;
-use crate::WalConfig;
 
 pub struct WalWriter {
     config: WalConfig,
@@ -44,32 +44,31 @@ impl WalWriter {
         }
 
         // Determine current segment
-        let (segment_first_seq, segment_path, segment_bytes) = if let Some((first_seq, path)) =
-            segments.last()
-        {
-            let file_len = if let Some((truncate_path, valid_size)) = &truncate_info {
-                if truncate_path == path {
-                    *valid_size
+        let (segment_first_seq, segment_path, segment_bytes) =
+            if let Some((first_seq, path)) = segments.last() {
+                let file_len = if let Some((truncate_path, valid_size)) = &truncate_info {
+                    if truncate_path == path {
+                        *valid_size
+                    } else {
+                        fs::metadata(path)?.len() as usize
+                    }
                 } else {
                     fs::metadata(path)?.len() as usize
+                };
+
+                // Check if the current segment is full
+                if file_len >= config.segment_size {
+                    // Start a new segment
+                    let new_path = config.dir.join(segment_filename(next_sequence));
+                    (next_sequence, new_path, 0)
+                } else {
+                    (*first_seq, path.clone(), file_len)
                 }
             } else {
-                fs::metadata(path)?.len() as usize
+                // No existing segments — create the first one
+                let path = config.dir.join(segment_filename(0));
+                (0, path, 0)
             };
-
-            // Check if the current segment is full
-            if file_len >= config.segment_size {
-                // Start a new segment
-                let new_path = config.dir.join(segment_filename(next_sequence));
-                (next_sequence, new_path, 0)
-            } else {
-                (*first_seq, path.clone(), file_len)
-            }
-        } else {
-            // No existing segments — create the first one
-            let path = config.dir.join(segment_filename(0));
-            (0, path, 0)
-        };
 
         let file = OpenOptions::new()
             .create(true)

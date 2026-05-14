@@ -9,9 +9,7 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 async fn main() -> Result<()> {
     // Tracing
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "info".into()))
         .json()
         .init();
 

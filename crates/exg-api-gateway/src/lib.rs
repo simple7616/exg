@@ -8,7 +8,10 @@ pub mod types;
 pub mod ws;
 
 pub use conversion::*;
-pub use error::{ApiError, ERR_INSUFFICIENT_BALANCE, ERR_INVALID_PARAMETER, ERR_ORDER_NOT_FOUND, ERR_TOO_MANY_REQUESTS, ERR_UNAUTHORIZED, ERR_UNKNOWN};
+pub use error::{
+    ApiError, ERR_INSUFFICIENT_BALANCE, ERR_INVALID_PARAMETER, ERR_ORDER_NOT_FOUND,
+    ERR_TOO_MANY_REQUESTS, ERR_UNAUTHORIZED, ERR_UNKNOWN,
+};
 pub use middleware::{ApiKeyAuth, RateLimiter, validate_timestamp};
 pub use types::*;
 pub use ws::{SubscriptionManager, WsRequest, WsResponse, parse_stream_name};
@@ -150,7 +153,11 @@ mod tests {
         );
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.msg.contains("price"), "Error should mention price: {}", err.msg);
+        assert!(
+            err.msg.contains("price"),
+            "Error should mention price: {}",
+            err.msg
+        );
     }
 
     // ── Rate limiter tests ───────────────────────────────────────────────
@@ -259,7 +266,10 @@ mod tests {
     fn test_subscription_manager_subscribe_and_get_clients() {
         let mut mgr = SubscriptionManager::new();
 
-        let newly = mgr.subscribe(1, &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()]);
+        let newly = mgr.subscribe(
+            1,
+            &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()],
+        );
         assert_eq!(newly.len(), 2);
 
         // Re-subscribing should not return duplicates
@@ -281,7 +291,10 @@ mod tests {
     #[test]
     fn test_subscription_manager_unsubscribe_and_remove_client() {
         let mut mgr = SubscriptionManager::new();
-        mgr.subscribe(1, &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()]);
+        mgr.subscribe(
+            1,
+            &["btcusdt@depth20".to_owned(), "ethusdt@trade".to_owned()],
+        );
         mgr.subscribe(2, &["btcusdt@depth20".to_owned()]);
 
         // Unsubscribe client 1 from one stream
@@ -328,7 +341,12 @@ mod tests {
         )
         .unwrap();
         match cmd {
-            Command::CancelOrder { order_id, user_id, symbol, .. } => {
+            Command::CancelOrder {
+                order_id,
+                user_id,
+                symbol,
+                ..
+            } => {
                 assert_eq!(order_id, OrderId::new(12345));
                 assert_eq!(user_id, UserId::new(42));
                 assert_eq!(symbol, SymbolId::new(1));
@@ -353,7 +371,12 @@ mod tests {
         )
         .unwrap();
         match cmd {
-            Command::AmendOrder { order_id, new_price, new_quantity, .. } => {
+            Command::AmendOrder {
+                order_id,
+                new_price,
+                new_quantity,
+                ..
+            } => {
                 assert_eq!(order_id, OrderId::new(99));
                 assert!(new_price.is_some());
                 assert!(new_quantity.is_none());

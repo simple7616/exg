@@ -13,8 +13,8 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 
 use actix_web::dev::ServerHandle as ActixServerHandle;
@@ -115,9 +115,7 @@ fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
 
 // ── SymbolConfig conversion ───────────────────────────────────────────────
 
-fn symbol_config_from_entry(
-    entry: &exg_config::SymbolConfigEntry,
-) -> anyhow::Result<SymbolConfig> {
+fn symbol_config_from_entry(entry: &exg_config::SymbolConfigEntry) -> anyhow::Result<SymbolConfig> {
     let parse = |s: &str| -> anyhow::Result<Decimal128> {
         s.parse::<Decimal128>()
             .with_context(|| format!("invalid decimal: {s}"))
@@ -258,15 +256,12 @@ pub async fn run_with_config(cfg: ExgConfig) -> anyhow::Result<ServerHandle> {
                         let events: Vec<Event> = engine.process_command(&cmd);
 
                         for evt in &events {
-                            let bytes =
-                                match rkyv::to_bytes::<rkyv::rancor::Error>(evt) {
-                                    Ok(b) => b,
-                                    Err(e) => {
-                                        panic!(
-                                            "matching thread: rkyv encode Event failed: {e}"
-                                        );
-                                    }
-                                };
+                            let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(evt) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    panic!("matching thread: rkyv encode Event failed: {e}");
+                                }
+                            };
                             if let Err(e) = matching_wal.lock().append(&bytes) {
                                 panic!("matching thread: WAL append failed: {e}");
                             }

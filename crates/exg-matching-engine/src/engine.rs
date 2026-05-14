@@ -153,27 +153,29 @@ impl MatchingEngine {
 
         // Validate limit price
         let effective_price = match order_type {
-            OrderType::Limit | OrderType::StopLimit | OrderType::TakeProfitLimit | OrderType::Iceberg => {
-                match price {
-                    Some(p) if p.is_positive() => p,
-                    _ => {
-                        events.push(Event::OrderRejected {
-                            order_id,
-                            user_id,
-                            reason: RejectReason::InvalidOrder,
-                            timestamp,
-                        });
-                        return events;
-                    }
+            OrderType::Limit
+            | OrderType::StopLimit
+            | OrderType::TakeProfitLimit
+            | OrderType::Iceberg => match price {
+                Some(p) if p.is_positive() => p,
+                _ => {
+                    events.push(Event::OrderRejected {
+                        order_id,
+                        user_id,
+                        reason: RejectReason::InvalidOrder,
+                        timestamp,
+                    });
+                    return events;
                 }
-            }
+            },
             // Market-like orders use Decimal128::MAX for buy, ZERO for sell as sentinel
-            OrderType::Market | OrderType::StopMarket | OrderType::TakeProfitMarket | OrderType::TrailingStop => {
-                match side {
-                    Side::Buy => Decimal128::MAX,
-                    Side::Sell => Decimal128::ZERO,
-                }
-            }
+            OrderType::Market
+            | OrderType::StopMarket
+            | OrderType::TakeProfitMarket
+            | OrderType::TrailingStop => match side {
+                Side::Buy => Decimal128::MAX,
+                Side::Sell => Decimal128::ZERO,
+            },
         };
 
         // Validate iceberg visible_qty
@@ -409,8 +411,7 @@ impl MatchingEngine {
                     // GTC, GTD, PostOnly — rest on book
                     if order_type.is_limit() || order_type == OrderType::Iceberg {
                         if let Some(expire) = book_order.expire_time {
-                            self.expiry_heap
-                                .push(Reverse((expire, order_id)));
+                            self.expiry_heap.push(Reverse((expire, order_id)));
                         }
                         self.orderbook.insert_order(book_order);
                     } else {
@@ -578,7 +579,13 @@ impl MatchingEngine {
             });
 
             // Emit fill events
-            self.emit_fill_events(&mut events, &match_result.fills, symbol, timestamp, &amended);
+            self.emit_fill_events(
+                &mut events,
+                &match_result.fills,
+                symbol,
+                timestamp,
+                &amended,
+            );
 
             // Rest remaining on book
             if !amended.remaining_qty.is_zero() && amended.order_type.is_limit() {
@@ -1105,13 +1112,29 @@ mod tests {
         let mut engine = MatchingEngine::new(test_config(), 1);
 
         // Place a resting sell
-        let sell = new_order_cmd(1, 10, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10");
+        let sell = new_order_cmd(
+            1,
+            10,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
+        );
         let events = engine.process_command(&sell);
         assert_eq!(events.len(), 1);
         assert!(is_accepted(&events[0]));
 
         // Place a buy that crosses
-        let buy = new_order_cmd(2, 20, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "5");
+        let buy = new_order_cmd(
+            2,
+            20,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "5",
+        );
         let events = engine.process_command(&buy);
 
         // Should have: OrderAccepted, OrderFilled(maker), OrderFilled(taker), TradeExecuted
@@ -1126,7 +1149,15 @@ mod tests {
     #[test]
     fn test_new_order_rejected_invalid() {
         let mut engine = MatchingEngine::new(test_config(), 1);
-        let cmd = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "0");
+        let cmd = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "0",
+        );
         let events = engine.process_command(&cmd);
         assert_eq!(events.len(), 1);
         assert!(is_rejected(&events[0]));
@@ -1137,7 +1168,15 @@ mod tests {
     #[test]
     fn test_cancel_order() {
         let mut engine = MatchingEngine::new(test_config(), 1);
-        let cmd = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10");
+        let cmd = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
+        );
         engine.process_command(&cmd);
 
         let cancel = Command::CancelOrder {
@@ -1174,7 +1213,15 @@ mod tests {
     #[test]
     fn test_amend_order_price_change() {
         let mut engine = MatchingEngine::new(test_config(), 1);
-        let cmd = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("49000"), "10");
+        let cmd = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("49000"),
+            "10",
+        );
         engine.process_command(&cmd);
 
         let amend = Command::AmendOrder {
@@ -1199,7 +1246,15 @@ mod tests {
     #[test]
     fn test_amend_order_qty_down() {
         let mut engine = MatchingEngine::new(test_config(), 1);
-        let cmd = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10");
+        let cmd = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
+        );
         engine.process_command(&cmd);
 
         let amend = Command::AmendOrder {
@@ -1226,13 +1281,31 @@ mod tests {
     fn test_cancel_all_orders() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("49000"), "10",
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("49000"),
+            "10",
         ));
         engine.process_command(&new_order_cmd(
-            2, 10, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("51000"), "20",
+            2,
+            10,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("51000"),
+            "20",
         ));
         engine.process_command(&new_order_cmd(
-            3, 20, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("48000"), "5",
+            3,
+            20,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("48000"),
+            "5",
         ));
 
         let cancel_all = Command::CancelAllOrders {
@@ -1256,13 +1329,27 @@ mod tests {
 
         // Place a resting ask
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("51000"), "10",
+            1,
+            10,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("51000"),
+            "10",
         ));
 
         // Place a stop-market buy at stop_price=51000
         let stop_buy = new_order_cmd_full(
-            2, 20, Side::Buy, OrderType::StopMarket, TimeInForce::Gtc,
-            None, "5", Some("51000"), None, None,
+            2,
+            20,
+            Side::Buy,
+            OrderType::StopMarket,
+            TimeInForce::Gtc,
+            None,
+            "5",
+            Some("51000"),
+            None,
+            None,
         );
         let events = engine.process_command(&stop_buy);
         assert!(is_accepted(&events[0]));
@@ -1288,13 +1375,27 @@ mod tests {
 
         // Place a resting bid for the triggered sell to match against
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("49000"), "100",
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("49000"),
+            "100",
         ));
 
         // Place trailing stop sell with delta=1000
         let trailing = new_order_cmd_full(
-            2, 20, Side::Sell, OrderType::TrailingStop, TimeInForce::Gtc,
-            None, "5", None, Some("1000"), None,
+            2,
+            20,
+            Side::Sell,
+            OrderType::TrailingStop,
+            TimeInForce::Gtc,
+            None,
+            "5",
+            None,
+            Some("1000"),
+            None,
         );
         let events = engine.process_command(&trailing);
         assert!(is_accepted(&events[0]));
@@ -1321,7 +1422,15 @@ mod tests {
         let mut engine = MatchingEngine::new(test_config(), 1);
 
         // Create GTD order — expire_time is automatically set to timestamp + 24h
-        let cmd = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtd, Some("50000"), "10");
+        let cmd = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtd,
+            Some("50000"),
+            "10",
+        );
         engine.process_command(&cmd);
 
         // The order timestamp is 1_000_001 micros, so expire = 1_000_001 + 86_400_000_000
@@ -1344,16 +1453,36 @@ mod tests {
 
         // Place some orders
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("49000"), "10",
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("49000"),
+            "10",
         ));
         engine.process_command(&new_order_cmd(
-            2, 11, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("51000"), "20",
+            2,
+            11,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("51000"),
+            "20",
         ));
 
         // Place a stop order
         let stop = new_order_cmd_full(
-            3, 12, Side::Buy, OrderType::StopMarket, TimeInForce::Gtc,
-            None, "5", Some("52000"), None, None,
+            3,
+            12,
+            Side::Buy,
+            OrderType::StopMarket,
+            TimeInForce::Gtc,
+            None,
+            "5",
+            Some("52000"),
+            None,
+            None,
         );
         engine.process_command(&stop);
 
@@ -1376,7 +1505,13 @@ mod tests {
     fn test_snapshot_serde_roundtrip() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("49000"), "10",
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("49000"),
+            "10",
         ));
 
         let snapshot = engine.take_snapshot();
@@ -1392,10 +1527,26 @@ mod tests {
     #[test]
     fn test_duplicate_order_rejected() {
         let mut engine = MatchingEngine::new(test_config(), 1);
-        let cmd = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10");
+        let cmd = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
+        );
         engine.process_command(&cmd);
 
-        let dup = new_order_cmd(1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10");
+        let dup = new_order_cmd(
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
+        );
         let events = engine.process_command(&dup);
         assert!(is_rejected(&events[0]));
         assert_eq!(
@@ -1409,11 +1560,23 @@ mod tests {
     fn test_post_only_rejection_via_engine() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10",
+            1,
+            10,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
         ));
 
         let post_only = new_order_cmd(
-            2, 20, Side::Buy, OrderType::Limit, TimeInForce::PostOnly, Some("50000"), "5",
+            2,
+            20,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::PostOnly,
+            Some("50000"),
+            "5",
         );
         let events = engine.process_command(&post_only);
         assert_eq!(events.len(), 1);
@@ -1429,11 +1592,23 @@ mod tests {
     fn test_fok_rejection_via_engine() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10",
+            1,
+            10,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
         ));
 
         let fok = new_order_cmd(
-            2, 20, Side::Buy, OrderType::Limit, TimeInForce::Fok, Some("50000"), "15",
+            2,
+            20,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Fok,
+            Some("50000"),
+            "15",
         );
         let events = engine.process_command(&fok);
         assert_eq!(events.len(), 1);
@@ -1451,11 +1626,23 @@ mod tests {
     fn test_ioc_partial_fill_via_engine() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         engine.process_command(&new_order_cmd(
-            1, 10, Side::Sell, OrderType::Limit, TimeInForce::Gtc, Some("50000"), "10",
+            1,
+            10,
+            Side::Sell,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            Some("50000"),
+            "10",
         ));
 
         let ioc = new_order_cmd(
-            2, 20, Side::Buy, OrderType::Limit, TimeInForce::Ioc, Some("50000"), "15",
+            2,
+            20,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Ioc,
+            Some("50000"),
+            "15",
         );
         let events = engine.process_command(&ioc);
 
@@ -1476,7 +1663,13 @@ mod tests {
     fn test_market_order_no_depth() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         let market = new_order_cmd(
-            1, 10, Side::Buy, OrderType::Market, TimeInForce::Ioc, None, "10",
+            1,
+            10,
+            Side::Buy,
+            OrderType::Market,
+            TimeInForce::Ioc,
+            None,
+            "10",
         );
         let events = engine.process_command(&market);
         // Accept + cancel (no depth)
@@ -1489,7 +1682,13 @@ mod tests {
     fn test_limit_order_no_price() {
         let mut engine = MatchingEngine::new(test_config(), 1);
         let cmd = new_order_cmd(
-            1, 10, Side::Buy, OrderType::Limit, TimeInForce::Gtc, None, "10",
+            1,
+            10,
+            Side::Buy,
+            OrderType::Limit,
+            TimeInForce::Gtc,
+            None,
+            "10",
         );
         let events = engine.process_command(&cmd);
         assert!(is_rejected(&events[0]));
