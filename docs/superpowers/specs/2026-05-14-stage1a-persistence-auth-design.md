@@ -64,6 +64,8 @@ Stage 0 step 3a  symbols.len() == 1
 Stage 0 step 3b  WAL dir empty
 NEW   step 3.5   let pool = PgPool::connect(cfg.database.url).await?
 NEW   step 3.6   sqlx::query("SELECT 1").execute(&pool).await?
+NEW   step 3.7   DUMMY_ARGON2_HASH.set(hash_password("__dummy_constant_for_timing_equalization__")?)
+                 — OnceCell init for constant-time login (per §4.3.2 + §9 #20)
 Stage 0 step 4   WAL open
 Stage 0 step 5   RingBuffer + Producer/Consumer (Box::leak)
 Stage 0 step 6   SymbolConfig conversion
@@ -72,12 +74,14 @@ Stage 0 step 8   SnowflakeGen
 Stage 0 step 9   shutdown_flag
 Stage 0 step 10  Prometheus exporter
 Stage 0 step 11  spawn matching OS thread
-NEW   step 11.5  build AppState { producer, snowflake, cfg, pool, auth_cfg }
+NEW   step 11.5  build AppState { producer, snowflake, cfg, pool, auth_cfg, rate_limiter }
 Stage 0 step 12  Actix HttpServer
 Stage 0 step 13-15  bind / ctrl_c / 5-step shutdown
 ```
 
 Stage 1a does **not** auto-migrate the database. Operators run `scripts/migrate.sh up` (already exists from Stage 0 baseline). `run_with_config` performs only a `SELECT 1` ping; a stale schema is the operator's responsibility. Auto-migrate would couple boot to schema state in a way that breaks rolling deploys and is hard to reason about; sticking with explicit `migrate.sh` keeps the schema-change discipline visible.
+
+**Deployment ordering**: `migrate.sh up` MUST run BEFORE deploying the new binary. The Stage 1a binary expects the `user_client_order_ids` table to exist (and the `users` table from Stage 0); if the binary boots against a stale schema, `SELECT 1` ping succeeds but the first `INSERT INTO user_client_order_ids` returns a `relation does not exist` error, mapped to `ApiError::db_unavailable` → 500. Operators verify schema readiness via `scripts/migrate.sh status` showing the latest migration as applied.
 
 ### 4.3 Auth Module Shape
 
@@ -90,9 +94,43 @@ The existing `crates/exg-user-service/src/auth.rs` (615 LOC) implements an `Auth
   - `pub fn verify_password(plain: &str, hash: &str) -> Result<bool, AuthError>`
 - **PG-backed lib** (new `crates/exg-user-service/src/repo.rs`):
   - `pub async fn register_user(&PgPool, &SnowflakeGen, email, password) -> Result<UserId, AuthError>`
-  - `pub async fn login_user(&PgPool, &auth_cfg, email, password) -> Result<LoginResponse, AuthError>`
+  - `pub async fn login_user(&PgPool, &AuthConfig, email, password) -> Result<LoginResponse, AuthError>`
   - `pub async fn find_user_by_id(&PgPool, UserId) -> Result<Option<UserRow>, AuthError>`
 - **Deprecated in Stage 1a** (mark `#[allow(dead_code)]`, keep for later stages): in-memory `register`/`login` on `AuthService` struct; 2FA / API key / sub-account / login_history mutators. These are not removed because Stage 2+ will revive their PG-backed equivalents.
+
+### 4.3.1 Login Rate Limit (CEO review finding 3.2 fix)
+
+Before `login_user` runs, the handler consults `state.rate_limiter`:
+- key1 = `format!("login:email:{}", email_normalized)`
+- key2 = `format!("login:ip:{}", req.peer_addr().map(|a| a.ip().to_string()).unwrap_or_else(|| "unknown".into()))` (proxy-aware extraction is Stage 7 work; Stage 1a accepts that requests behind a reverse proxy share the "unknown" bucket)
+- If either bucket is exhausted → 429 + `-1003` `"login rate limit"`.
+
+Both buckets use `cfg.risk.max_orders_per_second` as the rate (Stage 7 may split with a dedicated `cfg.risk.max_login_per_second`).
+
+### 4.3.2 Constant-Time Login (CEO review finding 3.3 fix)
+
+Email enumeration via response-time difference (SELECT-miss ~1ms vs SELECT-hit + Argon2-verify ~50ms) is blocked:
+
+```rust
+// In login_user:
+let user_opt = sqlx::query_as!(...).fetch_optional(&pool).await?;
+let (stored_hash, user_id, is_active) = match user_opt {
+    Some(row) => (row.password_hash, row.user_id, row.is_active),
+    None => (
+        // Constant dummy hash precomputed at boot (OnceCell), so verify_password
+        // runs against it and takes the same ~50ms even when email doesn't exist.
+        DUMMY_ARGON2_HASH.get().expect("dummy hash inited at boot").clone(),
+        UserId::new(0),  // sentinel; will fail the next branch anyway
+        false,
+    ),
+};
+let pw_ok = verify_password(&password, &stored_hash)?;
+if user_opt.is_none() || !pw_ok || !is_active {
+    return Err(AuthError::InvalidCredentials);
+}
+```
+
+The constant dummy hash is hashed once at boot from a fixed input (e.g. `hash_password("__dummy_constant_for_timing_equalization__")`) and stored in a `OnceCell<String>`. This ensures `verify_password` runs exactly once per login regardless of which branch we're in.
 
 ### 4.4 AppState Shape Evolution
 
@@ -169,14 +207,14 @@ The dedup table grows monotonically in Stage 1a. Stage 7 adds a cleanup job (del
 | `config/default.toml` | (a) Add `[auth]` section with `jwt_secret = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK"` (placeholder forcing operator to override via env) + `jwt_expiry_secs = 86400`. (b) Fix `[database].url` from `postgres://exg:exg@...` to `postgres://exg:exg_dev_password@localhost:5432/exg` to match `docker-compose.yml` + `scripts/migrate.sh`. |
 | `crates/exg-config/src/lib.rs` | Add `pub struct AuthConfig { pub jwt_secret: String, pub jwt_expiry_secs: u64 }`. Add `pub auth: AuthConfig` to `ExgConfig`. Update `default_config()`. |
 | `crates/exg-config/src/validation.rs` | New checks: `auth.jwt_secret.len() >= 32`; `auth.jwt_secret != "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK"` (placeholder rejection); `auth.jwt_expiry_secs > 0`. |
-| `crates/exg-config/src/tests.rs` | 3 new tests for jwt_secret length / placeholder / expiry. |
-| `crates/exg-user-service/Cargo.toml` | Add `sqlx = { workspace = true, features = [...] }` and `tracing`. |
+| `crates/exg-config/src/tests.rs` | 5 new tests: jwt_secret length too short / equals placeholder / valid 32+ bytes / jwt_expiry_secs=0 rejected / database.url format sanity. |
+| `crates/exg-user-service/Cargo.toml` | Add `sqlx = { workspace = true, features = ["runtime-tokio", "postgres", "chrono"] }` and `tracing`. `jsonwebtoken`, `argon2`, `rand`, `uuid`, `chrono` are already declared (confirmed pre-existing). `secrecy = "0.10"` added if `Secret<String>` path chosen for password redaction (per invariant #18); otherwise manual `impl Debug` suffices and no new dep needed. |
 | `crates/exg-user-service/src/auth.rs` | Extract `sign_jwt` / `verify_jwt` / `hash_password` / `verify_password` as top-level `pub fn`. Mark `AuthService` mutating methods (`register`, `login`, `enable_2fa`, etc.) with `#[allow(dead_code)]` and a `// Stage 1a: replaced by repo::*` doc comment. Do NOT delete — Stage 2+ revives them. |
 | `crates/exg-user-service/src/lib.rs` | Add `pub mod repo;` + re-export `sign_jwt`, `verify_jwt`, `hash_password`, `verify_password`, `JwtClaims`, `LoginResponse`, `AuthError`, `repo::*`. |
 | `crates/exg-api-gateway/Cargo.toml` | Add `sqlx` (workspace) and `exg-user-service` (workspace). |
-| `crates/exg-api-gateway/src/state.rs` | `AppState` gains `pub pool: sqlx::PgPool` + `pub auth_cfg: Arc<exg_config::AuthConfig>` + `pub rate_limiter: Arc<parking_lot::Mutex<crate::middleware::RateLimiter>>`. |
+| `crates/exg-api-gateway/src/state.rs` | `AppState` gains `pub pool: sqlx::PgPool` + `pub auth_cfg: Arc<exg_config::AuthConfig>` + `pub rate_limiter: Arc<parking_lot::Mutex<crate::middleware::RateLimiter>>`. `parking_lot` is already a workspace dep (used by Stage 0 `Mutex<Producer>`). The existing `RateLimiter::consume(key: &str, now)` is keyed by arbitrary string — login uses `login:email:<x>` / `login:ip:<x>` keys, order handlers use `user:<id>` keys. Algorithm is the existing token bucket (one bucket per key); refill rate from `cfg.risk.max_orders_per_second`. |
 | `crates/exg-api-gateway/src/types.rs` | Add `RegisterRequest`, `LoginRequest`, `LoginResponse`, `MeResponse`. All with `#[serde(rename_all = "camelCase")]`. |
-| `crates/exg-api-gateway/src/error.rs` | Add `pub const ERR_RATE_LIMITED_USER: i32 = -1003`; `pub const ERR_DUPLICATE_ORDER: i32 = -1014`. New constructors `duplicate_order(msg)`, `user_rate_limited()`, `db_unavailable(sqlx::Error)`. `status_code` map: `-1014 → 409 CONFLICT`, `-1003 → 429 TOO_MANY_REQUESTS`. |
+| `crates/exg-api-gateway/src/error.rs` | Add `pub const ERR_RATE_LIMITED_USER: i32 = -1003`; `pub const ERR_DUPLICATE_RESOURCE: i32 = -1014`. New constructors `duplicate_resource(msg)`, `user_rate_limited()`, `db_unavailable(sqlx::Error)`. `status_code` map: `-1014 → 409 CONFLICT`, `-1003 → 429 TOO_MANY_REQUESTS`. **Single -1014 constant reused for both "duplicate email" (register) and "duplicate clientOrderId" (place_order) 409 responses** — msg differs (`"email already registered"` vs `"duplicate clientOrderId"`). This is a deliberate semantic stretch acceptable for Stage 1a (both are 409-conflict); Stage 7 may split into distinct codes if client UX requires it. |
 | `crates/exg-api-gateway/src/handlers.rs` | Add `register`, `login`, `me` handlers. Rename `extract_user_id` → `extract_user_id_from_jwt` and rewrite body per §4.5. Add rate-limit gate + dedup gate in `place_order` per §4.6. |
 | `crates/exg-api-gateway/src/app_factory.rs` | Mount `/api/v1/auth/register`, `/api/v1/auth/login`, `/api/v1/me`. |
 | `crates/exg-server/Cargo.toml` | Add `sqlx` with features `runtime-tokio,postgres,macros`. |
@@ -187,10 +225,10 @@ The dedup table grows monotonically in Stage 1a. Stage 7 adds a cleanup job (del
 
 | File | Responsibility |
 |---|---|
-| `migrations/20260201000001_client_order_ids.up.sql` | `CREATE TABLE user_client_order_ids (user_id BIGINT NOT NULL, client_order_id BIGINT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (user_id, client_order_id)); CREATE INDEX idx_user_client_order_ids_created_at ON user_client_order_ids (created_at);` |
-| `migrations/20260201000001_client_order_ids.down.sql` | `DROP TABLE user_client_order_ids;` |
+| `migrations/20260514000001_client_order_ids.up.sql` | `CREATE TABLE user_client_order_ids (user_id BIGINT NOT NULL, client_order_id BIGINT NOT NULL, created_at BIGINT NOT NULL, PRIMARY KEY (user_id, client_order_id)); CREATE INDEX idx_user_client_order_ids_created_at ON user_client_order_ids (created_at);` |
+| `migrations/20260514000001_client_order_ids.down.sql` | `DROP TABLE user_client_order_ids;` |
 | `crates/exg-user-service/src/repo.rs` | PG-backed `register_user`, `login_user`, `find_user_by_id`. All `async`. Use `sqlx::query` (string form), not `query!` macro — keeps build-time PG dependency out of CI until Stage 7 prepare. |
-| `crates/exg-user-service/tests/repo_test.rs` | `#[sqlx::test]` 7 cases per §5.2. |
+| `crates/exg-user-service/tests/repo_test.rs` | `#[sqlx::test(migrations = "../../migrations")]`. **Path is resolved by the macro at compile time relative to `CARGO_MANIFEST_DIR` (the crate root, `crates/exg-user-service/`), NOT relative to runtime CWD.** From the crate root, `../../migrations` correctly resolves to the workspace-root `migrations/` dir. Verified against sqlx 0.8 macro semantics. If the path mis-resolves in CI, the fallback is `env!("CARGO_MANIFEST_DIR")` join, but Stage 1a sticks with the relative form. 7 cases per §5.2. |
 | `crates/exg-server/tests/stage1a_e2e.rs` | 10 e2e cases per §5.3. Uses `sqlx::migrate!("../../migrations").run(&pool)` at boot. |
 | `scripts/demo-stage1a.sh` | Cold-boot demo: docker-compose up postgres → migrate reset → cargo run server → curl register/login/order/dup/no-token → wal-dump → cleanup. |
 
@@ -294,12 +332,16 @@ Stage 0 §9 #1-10 unchanged. Stage 1a adds:
 
 11. **JWT secret must be ≥ 32 bytes and not the placeholder value `"CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK"`**. Boot panics on violation. Stage 7 connects this to KMS and rejects any plaintext config secret.
 12. **Password hashing uses only Argon2id**. The hash format `$argon2id$v=19$m=...` is asserted by tests. Bcrypt / SHA-x / MD5 forms are rejected by `verify_password`.
-13. **`client_order_id` dedup happens in the handler BEFORE ring-buffer enqueue**, persisted in `user_client_order_ids` table with `PRIMARY KEY (user_id, client_order_id)`. The matching engine is NOT modified to add internal dedup; ring-buffer events are dedup-free (Stage 1b WAL replay will replay all enqueued events without dedup ambiguity).
+13. **`client_order_id` dedup happens in the handler BEFORE ring-buffer enqueue**, persisted in `user_client_order_ids` table with `PRIMARY KEY (user_id, client_order_id)`. The matching engine is NOT modified to add internal dedup; ring-buffer events are dedup-free (Stage 1b WAL replay will replay all enqueued events without dedup ambiguity). **Orphan-row semantic**: dedup INSERT is NOT atomic with ring-buffer push. If INSERT succeeds and the subsequent `producer.try_push` fails (e.g. ring buffer full → 429), the row remains in `user_client_order_ids`. A client retry with the same `clientOrderId` will be rejected by dedup → 409. This is acceptable double-error semantic: the client never gets a duplicate order created. The HTTP-200-as-enqueued contract from Stage 0 §6.1 is preserved (HTTP 429 means NOT enqueued); the additional implied contract here is "any clientOrderId we INSERT, we never accept the same clientOrderId again, even if the corresponding push failed."
 14. **Email is normalized to lowercase before store/compare**. Case-sensitive email registration would let "Alice@x" and "alice@x" register as distinct users and is a known security antipattern.
 15. **JWT claims must include `user_id` (u64) + `exp` (Unix seconds) + `iat` (Unix seconds)**. `verify_jwt` rejects tokens missing any field or with `exp <= now`.
 16. **DB error never panics at request time**. The matching thread / WAL path is unchanged — only HTTP handlers degrade to 500. DB is NOT the source of truth; WAL is.
 17. **Login responses do not distinguish user-not-found from wrong-password**. The two paths return byte-identical responses (`HTTP 401`, code `-1002`, msg `"invalid credentials"`).
-18. **Passwords never log**. No log line at any level may include the plaintext password. Code review must flag any `info!(password = ...)` or `Debug`-derived struct that prints `RegisterRequest`/`LoginRequest` without `password` redaction.
+18. **Passwords never log**. No log line at any level may include the plaintext password. Mechanism (not just prose): `RegisterRequest` and `LoginRequest` MUST NOT `#[derive(Debug)]` directly. Either wrap the `password` field in `secrecy::Secret<String>` (preferred — opt-in display via `expose_secret()`) OR manually `impl Debug` that prints `password: "***"`. A unit test asserts `format!("{req:?}")` does not contain the literal password value. Code review must flag any new derive macro on these structs.
+
+19. **Login endpoint rate-limit keys**: per-email (normalized lowercase) AND per-IP, both checked via the in-memory `RateLimiter`. Either bucket exhausted → 429 + `-1003`. This guards against single-email brute force and same-IP scan-multiple-emails. Per-user-id rate limit (on authenticated endpoints) is separate and continues to use `user_id` as key.
+
+20. **Login response time must be constant regardless of email existence**. `login_user` always invokes `verify_password` exactly once — when the email is not found, it runs against a precomputed constant dummy hash (one-time computed at boot, stored in `OnceCell<String>`). Verified by integration test: median response time for "unknown email" and "known email + wrong password" must be within ±5ms.
 
 ## 10. Open Questions (resolved during plan stage)
 
