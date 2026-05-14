@@ -206,10 +206,10 @@ Error: `{ "code": <i32-binance-code>, "msg": "<string>" }`.
 
 | Trigger | HTTP | code | msg |
 |---|---|---|---|
-| Missing/non-numeric `X-User-Id` | 401 | -2014 | `missing or invalid X-User-Id header` |
+| Missing/non-numeric `X-User-Id` | 401 | -1002 | `missing or invalid X-User-Id header` |
 | JSON body parse error | 400 | -1100 | `illegal request body: <serde err>` |
 | `to_*_command` validation (missing price for LIMIT, unknown symbol, …) | 400 | -1100 | `<field>: <reason>` |
-| Ring buffer full (`Producer::try_push` Err) | 503 | -1015 | `server busy, ring buffer full` |
+| Ring buffer full (`Producer::try_push` Err) | 429 | -1015 | `Too many requests` |
 | Command bytes exceed ring slot size | 400 | -1100 | `command too large for ring slot` |
 | rkyv encode failure (should not happen in practice) | 500 | -1000 | `internal serialization error` |
 
@@ -224,7 +224,7 @@ Allowed:
 Not allowed (would constitute reverse-CLAUDE.md fallback):
 - WAL retry / write to alternative location.
 - Respawning the matching thread.
-- Sleeping/retrying on ring buffer full (returns 503 instead).
+- Sleeping/retrying on ring buffer full (returns 429 instead).
 - `let _ = result;` patterns that drop errors silently.
 
 `core_affinity::set_for_current` failure on macOS is **warned and continued** — it is a platform limitation, not a correctness issue.
@@ -249,11 +249,11 @@ Production-grade instrumentation lands in Stage 7, but Stage 0 still needs enoug
 |---|---|
 | `exg-config/src/tests.rs` | `mark_price` parses; missing field → validation error; non-positive → error |
 | `exg-api-gateway/src/conversion.rs` | `to_cancel_order_command` happy / missing order_id; `to_amend_order_command` happy / both new fields empty |
-| `exg-api-gateway/src/handlers.rs` | `actix_web::test::call_service` against each handler; verify 200/400/401/503 status and body shape |
+| `exg-api-gateway/src/handlers.rs` | `actix_web::test::call_service` against each handler; verify 200/400/401/429 status and body shape |
 | `exg-api-gateway/src/state.rs` | `AppState::clone` shares the same `Producer` lock and snowflake |
 | `exg-wal-dump` | given a temp WAL with 3 known events, the dump helper outputs 3 JSON lines with correct field values |
 | `exg-protocol` (new property test) | for every `Command` variant constructed at maximal-field size (e.g. NewOrder with Iceberg + StopLimit + leverage + client_order_id), `rkyv::to_bytes(&cmd).len() <= 4096`. Catches the hidden coupling between protocol field growth and `cfg.ringbuffer.slot_size`. |
-| `exg-api-gateway::handlers` | `X-User-Id: abc` (non-numeric) → 401 code=-2014 (covers the parse-fail branch separately from missing-header). |
+| `exg-api-gateway::handlers` | `X-User-Id: abc` (non-numeric) → 401 code=-1002 (covers the parse-fail branch separately from missing-header). |
 | `exg-wal-dump` (extended) | (a) corrupting one byte mid-record → dump tool exits non-zero, stderr mentions corruption. (b) empty WAL dir → exit 0, zero output lines. (c) `--from-seq 5` over an 8-event WAL → exactly 3 output lines starting at sequence 5. |
 | `exg-server` boot-panic suite (§9 invariants 1-4 guards) | Four `#[test]`s that spawn `cargo run -p exg-server` (or call an extracted `run_with_config(cfg)` library function) with specific malformed configs and assert panic/exit:<br>(a) `EXG_SERVER_HOST=0.0.0.0` → panic mentioning host invariant<br>(b) WAL dir pre-populated with a segment → panic mentioning WAL freshness<br>(c) `cfg.trading.symbols.len() == 2` → panic mentioning symbol whitelist<br>(d) `cfg.trading.symbols[0].mark_price = "-1"` → `ExgConfig::validate` returns error, `main` panics with the validation message.<br>Implementation note: extract `pub fn run_with_config(cfg) -> Handle` from `main` so tests can call it directly without spawning a subprocess; subprocess form is acceptable but `cargo build --bin exg-server` becomes a test prerequisite. |
 
@@ -261,7 +261,7 @@ Production-grade instrumentation lands in Stage 7, but Stage 0 still needs enoug
 
 `crates/exg-server/tests/stage0_e2e.rs` — see §5.3. Additional scenarios this test must cover:
 
-- **Backpressure**: spin up the server with `cfg.ringbuffer.slot_count = 4` (override for test), block the matching thread (e.g. send a sentinel command the test holds), then fire 5 concurrent `POST /order` requests. The 5th should respond `503` with `code = -1015`.
+- **Backpressure**: spin up the server with a small `cfg.ringbuffer.slot_count` (test uses 2) and fire many concurrent `POST /order` requests; at least one must respond `429` with `code = -1015`.
 - **IDOR**: place an order as `X-User-Id: 42`, then send `POST /order/cancel` for that `order_id` with `X-User-Id: 999`. The cancel should produce an `OrderRejected { OrderNotFound }` event in WAL; the original order must remain (verifiable by a subsequent legitimate cancel that succeeds).
 - **Shutdown ordering**: fire N concurrent `POST /order`, then `SIGTERM` mid-flight; assert WAL contains exactly the events for the requests that received `200 ACCEPTED` (no fewer, no more) — see §4.6.
 - **Duplicate `client_order_id` is accepted twice**: fire two `POST /order` with identical `client_order_id`, assert both responses `200 ACCEPTED` with distinct `orderId`s, and both `OrderAccepted` events land in WAL. Guards invariant §9 #9 against future silent dedup additions.
@@ -282,7 +282,7 @@ Stage 0 is complete iff **all** of the following pass:
 - [ ] `scripts/demo-stage0.sh` — runs end-to-end from cold; the WAL dump on stdout contains at least one `OrderAccepted` event (from the place call) and at least one `OrderCanceled` event (from the cancel call). The amend call's footprint depends on whether the engine implements amend as in-place modification (no event) or as cancel-replace (`OrderCanceled` + `OrderAccepted`); both are acceptable, but the demo must observably differ before/after amend (e.g. distinct event sequence, or the post-amend cancel uses the same order_id).
 - [ ] WAL directory after demo contains at least one segment file; `WalReader::open` succeeds
 - [ ] `SIGTERM` to the server triggers a clean exit in ≤ 2 seconds with WAL flushed
-- [ ] Negative cases by curl: `-d 'malformed'` → `-1100`; no `X-User-Id` header → `-2014`
+- [ ] Negative cases by curl: `-d 'malformed'` → `-1100`; no `X-User-Id` header → `-1002`
 - [ ] Boot-time host-binding assert: `EXG_SERVER_HOST=0.0.0.0 cargo run -p exg-server` panics at startup with a message naming Stage 0's no-auth policy
 - [ ] Shutdown ordering: `stage0_e2e.rs` includes a scenario that sends N concurrent `POST /order` then `SIGTERM`s mid-flight; asserts the WAL contains exactly the events for the requests that received `200 ACCEPTED`
 
