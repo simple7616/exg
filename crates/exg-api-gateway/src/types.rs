@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 // ── Order endpoints ──────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PlaceOrderRequest {
     pub symbol: String,
     pub side: String,

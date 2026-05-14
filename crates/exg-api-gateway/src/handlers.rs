@@ -205,7 +205,7 @@ mod tests {
     #[actix_web::test]
     async fn place_order_missing_header_returns_401() {
         let app = test::init_service(build_app(test_state())).await;
-        let body = r#"{"symbol":"BTCUSDT","side":"BUY","order_type":"LIMIT","time_in_force":"GTC","quantity":"0.001","price":"60000"}"#;
+        let body = r#"{"symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT","timeInForce":"GTC","quantity":"0.001","price":"60000"}"#;
         let req = test::TestRequest::post()
             .uri("/api/v1/order")
             .insert_header(("Content-Type", "application/json"))
@@ -220,7 +220,7 @@ mod tests {
     #[actix_web::test]
     async fn place_order_non_numeric_header_returns_401() {
         let app = test::init_service(build_app(test_state())).await;
-        let body = r#"{"symbol":"BTCUSDT","side":"BUY","order_type":"LIMIT","time_in_force":"GTC","quantity":"0.001","price":"60000"}"#;
+        let body = r#"{"symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT","timeInForce":"GTC","quantity":"0.001","price":"60000"}"#;
         let req = test::TestRequest::post()
             .uri("/api/v1/order")
             .insert_header(("X-User-Id", "abc"))
@@ -247,7 +247,7 @@ mod tests {
     #[actix_web::test]
     async fn place_order_happy_returns_200_with_order_id() {
         let app = test::init_service(build_app(test_state())).await;
-        let body = r#"{"symbol":"BTCUSDT","side":"BUY","order_type":"LIMIT","time_in_force":"GTC","quantity":"0.001","price":"60000"}"#;
+        let body = r#"{"symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT","timeInForce":"GTC","quantity":"0.001","price":"60000"}"#;
         let req = test::TestRequest::post()
             .uri("/api/v1/order")
             .insert_header(("X-User-Id", "42"))
