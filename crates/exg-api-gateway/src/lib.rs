@@ -13,7 +13,7 @@ pub use ws::{SubscriptionManager, WsRequest, WsResponse, parse_stream_name};
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exg_common::{OrderId, OrderType, Side, TimeInForce, UnixMicros, UserId};
+    use exg_common::{OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
     use exg_protocol::Command;
 
     // ── Conversion tests ─────────────────────────────────────────────────
@@ -302,6 +302,74 @@ mod tests {
         assert_eq!(parse_stream_name("invalid"), None);
         assert_eq!(parse_stream_name("@channel"), None);
         assert_eq!(parse_stream_name("symbol@"), None);
+    }
+
+    // ── Cancel / Amend conversion tests ─────────────────────────────────
+
+    #[test]
+    fn to_cancel_order_command_happy() {
+        let req = CancelOrderRequest {
+            order_id: 12345,
+            symbol: "BTCUSDT".into(),
+        };
+        let cmd = to_cancel_order_command(
+            &req,
+            UserId::new(42),
+            SymbolId::new(1),
+            UnixMicros::from_micros(1),
+        )
+        .unwrap();
+        match cmd {
+            Command::CancelOrder { order_id, user_id, symbol, .. } => {
+                assert_eq!(order_id, OrderId::new(12345));
+                assert_eq!(user_id, UserId::new(42));
+                assert_eq!(symbol, SymbolId::new(1));
+            }
+            _ => panic!("expected CancelOrder"),
+        }
+    }
+
+    #[test]
+    fn to_amend_order_command_happy_price_only() {
+        let req = AmendOrderRequest {
+            order_id: 99,
+            symbol: "BTCUSDT".into(),
+            new_price: Some("60500".into()),
+            new_quantity: None,
+        };
+        let cmd = to_amend_order_command(
+            &req,
+            UserId::new(7),
+            SymbolId::new(1),
+            UnixMicros::from_micros(2),
+        )
+        .unwrap();
+        match cmd {
+            Command::AmendOrder { order_id, new_price, new_quantity, .. } => {
+                assert_eq!(order_id, OrderId::new(99));
+                assert!(new_price.is_some());
+                assert!(new_quantity.is_none());
+            }
+            _ => panic!("expected AmendOrder"),
+        }
+    }
+
+    #[test]
+    fn to_amend_order_command_rejects_empty_amend() {
+        let req = AmendOrderRequest {
+            order_id: 99,
+            symbol: "BTCUSDT".into(),
+            new_price: None,
+            new_quantity: None,
+        };
+        let err = to_amend_order_command(
+            &req,
+            UserId::new(7),
+            SymbolId::new(1),
+            UnixMicros::from_micros(2),
+        )
+        .unwrap_err();
+        assert!(err.msg.contains("at least one of"), "msg: {}", err.msg);
     }
 
     // ── API error tests ──────────────────────────────────────────────────
