@@ -26,4 +26,14 @@ pub enum AuthError {
     WeakPassword(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("jwt error: {0}")]
+    JwtError(String),
+    #[error("hash error: {0}")]
+    HashError(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("email already registered")]
+    EmailExists,
+    #[error("database error: {0}")]
+    DbError(String),
 }

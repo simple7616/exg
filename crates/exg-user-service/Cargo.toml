@@ -17,5 +17,9 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rustc-hash = { workspace = true }
 totp-rs = { workspace = true }
+sqlx = { workspace = true }
+tracing = { workspace = true }
+once_cell = { workspace = true }
 
 [dev-dependencies]
+tempfile = { workspace = true }

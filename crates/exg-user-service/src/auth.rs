@@ -3,7 +3,6 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
 use hmac::{Hmac, Mac};
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use rustc_hash::FxHashMap;
 use sha2::Sha256;
 use uuid::Uuid;
@@ -15,20 +14,75 @@ use crate::user::{ApiKey, ApiPermissions, KycLevel, SubAccount, User};
 
 type HmacSha256 = Hmac<Sha256>;
 
+// ── Public types ────────────────────────────────────────────────────────────
+
+/// JWT claims. Unified to spec §9 #15 field names.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct JwtClaims {
-    pub sub: u64,
+    pub user_id: u64,
     pub exp: u64,
     pub iat: u64,
-    pub jti: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LoginResponse {
-    pub token: String,
-    pub expires_at: u64,
-    pub user_id: UserId,
+    pub access_token: String,
+    pub expires_in: u64,
+    pub user_id: u64,
 }
+
+// ── Pure crypto fns ─────────────────────────────────────────────────────────
+
+/// Sign a JWT (HS256) with the given secret and claims.
+pub fn sign_jwt(secret: &[u8], claims: &JwtClaims) -> Result<String, AuthError> {
+    use jsonwebtoken::{encode, EncodingKey, Header};
+    encode(
+        &Header::default(),
+        claims,
+        &EncodingKey::from_secret(secret),
+    )
+    .map_err(|e| AuthError::JwtError(e.to_string()))
+}
+
+/// Verify a JWT and return its claims. Rejects expired tokens and bad signatures.
+pub fn verify_jwt(secret: &[u8], token: &str) -> Result<JwtClaims, AuthError> {
+    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    validation.leeway = 0; // Stage 1a: no clock skew tolerance
+    decode::<JwtClaims>(
+        token,
+        &DecodingKey::from_secret(secret),
+        &validation,
+    )
+    .map(|td| td.claims)
+    .map_err(|e| AuthError::JwtError(e.to_string()))
+}
+
+/// Hash a password using Argon2id with default OWASP-recommended parameters.
+pub fn hash_password(plain: &str) -> Result<String, AuthError> {
+    let salt = SaltString::generate(&mut OsRng);
+    let argon2 = Argon2::default(); // Argon2id by default
+    argon2
+        .hash_password(plain.as_bytes(), &salt)
+        .map(|h| h.to_string())
+        .map_err(|e| AuthError::HashError(e.to_string()))
+}
+
+/// Verify a plaintext password against an Argon2id hash. Returns false on mismatch.
+pub fn verify_password(plain: &str, hash: &str) -> Result<bool, AuthError> {
+    let parsed = PasswordHash::new(hash)
+        .map_err(|e| AuthError::HashError(format!("invalid hash format: {e}")))?;
+    Ok(Argon2::default()
+        .verify_password(plain.as_bytes(), &parsed)
+        .is_ok())
+}
+
+// ── AuthService (in-memory) ──────────────────────────────────────────────────
+//
+// Stage 1a: in-memory state superseded by repo.rs PG-backed lib.
+// Kept for Stage 2+ where API keys, sub-accounts, login_history,
+// and 2FA endpoints will be revived (still as PG-backed forms).
 
 pub struct AuthService {
     jwt_secret: Vec<u8>,
@@ -41,6 +95,7 @@ pub struct AuthService {
     next_account_id: u64,
 }
 
+#[allow(dead_code)]
 impl AuthService {
     pub fn new(jwt_secret: &[u8], jwt_expiry_secs: u64) -> Self {
         Self {
@@ -100,48 +155,31 @@ impl AuthService {
             return Err(AuthError::InvalidCredentials);
         }
 
-        verify_password(password, &user.password_hash)?;
+        if !verify_password(password, &user.password_hash)? {
+            return Err(AuthError::InvalidCredentials);
+        }
 
         let now_secs = chrono::Utc::now().timestamp() as u64;
-        let expires_at = now_secs + self.jwt_expiry_secs;
+        let exp = now_secs + self.jwt_expiry_secs;
 
         let claims = JwtClaims {
-            sub: user.user_id.value(),
-            exp: expires_at,
+            user_id: user.user_id.value(),
+            exp,
             iat: now_secs,
-            jti: Uuid::new_v4().to_string(),
         };
 
-        let token = jsonwebtoken::encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(&self.jwt_secret),
-        )
-        .map_err(|e| AuthError::Internal(format!("jwt encode: {e}")))?;
+        let access_token = sign_jwt(&self.jwt_secret, &claims)?;
 
         Ok(LoginResponse {
-            token,
-            expires_at,
-            user_id: user.user_id,
+            access_token,
+            expires_in: self.jwt_expiry_secs,
+            user_id: user.user_id.value(),
         })
     }
 
     /// Verify a JWT token. Returns claims.
-    pub fn verify_jwt(&self, token: &str) -> Result<JwtClaims, AuthError> {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-
-        let token_data = jsonwebtoken::decode::<JwtClaims>(
-            token,
-            &DecodingKey::from_secret(&self.jwt_secret),
-            &validation,
-        )
-        .map_err(|e| match e.kind() {
-            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-            _ => AuthError::InvalidToken(e.to_string()),
-        })?;
-
-        Ok(token_data.claims)
+    pub fn verify_token(&self, token: &str) -> Result<JwtClaims, AuthError> {
+        verify_jwt(&self.jwt_secret, token)
     }
 
     /// Enable TOTP 2FA. Returns the secret (base32) for QR code generation.
@@ -317,7 +355,9 @@ impl AuthService {
         validate_password(new_password)?;
 
         let user = self.users.get(&user_id).ok_or(AuthError::UserNotFound)?;
-        verify_password(old_password, &user.password_hash)?;
+        if !verify_password(old_password, &user.password_hash)? {
+            return Err(AuthError::InvalidCredentials);
+        }
 
         let new_hash = hash_password(new_password)?;
         let user = self
@@ -342,23 +382,6 @@ fn validate_password(password: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-fn hash_password(password: &str) -> Result<String, AuthError> {
-    let salt = SaltString::generate(&mut OsRng);
-    let argon2 = Argon2::default();
-    let hash = argon2
-        .hash_password(password.as_bytes(), &salt)
-        .map_err(|e| AuthError::Internal(format!("hash: {e}")))?;
-    Ok(hash.to_string())
-}
-
-fn verify_password(password: &str, hash: &str) -> Result<(), AuthError> {
-    let parsed =
-        PasswordHash::new(hash).map_err(|e| AuthError::Internal(format!("parse hash: {e}")))?;
-    Argon2::default()
-        .verify_password(password.as_bytes(), &parsed)
-        .map_err(|_| AuthError::InvalidCredentials)
-}
-
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -378,6 +401,57 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 // ══════════════════════════════════════════════════════════════════════════
 // Tests
 // ══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod stage1a_crypto_tests {
+    use super::*;
+
+    #[test]
+    fn test_sign_verify_jwt_roundtrip() {
+        let secret = b"32-byte-secret-for-test-padding!";
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = JwtClaims { user_id: 12345, iat: now, exp: now + 3600 };
+        let token = sign_jwt(secret, &claims).unwrap();
+        let decoded = verify_jwt(secret, &token).unwrap();
+        assert_eq!(decoded.user_id, 12345);
+    }
+
+    #[test]
+    fn test_verify_jwt_expired_rejected() {
+        let secret = b"32-byte-secret-for-test-padding!";
+        let claims = JwtClaims { user_id: 1, iat: 50, exp: 100 };
+        let token = sign_jwt(secret, &claims).unwrap();
+        assert!(verify_jwt(secret, &token).is_err());
+    }
+
+    #[test]
+    fn test_verify_jwt_wrong_secret_rejected() {
+        let s1 = b"32-byte-secret-for-test-padding!";
+        let s2 = b"DIFFERENT-secret-equal-length-x!";
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = JwtClaims { user_id: 1, iat: now, exp: now + 3600 };
+        let token = sign_jwt(s1, &claims).unwrap();
+        assert!(verify_jwt(s2, &token).is_err());
+    }
+
+    #[test]
+    fn test_hash_password_uses_argon2id() {
+        let hash = hash_password("hunter2hunter2").unwrap();
+        assert!(hash.starts_with("$argon2id$"), "hash prefix: {hash}");
+    }
+
+    #[test]
+    fn test_verify_password_correct() {
+        let hash = hash_password("hunter2hunter2").unwrap();
+        assert!(verify_password("hunter2hunter2", &hash).unwrap());
+    }
+
+    #[test]
+    fn test_verify_password_wrong_returns_false() {
+        let hash = hash_password("hunter2hunter2").unwrap();
+        assert!(!verify_password("wrong-pw", &hash).unwrap());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -411,8 +485,8 @@ mod tests {
         let mut svc = make_service();
         let uid = svc.register("bob@example.com", "strongpass1").unwrap();
         let resp = svc.login("bob@example.com", "strongpass1").unwrap();
-        assert_eq!(resp.user_id, uid);
-        assert!(!resp.token.is_empty());
+        assert_eq!(resp.user_id, uid.value());
+        assert!(!resp.access_token.is_empty());
     }
 
     #[test]
@@ -428,8 +502,8 @@ mod tests {
         let mut svc = make_service();
         let uid = svc.register("carol@example.com", "strongpass1").unwrap();
         let resp = svc.login("carol@example.com", "strongpass1").unwrap();
-        let claims = svc.verify_jwt(&resp.token).unwrap();
-        assert_eq!(claims.sub, uid.value());
+        let claims = svc.verify_token(&resp.access_token).unwrap();
+        assert_eq!(claims.user_id, uid.value());
     }
 
     #[test]
@@ -437,19 +511,13 @@ mod tests {
         let svc = make_service();
         // Manually create a token with exp in the past
         let claims = JwtClaims {
-            sub: 1,
+            user_id: 1,
             exp: 1_000_000, // far in the past
             iat: 999_000,
-            jti: "test-jti".to_string(),
         };
-        let token = jsonwebtoken::encode(
-            &Header::new(Algorithm::HS256),
-            &claims,
-            &EncodingKey::from_secret(&svc.jwt_secret),
-        )
-        .unwrap();
-        let err = svc.verify_jwt(&token).unwrap_err();
-        assert!(matches!(err, AuthError::TokenExpired));
+        let token = sign_jwt(&svc.jwt_secret, &claims).unwrap();
+        let err = svc.verify_token(&token).unwrap_err();
+        assert!(matches!(err, AuthError::JwtError(_)));
     }
 
     #[test]
@@ -458,9 +526,9 @@ mod tests {
         svc.register("eve@example.com", "strongpass1").unwrap();
         let resp = svc.login("eve@example.com", "strongpass1").unwrap();
         // Tamper with the token payload
-        let tampered = format!("{}x", resp.token);
-        let err = svc.verify_jwt(&tampered).unwrap_err();
-        assert!(matches!(err, AuthError::InvalidToken(_)));
+        let tampered = format!("{}x", resp.access_token);
+        let err = svc.verify_token(&tampered).unwrap_err();
+        assert!(matches!(err, AuthError::JwtError(_)));
     }
 
     #[test]
@@ -603,7 +671,7 @@ mod tests {
 
         // New password works
         let resp = svc.login("mia@example.com", "newpassword1").unwrap();
-        assert_eq!(resp.user_id, uid);
+        assert_eq!(resp.user_id, uid.value());
     }
 
     #[test]
