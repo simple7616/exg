@@ -1021,6 +1021,30 @@ impl MatchingEngine {
         &self.orderbook
     }
 
+    /// Mutable orderbook access — replay-only.
+    #[doc(hidden)]
+    pub fn orderbook_mut(&mut self) -> &mut OrderBook {
+        &mut self.orderbook
+    }
+
+    /// Mutable stop-orders access — replay-only.
+    #[doc(hidden)]
+    pub fn stop_orders_mut(&mut self) -> &mut Vec<BookOrder> {
+        &mut self.stop_orders
+    }
+
+    /// Mutable expiry-heap access — replay-only (Eng review B6). GTD orders
+    /// must be re-registered in the heap during replay so the GTD sweeper
+    /// finds them at expiry time.
+    #[doc(hidden)]
+    pub fn expiry_heap_mut(
+        &mut self,
+    ) -> &mut std::collections::BinaryHeap<
+        std::cmp::Reverse<(exg_common::UnixMicros, exg_common::OrderId)>,
+    > {
+        &mut self.expiry_heap
+    }
+
     /// Current mark price.
     pub fn mark_price(&self) -> Decimal128 {
         self.mark_price
