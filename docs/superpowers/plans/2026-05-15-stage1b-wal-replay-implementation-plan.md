@@ -2816,10 +2816,10 @@ All spec sections covered.
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (PLAN) | mode: HOLD_SCOPE, 0 critical gaps, 8 findings all accepted (A1–A8) |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | mode: FULL_REVIEW, 0 critical gaps, 7 findings all accepted (B1, B5, B6, B10, B11, B12, B13) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | no UI scope |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
 **UNRESOLVED:** 0 across all reviews.
 
-**VERDICT:** CEO CLEARED — proceed to `/plan-eng-review` (architecture / tests / edge cases under HOLD SCOPE rigor). Eng review is the required shipping gate.
+**VERDICT:** CEO + ENG CLEARED — ready to implement. Proceed to subagent-driven execution (or `/ship` after implementation).
