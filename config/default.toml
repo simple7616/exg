@@ -6,7 +6,7 @@ admin_port = 9090
 node_id = 1
 
 [database]
-url = "postgres://exg:exg_dev_password@localhost:5432/exg"
+url = "postgres://exg:exg_dev_password@localhost:5433/exg"
 max_connections = 20
 min_connections = 2
 
