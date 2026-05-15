@@ -219,12 +219,13 @@ fn test_auth_jwt_expiry_zero_rejected() {
 
 #[test]
 fn admin_secret_placeholder_rejected() {
-    let cfg = ExgConfig::default_config();
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32); // advance past the JWT check
     let err = cfg.validate().unwrap_err();
     let msg = format!("{err}");
     assert!(
-        msg.contains("admin.admin_secret") || msg.contains("jwt_secret"),
-        "expected admin or jwt secret rejection, got: {msg}"
+        msg.contains("admin.admin_secret"),
+        "expected admin secret placeholder rejection, got: {msg}"
     );
 }
 
