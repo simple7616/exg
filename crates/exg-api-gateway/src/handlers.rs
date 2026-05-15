@@ -220,8 +220,26 @@ pub async fn amend_order(
 
 pub async fn register(
     state: web::Data<AppState>,
+    req: HttpRequest,
     body: web::Json<crate::types::RegisterRequest>,
 ) -> Result<HttpResponse, ApiError> {
+    // Per-IP rate-limit gate. register_user runs Argon2id (~50ms CPU) and
+    // exposes a 201 vs 409 oracle for email enumeration; without a cap an
+    // attacker can DoS the server or scrape registered emails.
+    let now_ts = UnixMicros::now();
+    let ip_key = format!(
+        "register:ip:{}",
+        req.peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
+    {
+        let mut limiter = state.rate_limiter.lock();
+        if !limiter.consume(&ip_key, now_ts) {
+            return Err(ApiError::user_rate_limited("register rate limit exceeded"));
+        }
+    }
+
     let user_id =
         exg_user_service::register_user(&state.pool, &state.snowflake, &body.email, &body.password)
             .await

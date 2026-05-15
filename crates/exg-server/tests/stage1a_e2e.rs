@@ -340,6 +340,40 @@ async fn malformed_token_returns_401(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn register_rate_limit_per_ip(pool: PgPool) {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.risk.max_orders_per_second = 1; // tiny bucket to deterministically trip
+    let (handle, base) = boot_server(cfg, pool).await;
+    let client = Client::new();
+    // Fire 10 register attempts from the same loopback IP with distinct
+    // emails (so we exercise the IP bucket, not the email-exists path).
+    let mut saw_429 = false;
+    for i in 0..10 {
+        let resp = client
+            .post(format!("{base}/api/v1/auth/register"))
+            .json(&serde_json::json!({
+                "email": format!("ratereg{i}@e.com"),
+                "password": "hunter2hunter2"
+            }))
+            .send()
+            .await
+            .unwrap();
+        if resp.status().as_u16() == 429 {
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(body["code"], -1003);
+            saw_429 = true;
+            break;
+        }
+    }
+    assert!(
+        saw_429,
+        "expected at least one 429 from per-IP register limit"
+    );
+    handle.shutdown().await.unwrap();
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn client_order_id_exceeding_i64_max_returns_400(pool: PgPool) {
     let tmp = TempDir::new().unwrap();
     let cfg = base_cfg(tmp.path());
