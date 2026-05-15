@@ -60,6 +60,7 @@
 | `crates/exg-protocol/src/lib.rs` | extend `all_commands()`/`all_events()` test helpers if present |
 | `crates/exg-matching-engine/src/engine.rs` | `process_command`: `Command::AdminCredit { .. } => Vec::new()` arm (engine ignores; clearing-domain) |
 | `crates/exg-matching-engine/src/replay.rs` | `apply_event`: `Event::AdminCredited{..}|RealizedPnl{..}|FundingSettled{..} => Ok(())` no-op arm |
+| `crates/exg-ledger/src/operations.rs` | **NEW** `settle_realized_pnl_capped` op (CEO C1/C1b: capped-debit, never errors on insufficiency, never drives user negative — used by both realized PnL and funding payment) |
 | `crates/exg-clearing/src/lib.rs` | `pub mod post_trade;` |
 | `crates/exg-api-gateway/src/types.rs` | `AdminCreditRequest { user_id: u64, amount: String }` |
 | `crates/exg-api-gateway/src/admin.rs` | `admin_credit` handler + route `/api/v1/admin/credit` |
@@ -582,18 +583,28 @@ Add to `impl PostTradeProcessor`:
         idempotency_key: &str,
         ts: UnixMicros,
     ) -> Vec<Event> {
-        self.ledger
-            .get_or_create_account(user_id);
+        self.ledger.get_or_create_account(user_id);
         self.ledger
             .deposit(user_id, amount, idempotency_key, ts)
             .expect("admin credit deposit (amount > 0 enforced at handler)");
-        vec![Event::AdminCredited { user_id, amount, timestamp: ts }]
+        vec![Event::AdminCredited {
+            user_id,
+            amount,
+            idempotency_key: idempotency_key.to_owned(),
+            timestamp: ts,
+        }]
     }
 
-    /// Settle a signed realized PnL vs the system Funding pool. Profit
-    /// (>0) → deposit (SYSTEM→user); loss (<0) → withdraw (user→SYSTEM).
-    /// `withdraw` errors if the user's Funding cannot cover the loss →
-    /// fail-fast (spec §5.4; Stage 4 margin/liquidation removes this).
+    /// Settle a signed realized PnL vs the system Funding pool, returning
+    /// the **actually-moved** signed amount (the value recorded in the
+    /// RealizedPnl fact event). CEO review C1/C1b: a loss the user cannot
+    /// cover MUST NOT panic the single-threaded exchange and MUST NOT
+    /// drive `verify_account_invariant` (forbids negative user available)
+    /// to fail. Uses the new capped-debit ledger primitive
+    /// `settle_realized_pnl` (Step 0 below): profit → SYSTEM→user; loss →
+    /// move only `min(loss, user.Funding.available)` (user floored at 0),
+    /// uncollected remainder = implicit bad debt absorbed by the SYSTEM
+    /// Funding pool (allowed negative). Returns the signed moved amount.
     fn settle_realized_pnl(
         &mut self,
         user_id: UserId,
@@ -601,22 +612,140 @@ Add to `impl PostTradeProcessor`:
         pnl: Decimal128,
         seq_tag: u64,
         ts: UnixMicros,
-    ) {
+    ) -> Decimal128 {
         if pnl.is_zero() {
-            return;
+            return Decimal128::ZERO;
         }
         let key = format!("pnl_{seq_tag}_{}_{}", user_id.value(), symbol.value());
-        if pnl.is_positive() {
-            self.ledger.get_or_create_account(user_id);
-            self.ledger
-                .deposit(user_id, pnl, &key, ts)
-                .expect("realized profit deposit");
-        } else {
-            self.ledger
-                .withdraw(user_id, pnl.abs(), &key, ts)
-                .expect("realized loss withdraw (Stage 3: user must be funded)");
+        self.ledger.get_or_create_account(user_id);
+        // settle_realized_pnl_capped: signed pnl; never errors on
+        // insufficiency, never drives user available negative; returns the
+        // signed amount actually moved (== pnl for profit or covered loss,
+        // == -(available) for an underfunded loss). Idempotent on `key`.
+        let moved = self
+            .ledger
+            .settle_realized_pnl_capped(user_id, pnl, &key, ts)
+            .expect("settle_realized_pnl_capped is infallible for a known account");
+        // CEO review C4: realized-PnL audit line (spec invariant 39).
+        if !moved.is_zero() {
+            tracing::info!(
+                target: "post_trade",
+                user_id = user_id.value(),
+                symbol = symbol.value(),
+                %moved,
+                "realized pnl"
+            );
         }
+        moved
     }
+```
+
+- [ ] **Step 0 (CEO review C1/C1b): add the capped-debit ledger primitive**
+
+`reduce_or_close`/funding can produce a debit a user cannot cover. No
+existing `exg-ledger` op is safe here: `withdraw` and `settle_funding`
+**error `InsufficientBalance`** (→ `.expect()` → matching-thread panic →
+whole single-threaded exchange down for ALL users — a user's normal
+losing close cannot be allowed to do that); `transfer` is same-user only;
+`verify_account_invariant` (invariant.rs) **hard-forbids** a negative
+user wallet `available`, so the user cannot simply go negative either.
+
+Add to `crates/exg-ledger/src/operations.rs` (TDD: write the ledger unit
+test first — see this task's test step):
+
+```rust
+    /// Stage 3 (CEO review C1/C1b): settle a SIGNED realized-PnL/funding
+    /// amount vs the SYSTEM Funding pool, capping a debit at the user's
+    /// available so the user is never driven negative and the call never
+    /// errors on insufficiency. Returns the signed amount actually moved.
+    ///
+    /// `signed > 0` (credit / user receives): user Funding available +=
+    /// signed; balanced journal SYSTEM→user (RealizedPnl entry_type).
+    /// `signed < 0` (debit / user pays): moved = min(|signed|, available);
+    /// user available -= moved; balanced journal user→SYSTEM for `moved`.
+    /// The uncollected `|signed| - moved` is implicit bad debt — NOT
+    /// journaled (only balanced transfers stay on the books, preserving
+    /// verify_global_invariant); it surfaces as the SYSTEM Funding pool
+    /// going more negative than user credits, which verify_all_invariants
+    /// explicitly permits (Funding ∉ NON_NEGATIVE_SYSTEM_WALLETS).
+    /// Idempotent on `idempotency_key`. Never returns Err for a known
+    /// account; `AccountNotFound` only if the user account is absent.
+    pub fn settle_realized_pnl_capped(
+        &mut self,
+        user_id: UserId,
+        signed: Decimal128,
+        idempotency_key: &str,
+        timestamp: UnixMicros,
+    ) -> ExgResult<Decimal128> {
+        if signed.is_zero() {
+            return Ok(Decimal128::ZERO);
+        }
+        if self.check_idempotency(idempotency_key) {
+            return Ok(Decimal128::ZERO); // already applied (replay no-op)
+        }
+        let account = self
+            .accounts
+            .get_mut(&user_id)
+            .ok_or(ExgError::AccountNotFound(user_id))?;
+        let bal = account.wallet_mut(WalletType::Funding);
+        let moved: Decimal128;
+        if signed.is_positive() {
+            bal.available = bal.available + signed;
+            self.add_system_balance(WalletType::Funding, signed); // pool -= credit
+            moved = signed;
+            let id = self.next_id();
+            self.append_journal(JournalEntry {
+                id,
+                debit_user: SYSTEM_USER_ID,
+                debit_wallet: WalletType::Funding,
+                debit_field: BalanceField::Available,
+                credit_user: user_id,
+                credit_wallet: WalletType::Funding,
+                credit_field: BalanceField::Available,
+                amount: signed,
+                entry_type: JournalEntryType::FundingPayment,
+                idempotency_key: idempotency_key.to_owned(),
+                timestamp,
+            });
+        } else {
+            let owed = signed.abs();
+            let cover = owed.min(bal.available);
+            bal.available = bal.available - cover;
+            self.add_system_balance(WalletType::Funding, Decimal128::ZERO - cover);
+            moved = Decimal128::ZERO - cover;
+            if cover.is_positive() {
+                let id = self.next_id();
+                self.append_journal(JournalEntry {
+                    id,
+                    debit_user: user_id,
+                    debit_wallet: WalletType::Funding,
+                    debit_field: BalanceField::Available,
+                    credit_user: SYSTEM_USER_ID,
+                    credit_wallet: WalletType::Funding,
+                    credit_field: BalanceField::Available,
+                    amount: cover,
+                    entry_type: JournalEntryType::FundingPayment,
+                    idempotency_key: idempotency_key.to_owned(),
+                    timestamp,
+                });
+            }
+            // owed - cover = implicit bad debt: intentionally NOT journaled
+            // (keeps verify_global_invariant balanced; SYSTEM Funding pool
+            // absorbs it via the `add_system_balance(-cover)` asymmetry vs
+            // the winner's credit. Stage 4 adds explicit bad-debt accounting).
+        }
+        Ok(moved)
+    }
+```
+
+Verify the exact `JournalEntry` field set, `BalanceField`, `JournalEntryType`
+variants, `add_system_balance` signature, and `SYSTEM_USER_ID` const against
+the real `operations.rs`/`journal.rs` (the snippet mirrors `settle_funding`'s
+journal shape — re-read `settle_funding` and match field names exactly;
+`add_system_balance(WalletType::Funding, x)` adds `x` to the pool — confirm
+sign direction in the real fn and adjust `Decimal128::ZERO - cover` if the
+pool convention is inverted). `Decimal128` negation: use the real
+`Neg`/`Sub` (grep `impl Neg`/`Sub for Decimal128`).
 ```
 
 Then thread PnL through `consume`. Replace the `consume` `OrderFilled` branch body with:
@@ -658,10 +787,15 @@ Fix the snippet's placeholder names: `consume(&mut self, events: &[Event], ts_pa
                 let pnl = self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
                 if !pnl.is_zero() {
                     let seq = self.next_pnl_seq();
-                    self.settle_realized_pnl(*user_id, *symbol, pnl, seq, ts_param);
-                    out.push(Event::RealizedPnl {
-                        user_id: *user_id, symbol: *symbol, amount: pnl, timestamp: ts_param,
-                    });
+                    // CEO C1/C1b: record the ACTUALLY-MOVED signed amount
+                    // (capped at the user's available for a loss), not the
+                    // notional pnl — replay applies this fact directly.
+                    let moved = self.settle_realized_pnl(*user_id, *symbol, pnl, seq, ts_param);
+                    if !moved.is_zero() {
+                        out.push(Event::RealizedPnl {
+                            user_id: *user_id, symbol: *symbol, amount: moved, timestamp: ts_param,
+                        });
+                    }
                 }
             }
         }
@@ -803,8 +937,10 @@ Extend the `consume` loop to also match `MarkPriceUpdate` and `FundingRateUpdate
                     let pnl = self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
                     if !pnl.is_zero() {
                         let seq = self.next_pnl_seq();
-                        self.settle_realized_pnl(*user_id, *symbol, pnl, seq, ts_param);
-                        out.push(Event::RealizedPnl { user_id: *user_id, symbol: *symbol, amount: pnl, timestamp: ts_param });
+                        let moved = self.settle_realized_pnl(*user_id, *symbol, pnl, seq, ts_param);
+                        if !moved.is_zero() {
+                            out.push(Event::RealizedPnl { user_id: *user_id, symbol: *symbol, amount: moved, timestamp: ts_param });
+                        }
                     }
                 }
                 Event::MarkPriceUpdate { mark_price, .. } => {
@@ -825,10 +961,7 @@ Extend the `consume` loop to also match `MarkPriceUpdate` and `FundingRateUpdate
     /// One atomic batch per tick (spec invariant 33); verify invariants
     /// after. Returns one FundingSettled fact per position.
     fn settle_funding(&mut self, rate: Decimal128, ts: UnixMicros) -> Vec<Event> {
-        self.funding_period_id += 1;
-        let period = self.funding_period_id;
-        let mark = self.mark_price;
-        // Snapshot (user,symbol,size,side) first — settle_funding_checked
+        // Snapshot (user,symbol,size,side) first — the capped primitive
         // borrows the ledger mutably; avoid aliasing the positions iter.
         let rows: Vec<(UserId, SymbolId, Decimal128, PositionSide)> = self
             .positions
@@ -836,26 +969,63 @@ Extend the `consume` loop to also match `MarkPriceUpdate` and `FundingRateUpdate
             .filter(|p| !p.size.is_zero())
             .map(|p| (p.user_id, p.symbol, p.size, p.side))
             .collect();
+        // CEO review C3: a funding tick with open positions but no mark
+        // price set would charge everyone 0 and look like success — a
+        // silent correctness failure. Warn + skip (no period bump, no
+        // events).
+        if !rows.is_empty() && self.mark_price.is_zero() {
+            tracing::warn!(
+                target: "post_trade",
+                open_positions = rows.len(),
+                "funding tick skipped: mark_price unset"
+            );
+            return Vec::new();
+        }
+        self.funding_period_id += 1;
+        let period = self.funding_period_id;
+        let mark = self.mark_price;
         let mut out = Vec::new();
+        let mut settled_count = 0u64;
+        let mut total_abs = Decimal128::ZERO;
         for (user_id, symbol, size, side) in rows {
             // notional always positive (size is magnitude); a Short pays a
-            // sign-flipped amount so the long/short directions net.
+            // sign-flipped amount so long/short directions net.
             let notional = size * mark;
             let signed_rate = match side {
                 PositionSide::Long | PositionSide::Both => rate,
                 PositionSide::Short => Decimal128::ZERO - rate,
             };
-            let payment = notional * signed_rate;
+            let payment = notional * signed_rate; // >0 user pays, <0 receives
             if payment.is_zero() {
                 continue;
             }
-            self.ledger
-                .settle_funding_checked(user_id, symbol, period, payment, ts)
-                .expect("funding settlement (Stage 3: users funded via admin credit)");
+            // CEO C1/C1b: route funding through the SAME capped-debit
+            // primitive as realized PnL. A Long that cannot cover a
+            // funding payment must NOT panic the exchange; the moved
+            // amount (capped) is what the FundingSettled fact records.
+            // Deterministic idempotency key matches settle_funding_checked's
+            // scheme so live↔replay align.
+            self.ledger.get_or_create_account(user_id);
+            let key = format!("funding_{period}_{}_{}", user_id.value(), symbol.value());
+            let moved = self
+                .ledger
+                .settle_realized_pnl_capped(user_id, payment, &key, ts)
+                .expect("capped funding settle is infallible for a known account");
+            if moved.is_zero() {
+                continue;
+            }
+            settled_count += 1;
+            total_abs = total_abs + moved.abs();
             out.push(Event::FundingSettled {
-                user_id, symbol, funding_period_id: period, amount: payment, timestamp: ts,
+                user_id, symbol, funding_period_id: period, amount: moved, timestamp: ts,
             });
         }
+        // CEO review C4: settlement audit line before the invariant gate.
+        tracing::info!(
+            target: "post_trade",
+            period, settled_count, %total_abs,
+            "funding batch"
+        );
         self.ledger
             .verify_all_invariants()
             .expect("ledger invariants after funding batch (spec invariant 32)");
@@ -995,9 +1165,42 @@ Add to the test module a helper that runs a command/event script live, collects 
         let after = pt.ledger().get_balance(UserId::new(1), exg_ledger::WalletType::Funding).unwrap().available;
         assert_eq!(before, after, "FundingRateUpdate replay must not settle (invariant 36)");
     }
+
+    // CEO review C1/C1b (spec §7.2 #5): underfunded loss replays
+    // equivalently. Live: fund small, open, close at a loss exceeding
+    // balance (capped at available). Reboot. Assert user available (==0),
+    // SYSTEM Funding pool, positions, journal length identical; the
+    // capped RealizedPnl.amount replays as a pure fact (no re-cap),
+    // verify_all_invariants holds.
+    #[test]
+    fn rt_underfunded_loss_equivalent() {
+        let mut live = PostTradeProcessor::new();
+        let mut all = Vec::new();
+        all.extend(live.handle_admin_credit(UserId::new(1), dec("100"), "c1", ts()));
+        all.extend(live.consume(&[filled(1, Side::Buy, "1", "60000")], ts()));
+        // close at 59000 → loss 1000 ≫ available 100 → capped to 100 moved
+        all.extend(live.consume(&[filled(1, Side::Sell, "1", "59000")], ts()));
+        let lb = live.ledger().get_balance(UserId::new(1), exg_ledger::WalletType::Funding).unwrap().available;
+        assert_eq!(lb, dec("0"), "user floored at 0, never negative");
+        live.ledger().verify_all_invariants().unwrap();
+        let rp = all.iter().find_map(|e| match e {
+            Event::RealizedPnl { amount, .. } => Some(*amount), _ => None }).unwrap();
+        assert_eq!(rp, dec("-100"), "RealizedPnl records the MOVED (capped) amount");
+        let replayed = replay_all(&all);
+        assert_equivalent(&live, &replayed, &[1]);
+        replayed.ledger().verify_all_invariants().unwrap();
+    }
 ```
 
-Run → RED (`apply_event` undefined).
+Also add the CEO C1/C1b/C3 **unit** tests to the Task 3 / Task 4
+test modules per spec §7.1 #8/#9/#10 (the implementer writes these as
+TDD-red in the task that owns the behavior — #8/#9 underfunded
+loss/funding caps-at-zero-no-panic in Task 3/4, #10 zero-mark
+warn-skip in Task 4 — each asserting no panic, user `available == 0`,
+SYSTEM pool negative, `verify_all_invariants` holds; #10 asserts no
+`FundingSettled` and `funding_period_id` unchanged).
+
+Run → RED (`apply_event` undefined; new tests fail).
 
 - [ ] **Step 2: Implement `apply_event` (green)**
 
@@ -1040,20 +1243,23 @@ Add to `impl PostTradeProcessor`:
                 let _ = self.ledger.deposit(*user_id, *amount, idempotency_key, *timestamp);
             }
             Event::RealizedPnl { user_id, symbol, amount, timestamp } => {
+                // CEO C1/C1b: `amount` is the ALREADY-MOVED (capped) signed
+                // value — re-apply it directly via the same capped
+                // primitive + same key. No re-cap (it was already capped
+                // live; the primitive is idempotent on the key anyway).
+                // pnl_seq advanced identically to live to keep keys aligned.
                 let seq = self.next_pnl_seq();
                 let key = format!("pnl_{seq}_{}_{}", user_id.value(), symbol.value());
-                if amount.is_positive() {
-                    self.ledger.get_or_create_account(*user_id);
-                    let _ = self.ledger.deposit(*user_id, *amount, &key, *timestamp);
-                } else if amount.is_negative() {
-                    let _ = self.ledger.withdraw(*user_id, amount.abs(), &key, *timestamp);
-                }
+                self.ledger.get_or_create_account(*user_id);
+                let _ = self.ledger.settle_realized_pnl_capped(*user_id, *amount, &key, *timestamp);
             }
             Event::FundingSettled { user_id, symbol, funding_period_id, amount, timestamp } => {
+                // `amount` is the already-moved capped value; re-apply via
+                // the same capped primitive + same key as the live funding
+                // path (funding_{period}_{user}_{symbol}).
                 self.ledger.get_or_create_account(*user_id);
-                let _ = self.ledger.settle_funding_checked(
-                    *user_id, *symbol, *funding_period_id, *amount, *timestamp,
-                );
+                let key = format!("funding_{}_{}_{}", funding_period_id, user_id.value(), symbol.value());
+                let _ = self.ledger.settle_realized_pnl_capped(*user_id, *amount, &key, *timestamp);
                 if *funding_period_id > self.funding_period_id {
                     self.funding_period_id = *funding_period_id;
                 }
@@ -1084,7 +1290,7 @@ cargo test -p exg-clearing post_trade 2>&1 | tail -14
 cargo clippy -p exg-clearing -- -D warnings 2>&1 | tail -3
 ```
 
-Expected: all Task 2-5 tests pass — crucially the 4 `rt_*` round-trip-equivalence tests (live↔replay identical positions + balances + system pool + journal len) and `rt_funding_rate_update_is_settlement_noop_on_replay`. If any `rt_*` fails, the live/replay paths diverge — fix the divergence (do NOT weaken the assertion; this is the Stage 2 P1 discipline).
+Expected: all Task 2-5 tests pass — crucially the **5** `rt_*` round-trip-equivalence tests (the 4 base + `rt_underfunded_loss_equivalent`, CEO C1/C1b) plus `rt_funding_rate_update_is_settlement_noop_on_replay`. If any `rt_*` fails, the live/replay paths diverge — fix the divergence (do NOT weaken the assertion; this is the Stage 2 P1 discipline).
 
 - [ ] **Step 4: Commit**
 
@@ -1160,7 +1366,15 @@ pub async fn admin_credit(
     }
     let user_id = UserId::new(body.user_id);
     let ts = UnixMicros::now();
-    let idempotency_key = format!("admincredit_{}_{}", body.user_id, ts.as_micros());
+    // CEO review C2: a ts-only key collides when two same-user credits
+    // land in the same microsecond (e2e/demo issue rapid sequential
+    // credits) → second deposit silently no-ops → silently lost funds.
+    // Embed a process-unique monotonic counter so every accepted credit
+    // gets a distinct key. The command carries it; replay re-applies the
+    // recorded key (deterministic, still idempotent cross-machine).
+    static ADMIN_CREDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = ADMIN_CREDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let idempotency_key = format!("admincredit_{}_{}_{}", body.user_id, ts.as_micros(), n);
     tracing::info!(target: "admin", user_id = body.user_id, amount = %amount, "admin credit");
     let cmd = Command::AdminCredit { user_id, amount, idempotency_key, timestamp: ts };
     enqueue_admin(&state, &cmd)?;
@@ -1667,7 +1881,7 @@ bash scripts/demo-stage3.sh 2>&1 | tail -25
 
 Expected:
 - workspace + all-targets clean; clippy/fmt clean.
-- exg-clearing post_trade unit ~10 + 4 round-trip equivalence green.
+- exg-clearing post_trade unit ~13 (incl. CEO C1/C1b underfunded-loss/funding + C3 zero-mark) + 5 round-trip equivalence (incl. CEO underfunded-loss) + ledger `settle_realized_pnl_capped` unit, green.
 - stage3_e2e 5/5; regression stage0 7, stage1a 12, stage1b 16, stage2 11 green; boot_panics prior+1.
 - whole `cargo test --workspace` green.
 - demo: clean exit; wal-dump shows `AdminCredited` + `FundingRateUpdate` + `FundingSettled`; boot 2 health 200.
@@ -1737,8 +1951,18 @@ All spec sections covered.
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
-| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (PLAN) | mode: HOLD_SCOPE, 1 CRITICAL + 3 medium/low, 0 critical gaps unresolved, all 4 applied (C1/C1b, C2, C3, C4) |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | no UI scope |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-**VERDICT:** Plan drafted; spec corrected to source-verified APIs during planning. Next: `/plan-ceo-review` → `/plan-eng-review` (the Eng review will grep real call sites — esp. `OrderFilled`/`TradeExecuted` field sets, `Decimal128` `ONE`/`Neg`, the matching-thread move/borrow of `post_trade`, the e2e user-id resolution, and the boot_panics WAL-injection helper — same rigor that caught the Stage 2 cascade/P1 issues) → subagent-driven execution with two-stage review per task → final cross-task review → PR → merge.
+**CEO Review findings (HOLD_SCOPE, applied to spec + plan):**
+- **C1/C1b (CRITICAL, applied)** — underfunded realized loss / funding payment via `.expect()` on `withdraw`/`settle_funding_checked` would panic the single-threaded matching thread → whole exchange down for ALL users on one user's normal losing close. `verify_account_invariant` forbids negative user `available` (so "let user go negative" is infeasible — would re-panic via inv #32). Resolution: new `Ledger::settle_realized_pnl_capped` (plan Task 3 Step 0) moves only `min(owed, available)`, user floored at 0, never errors; uncollected remainder = implicit bad debt absorbed by the SYSTEM Funding pool (allowed negative); `RealizedPnl`/`FundingSettled.amount` records the actually-moved value → replay pure fact-apply, invariant 36 + `verify_all_invariants` intact. Same primitive reused for funding payment. New inv #37.
+- **C2 (Medium, applied)** — `admincredit_{user}_{ts_micros}` key collides under same-microsecond same-user credits → silent lost funds. Task 6 adds a process `AtomicU64` discriminator to the key; command carries it, replay re-applies recorded key.
+- **C3 (Medium, applied)** — funding tick with open positions but `mark_price == 0` → silent zero-charge "success". Task 4 `settle_funding` warns + skips (no period bump, no events). New inv #38.
+- **C4 (Low, applied)** — post_trade money moves had no operational log. Task 3/4 add `tracing::info!(target:"post_trade", ...)` for realized-PnL and funding-batch (parity with Stage 2 inv #30). New inv #39.
+
+Non-findings (verified): architecture brainstorm-locked + sound (same-thread, single-WAL, bounded contexts); DRY/TDD structure; `settle_funding` O(positions) negligible at single-symbol scale; rollback §8.5 symmetric with Stage 2; substrate reversible + Stage-4-reusable. Outside voice skipped (user, consistent with Stage 0-2). Section 11 Design SKIPPED (no UI).
+
+**UNRESOLVED:** 0. **VERDICT:** CEO CLEARED (HOLD_SCOPE) — proceed to `/plan-eng-review` (required gate; it will grep real call sites — `OrderFilled`/`TradeExecuted` field sets, `JournalEntry`/`BalanceField`/`add_system_balance` shapes for the new `settle_realized_pnl_capped`, `Decimal128` `ONE`/`Neg`, matching-thread `post_trade` move/borrow, e2e user-id resolution, boot_panics WAL-tamper — same rigor that caught Stage 2's cascade/P1) → subagent-driven execution with two-stage review per task → final cross-task review → PR → merge.
