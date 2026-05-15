@@ -140,17 +140,27 @@ These are **facts** (Q6): they record the exact money movement that
 already happened on the live path; replay re-applies the recorded amount,
 never recomputes it (Stage 2 P1 discipline).
 
-### 4.3 System account (Q4 / Q7)
+### 4.3 System account (Q4 / Q7) — resolved against source
 
-A reserved sentinel `UserId` — `UserId::SYSTEM` (value `0`; no real user
-is assigned id 0 by the snowflake generator) — holds the unified
-counterparty wallet. All Stage 3 money moves are double-entry between a
-user's `WalletType::Futures` wallet and `UserId::SYSTEM`'s
-`WalletType::Futures` wallet. The system account is allowed to go
-negative (it is the net sink for funding imbalance and PnL); precise
-insurance-fund accounting (which constrains `WalletType::InsuranceFund`
-to be non-negative) is Stage 4. `Ledger::get_or_create_account` is called
-for `UserId::SYSTEM` at `PostTradeProcessor` construction.
+`exg-ledger` **already** defines a private `SYSTEM_USER_ID: UserId =
+UserId(0)` (`operations.rs:10`) and performs **all** system-side
+double-entry **internally**: `deposit`, `withdraw`, and `settle_funding`
+each append journal entries against `SYSTEM_USER_ID`. `PostTradeProcessor`
+therefore **never references a system account directly** and **no new
+`UserId::SYSTEM` is added** — it calls the high-level ledger ops and the
+ledger does the counterparty bookkeeping. (Snowflake `next_id()` is
+`ts_ms << 22 | …` so it never yields 0; `UserId(0)` is a safe sentinel —
+no real user collides.)
+
+The funding counterparty pool is `WalletType::Funding`.
+`verify_all_invariants()` enforces non-negativity only for
+`NON_NEGATIVE_SYSTEM_WALLETS`, which **explicitly excludes `Funding`**
+("Funding pool can legitimately be negative (receives before pays)").
+So an imbalanced book (longs notional ≠ shorts notional) nets into the
+Funding pool **without** violating any invariant — the Q7 "system absorbs
+the imbalance" requirement is satisfied by the existing ledger model with
+no extra code. Precise insurance-fund accounting (which *does* constrain
+`WalletType::InsuranceFund`) remains Stage 4.
 
 ### 4.4 `PostTradeProcessor` (new — `crates/exg-clearing/src/post_trade.rs`)
 
@@ -175,10 +185,17 @@ pub struct PostTradeProcessor {
     side is opposite the resting position reduces/closes it, flipping if
     `fill_qty` exceeds current size). Call
     `positions.open_or_increase(..)` or `positions.reduce_or_close(..)`.
-    `reduce_or_close` returns `(realized_pnl, _)`; if `realized_pnl != 0`,
-    move it via the ledger (user.Futures ↔ `UserId::SYSTEM`.Futures,
-    idempotency key `pnl_{seq}_{user}_{symbol}`) and push
-    `Event::RealizedPnl { .. , amount: realized_pnl, .. }`.
+    `reduce_or_close(user, symbol, qty, exit_price) -> ExgResult<(pnl,
+    Option<&Position>)>` returns a **signed** `realized_pnl`; if it is
+    non-zero, settle vs the system pool with idempotency key
+    `pnl_{seq}_{user}_{symbol}`: profit → `ledger.deposit(user,
+    pnl.abs(), key, ts)` (SYSTEM→user, `WalletType::Funding`); loss →
+    `ledger.withdraw(user, pnl.abs(), key, ts)` (user→SYSTEM). Push
+    `Event::RealizedPnl { .. , amount: realized_pnl /* signed */, .. }`.
+    Note: `withdraw` errors `InsufficientBalance` if the user's Funding
+    available cannot cover the loss → live fail-fast (Stage 3 has no
+    margin/liquidation to prevent it; documented limitation, §5.4 / §9 →
+    Stage 4). Tests/demo admin-credit users before any losing close.
   - `MarkPriceUpdate { mark_price, .. }` → `self.mark_price = mark_price`
     (needed for funding notional). No money move.
   - `FundingRateUpdate { funding_rate, .. }` → `funding_period_id += 1`;
@@ -198,17 +215,19 @@ pub struct PostTradeProcessor {
   - `OrderFilled`/`TradeExecuted` → **re-project position qty/avg-entry
     only** (same `open_or_increase`/`reduce_or_close` arithmetic, which
     is pure additive). Do **NOT** emit or recompute money here.
-  - `RealizedPnl { user_id, amount, .. }` → apply the **recorded** amount
-    to the ledger (user.Futures ↔ system) with the same idempotency key
-    scheme. No PnL recomputation.
+  - `RealizedPnl { user_id, amount, .. }` → apply the **recorded** signed
+    amount via the same `deposit`(>0)/`withdraw`(<0) rule + same
+    `pnl_{seq}_{user}_{symbol}` idempotency key. No PnL recomputation
+    (the sign→direction mapping is a fixed deterministic rule applied to
+    the recorded number — not a recompute).
   - `FundingSettled { user_id, funding_period_id, amount, .. }` → apply
     the **recorded** signed `amount` via
     `ledger.settle_funding_checked(.., funding_period_id, amount, ..)`;
     its deterministic idempotency key makes a duplicate apply a no-op.
     Also advance `self.funding_period_id` to `max(self, period)`.
-  - `AdminCredited { user_id, amount, .. }` → ledger credit
-    (`UserId::SYSTEM`.Futures → user.Futures) with idempotency key
-    `admincredit_{user}_{seq}`.
+  - `AdminCredited { user_id, amount, .. }` → `ledger.deposit(user,
+    amount, "admincredit_{user}_{seq}", ts)` (the ledger journals
+    SYSTEM→user `WalletType::Funding`; idempotent on the key).
   - `MarkPriceUpdate` → `self.mark_price = mark_price` (so a post-replay
     funding tick has the right notional).
   - `FundingRateUpdate` on replay → **NO-OP for settlement** (only
@@ -223,40 +242,60 @@ dispatched: `PostTradeProcessor` exposes
 returning `[AdminCredited{..}]` after the ledger credit; on replay the
 `AdminCredited` event arm re-applies it idempotently.
 
-### 4.5 Ledger usage notes
+### 4.5 Ledger usage notes — resolved against source
 
-- Funding uses `settle_funding_checked(user, symbol, funding_period_id,
-  payment, ts)` (auto idempotency key `funding_{period}_{user}_{symbol}`)
-  — chosen over `settle_funding` because the derived key is deterministic
-  across live and replay (Invariant 31).
-  **To verify in the plan / Eng review (do not assume):** the exact sign
-  convention of `settle_funding_checked`'s `payment` argument — whether a
-  positive `payment` debits or credits the user, and whether it accepts a
-  negative value at all. The brainstorming intent is "long pays when
-  `rate > 0`, short receives". The implementation must read the real
-  `exg-ledger` `settle_funding`/`settle_funding_checked` body and map the
-  `notional × rate` sign to the correct debit/credit direction; if the
-  ledger fn only accepts a positive magnitude, the post-trade layer
-  selects debit-vs-credit by sign and passes the magnitude (mirroring the
-  realized-PnL `transfer` direction rule in this section). This is an
-  explicit unknown to resolve against source, not a settled fact.
-- Realized PnL does **not** use `close_position_settled` — that function
-  requires `margin_released > 0` and is margin-coupled (Stage 4). Stage 3
-  moves PnL with `Ledger::transfer` between user and system `Futures`
-  wallets (sign handled by choosing transfer direction;
-  `transfer` requires a positive amount, so a loss transfers
-  user→system and a profit system→user with `amount = abs(pnl)`).
-- `Ledger::transfer` already short-circuits on a duplicate idempotency
-  key (returns `Ok` without moving funds) — this is what makes hybrid
-  replay safe (CLAUDE.md: "duplicates silently accepted").
+Verified by reading `crates/exg-ledger/src/operations.rs`:
+
+- **Funding sign convention (resolved — was a flagged unknown).**
+  `settle_funding_checked(user, symbol, funding_period_id, payment, ts)
+  -> ExgResult<bool>` builds the idempotency key
+  `funding_{period}_{user}_{symbol}` internally (deterministic across
+  live/replay — Invariant 31) and delegates to `settle_funding`, which
+  **handles a signed `payment`**: `payment > 0` ⇒ **user pays** (debit
+  user `WalletType::Futures` available→margin, credit `SYSTEM_USER_ID`
+  Funding pool); `payment < 0` ⇒ **user receives** (credit user, debit
+  the Funding pool); `payment == 0` ⇒ early `Ok`. So
+  `payment = position_notional × funding_rate` is passed **signed,
+  unchanged** — long with `rate > 0` yields `payment > 0` (pays), short
+  yields `payment < 0` (receives). The brainstorming intent matches the
+  ledger exactly; no manual debit/credit selection is needed. The
+  returned `bool` (margin tapped) is ignored in Stage 3 (no liquidation
+  → Stage 4).
+- **Realized PnL** does **not** use `close_position_settled`
+  (`margin_released > 0` required — margin-coupled, Stage 4) and **cannot**
+  use `transfer` (`transfer` moves between two wallets of the *same*
+  user, not user↔system). It uses `deposit` (profit; SYSTEM→user Funding)
+  / `withdraw` (loss; user→SYSTEM Funding), the only margin-free
+  user↔SYSTEM primitives. Both require a **positive** `amount` → pass
+  `pnl.abs()` and choose the op by `pnl`'s sign.
+- **Admin credit** uses `deposit(user, amount, idempotency_key, ts)` —
+  its journal is exactly SYSTEM→user `WalletType::Funding`; `amount` must
+  be positive (handler rejects `≤ 0` at 400 before the command).
+- **Idempotency.** `deposit`, `withdraw`, `settle_funding` all call
+  `check_idempotency(key)` and early-return `Ok` on a duplicate key
+  (CLAUDE.md "duplicates silently accepted"). This is exactly what makes
+  hybrid replay safe: re-applying a recorded `AdminCredited`/
+  `RealizedPnl`/`FundingSettled` with its deterministic key is a no-op,
+  so double-entry stays balanced (Invariant 31/36).
+- **`verify_all_invariants()`** checks every user account invariant plus
+  non-negativity of `NON_NEGATIVE_SYSTEM_WALLETS` only — `Funding` is
+  **excluded** by design, so an imbalanced funding book is invariant-safe
+  (§4.3).
 
 ### 4.6 Boot lifecycle (exg-server/src/lib.rs)
 
-- The Stage 1b replay loop (lib.rs:307) gains a `PostTradeProcessor`
-  constructed before replay; each decoded WAL event is passed to
-  `engine.apply_event(e)` (unchanged) **and** `post_trade.apply_event(e)`.
-  A `post_trade.apply_event` error becomes a `ReplayError::Apply` →
-  boot abort (same fail-fast as Stage 1b).
+- **Dispatch rule (explicit, no per-variant routing in the boot loop).**
+  `engine.apply_event` gains a single new arm
+  `Event::AdminCredited { .. } | Event::RealizedPnl { .. } |
+  Event::FundingSettled { .. } => Ok(())` — the matching engine ignores
+  post-trade fact events (mirrors its existing `OrderRejected => Ok(())`
+  / `TradeExecuted => Ok(())` no-op arms; it does **not** make them
+  `UnexpectedVariant`). The Stage 1b replay loop (lib.rs:307) gains a
+  `PostTradeProcessor` constructed before replay and calls **both**
+  `engine.apply_event(e)?` **and** `post_trade.apply_event(e)?` for
+  **every** decoded WAL record, uniformly (each side Ok-noops events
+  outside its domain). A `post_trade.apply_event` error becomes a
+  `ReplayError::Apply` → boot abort (same fail-fast as Stage 1b).
 - After replay, before spawning the matching thread,
   `post_trade.ledger.verify_all_invariants()` must hold (Invariant 32) —
   failure ⇒ boot panic.
@@ -296,9 +335,11 @@ POST /admin/credit
 
 ### 5.2 Fill → position → realized PnL
 
-`OrderFilled`/`TradeExecuted` (engine) → position open/increase (no money)
-or reduce/close → `realized_pnl` from `PositionManager.reduce_or_close`
-→ ledger `transfer` user↔system → `Event::RealizedPnl{amount}` WAL'd.
+`OrderFilled` (engine; `TradeExecuted` not used for projection) →
+position open/increase (no money) or reduce/close → signed `realized_pnl`
+from `PositionManager.reduce_or_close` → `ledger.deposit` (profit) /
+`ledger.withdraw` (loss) vs SYSTEM Funding → `Event::RealizedPnl{amount}`
+WAL'd.
 
 ### 5.3 Funding tick (atomic)
 
@@ -316,6 +357,7 @@ contiguously in WAL order (one tick = rate + settlement; Invariant 33).
 |-----------|----------|
 | admin credit amount ≤ 0 | 400 at handler; no Command produced |
 | ledger op fails live (e.g. account-not-found) | matching thread aborts (fail-fast; WAL is truth) — no silent skip |
+| realized **loss** exceeds user Funding available (`withdraw` → `InsufficientBalance`) | live fail-fast (no margin/liquidation in Stage 3 to prevent it); documented limitation → Stage 4. Tests/demo admin-credit users before any losing close |
 | `verify_all_invariants()` fails live | fail-fast abort |
 | replay `apply_event` ledger error | `ReplayError::Apply` → boot panic |
 | replay end `verify_all_invariants()` fails | boot panic |
@@ -346,12 +388,15 @@ by regression baselines).
   WAL-appended contiguously with that `FundingRateUpdate`; a per-position
   ledger failure aborts the process (no partial batch persists).
 - **#34** Position quantity / weighted-average entry price is a pure
-  projection of `OrderFilled`/`TradeExecuted`; never separately evented;
-  live and replayed position state are identical (round-trip equivalence
-  test — the Stage 2 C10 observable-assertion discipline).
-- **#35** `UserId::SYSTEM` is the sole Stage 3 counterparty; for every
-  Stage 3 money operation, Σ(user wallet deltas) + (system wallet delta)
-  = 0 (double-entry; `verify_all_invariants` enforces).
+  projection of `OrderFilled` **only** (`TradeExecuted` is never used for
+  projection — anti-double-count); never separately evented; live and
+  replayed position state are identical (round-trip equivalence test —
+  the Stage 2 C10 observable-assertion discipline).
+- **#35** The ledger-internal `SYSTEM_USER_ID` (`UserId(0)`) is the sole
+  Stage 3 counterparty; every Stage 3 money op is a balanced ledger
+  journal (Σ debits = Σ credits) — `verify_all_invariants` enforces
+  per-account invariants + non-negativity of
+  `NON_NEGATIVE_SYSTEM_WALLETS` (Funding pool excluded by design).
 - **#36** On replay, `PostTradeProcessor` never recomputes a money amount
   — `FundingRateUpdate` is a settlement no-op; all money state comes from
   recorded `AdminCredited`/`RealizedPnl`/`FundingSettled` facts (explicit
@@ -378,8 +423,9 @@ by regression baselines).
 
 Drive a live `MatchingEngine` + `PostTradeProcessor`, collect **all**
 WAL'd events, replay them into a fresh pair, assert **identical**:
-positions (size + entry per user/symbol), every user wallet balance, and
-the `UserId::SYSTEM` balance.
+positions (size + entry per user/symbol), every user wallet balance, the
+system Funding-pool balance (`ledger.system_balance(WalletType::Funding)`),
+and the full journal length/entries.
 
 1. `replay_admin_credit_then_open_then_funding_tick` — credit → open both
    sides → funding tick → reboot → balances + positions identical; **no**
@@ -466,12 +512,15 @@ remains deferred to Stage 5+ (tracked below).
   post-trade pipeline on `MarkPriceUpdate`; emit `LiquidationOrder`;
   matcher executes forced close; `close_position_settled` with margin;
   replay arm for `LiquidationOrder` (currently `UnexpectedVariant`).
-- **Initial margin** (Stage 4): reserve user.Futures→margin on position
-  open, release on close; order-acceptance rejects on insufficient
-  margin (touches the engine order-acceptance path).
-- **Insurance fund** (Stage 4): replace the `UserId::SYSTEM` net-sink with
-  a real `WalletType::InsuranceFund` account + bankruptcy/ADL waterfall;
-  precise per-trade PnL counterparty accounting.
+- **Initial margin + realized-loss solvency** (Stage 4): reserve
+  user Funding→margin on position open, release on close; order-acceptance
+  rejects on insufficient margin; this also removes the Stage 3
+  "realized loss exceeds Funding available → `withdraw` fail-fast"
+  limitation (§5.4) — margin/liquidation guarantees a closing user can
+  cover the loss.
+- **Insurance fund** (Stage 4): replace the SYSTEM Funding-pool net-sink
+  with a real `WalletType::InsuranceFund` account + bankruptcy/ADL
+  waterfall; precise per-trade PnL counterparty accounting.
 - **Periodic funding timer**: production `funding_interval_hours` cadence
   replacing admin-triggered ticks.
 - **Real deposits/withdrawals**: replace admin-credit with a funded
@@ -494,4 +543,4 @@ remains deferred to Stage 5+ (tracked below).
 | 4 | Balance bootstrap | minimal `Command::AdminCredit` via ring buffer + `X-Admin-Secret` admin endpoint; double-entry vs system account |
 | 5 | Settlement trigger | `PostTradeProcessor` reacts to `FundingRateUpdate`, atomic settle same tick; `FundingSettled` WAL'd; replay applies recorded amount |
 | 6 | Replay model | hybrid — position qty/entry projected from fills; all money movements explicit WAL'd fact events, replay applies recorded amounts (no money recompute) |
-| 7 | Double-entry counterparty | `UserId::SYSTEM`/treasury account as unified counterparty for funding + realized PnL; precise per-trade PnL + insurance fund → Stage 4 |
+| 7 | Double-entry counterparty | ledger-internal `SYSTEM_USER_ID`/Funding pool as unified counterparty (deposit/withdraw/settle_funding handle it internally); precise per-trade PnL + insurance fund → Stage 4 |
