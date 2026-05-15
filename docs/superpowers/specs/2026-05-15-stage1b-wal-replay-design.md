@@ -104,7 +104,7 @@ Dispatch table:
 | `OrderRejected`     | no-op (rejected orders never entered the book)                                                   | —                                              |
 | `OrderCanceled`     | remove `order_id` from book                                                                      | `order_id` not present → `UnknownOrder`        |
 | `OrderFilled`       | decrement `BookOrder.remaining_qty` by `fill_qty`; if result is zero, remove from book.          | order not present → `UnknownOrder`; `fill_qty > remaining` → `OverFill` |
-| `TradeExecuted`     | `engine.trade_id_counter = max(self.trade_id_counter, trade_id.value() + 1)`; no book mutation. | —                                              |
+| `TradeExecuted`     | No-op. The OrderFilled events covering both sides already updated the book; trade IDs come from `SnowflakeGen` (timestamp + node_id + counter), which cannot collide with prior IDs after a reboot because the timestamp component always advances. | — |
 | `MarkPriceUpdate`   | (Stage 0/1a never write these) — return `UnexpectedVariant`                                      | always                                         |
 | `FundingRateUpdate` | (Stage 0/1a never write these) — return `UnexpectedVariant`                                      | always                                         |
 | `LiquidationOrder`  | (Stage 0/1a never write these) — return `UnexpectedVariant`                                      | always                                         |
@@ -308,12 +308,16 @@ Ten tests, all in-process, no fixtures:
 2. `apply_order_canceled_removes_book_order`
 3. `apply_order_filled_decrements_remaining_qty`
 4. `apply_order_filled_zero_removes_book_order`
-5. `apply_trade_executed_advances_trade_id_counter`
-6. `apply_unknown_order_canceled_returns_err`
-7. `apply_unknown_order_filled_returns_err`
-8. `apply_over_fill_returns_err`
-9. `apply_mark_price_update_returns_unexpected_variant`
-10. `replay_then_take_snapshot_matches_original` (golden round-trip)
+5. `apply_trade_executed_is_noop_on_book`
+6. `apply_order_rejected_is_noop`
+7. `apply_duplicate_order_accepted_returns_err`
+8. `apply_unknown_order_canceled_returns_err`
+9. `apply_unknown_order_filled_returns_err`
+10. `apply_over_fill_returns_err`
+11. `apply_mark_price_update_returns_unexpected_variant`
+12. `replay_then_take_snapshot_round_trip` (golden round-trip via process_command → events → apply_event into empty engine; compare order counts)
+
+Twelve tests (spec originally said ten; landed on twelve after self-review to keep coverage tight).
 
 ### 8.2 Integration tests (`crates/exg-server/tests/stage1b_e2e.rs`)
 
