@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-export DATABASE_URL="${DATABASE_URL:-postgresql://exg:exg_dev_password@localhost:5432/exg}"
+export DATABASE_URL="${DATABASE_URL:-postgresql://exg:exg_dev_password@localhost:5433/exg}"
 
 GREEN='\033[0;32m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $1"; }

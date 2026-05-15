@@ -117,6 +117,19 @@ fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
         }
     }
 
+    // Invariant 11: JWT secret must be at least 32 bytes.
+    // Invariant 12: JWT secret must not be the dev placeholder.
+    const JWT_PLACEHOLDER: &str = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK";
+    if cfg.auth.jwt_secret.len() < 32 {
+        bail!(
+            "Stage 1a: auth.jwt_secret must be at least 32 bytes, got {}",
+            cfg.auth.jwt_secret.len()
+        );
+    }
+    if cfg.auth.jwt_secret == JWT_PLACEHOLDER {
+        bail!("Stage 1a: auth.jwt_secret is the placeholder; override via EXG_AUTH_JWT_SECRET");
+    }
+
     Ok(())
 }
 
@@ -157,10 +170,14 @@ fn symbol_config_from_entry(entry: &exg_config::SymbolConfigEntry) -> anyhow::Re
 
 /// Start the exchange server from an in-memory config.
 ///
+/// Connects a fresh `PgPool` from `cfg.database.url`. For test callers that
+/// need a pre-built pool (e.g. `sqlx::test`), use [`run_with_config_with_pool`].
+///
 /// # Invariants enforced (spec §4.5)
 /// - `cfg.server.host` ∈ {127.0.0.1, ::1, localhost}
 /// - `cfg.trading.symbols.len() == 1`
 /// - WAL directory is empty or does not exist
+/// - `cfg.auth.jwt_secret.len() >= 32` and not the dev placeholder
 ///
 /// # Thread model
 /// - HTTP: N Actix worker threads (default = logical CPU count)
@@ -175,6 +192,19 @@ fn symbol_config_from_entry(entry: &exg_config::SymbolConfigEntry) -> anyhow::Re
 /// that call this function multiple times will accumulate one leaked
 /// `RingBuffer` per call — acceptable because test processes are short-lived.
 pub async fn run_with_config(cfg: ExgConfig) -> anyhow::Result<ServerHandle> {
+    run_with_config_with_pool(cfg, None).await
+}
+
+/// Test seam: accept a pre-built `PgPool` (e.g. from `sqlx::test`).
+///
+/// Production callers use [`run_with_config`] which passes `None` and connects
+/// from `cfg.database.url`. Integration tests that use `#[sqlx::test]` pass
+/// their pool here so the server uses the transaction-isolated test database
+/// instead of the real instance.
+pub async fn run_with_config_with_pool(
+    cfg: ExgConfig,
+    pool_override: Option<sqlx::PgPool>,
+) -> anyhow::Result<ServerHandle> {
     // ── Step 0: validate startup invariants ──────────────────────────────
     validate_invariants(&cfg)?;
 
@@ -211,11 +241,40 @@ pub async fn run_with_config(cfg: ExgConfig) -> anyhow::Result<ServerHandle> {
     let mut engine = MatchingEngine::new(symbol_config, cfg.server.node_id);
     engine.set_mark_price(mark_price);
 
+    // ── Step 3.5 (Stage 1a): connect PG pool ─────────────────────────────
+    // Pool connection happens AFTER validate_invariants so that invariant
+    // failures (e.g. bad JWT secret) surface immediately without requiring PG.
+    let pool = match pool_override {
+        Some(p) => p,
+        None => sqlx::PgPool::connect(&cfg.database.url)
+            .await
+            .with_context(|| format!("failed to connect PG at {}", cfg.database.url))?,
+    };
+    // Ping to confirm the connection is live. sqlx::test pools are already
+    // verified, but the ping is cheap and keeps the path uniform.
+    sqlx::query("SELECT 1")
+        .execute(&pool)
+        .await
+        .context("PG ping (SELECT 1) failed")?;
+
+    // ── Step 3.7 (Stage 1a): DUMMY_ARGON2_HASH OnceCell init ─────────────
+    // Pre-compute the timing-safe dummy hash used by login handlers to make
+    // timing attacks harder (prevents fast-path on unknown usernames).
+    // init_dummy_argon2_hash is idempotent via OnceCell::get_or_try_init.
+    exg_user_service::init_dummy_argon2_hash()
+        .map_err(|e| anyhow::anyhow!("failed to init DUMMY_ARGON2_HASH: {e:?}"))?;
+
     // ── Step 4: build shared AppState ────────────────────────────────────
     let state = AppState {
         producer: Arc::new(Mutex::new(producer)),
         snowflake: Arc::new(SnowflakeGen::new(cfg.server.node_id)),
         cfg: Arc::clone(&cfg),
+        pool: pool.clone(),
+        auth_cfg: Arc::new(cfg.auth.clone()),
+        rate_limiter: Arc::new(Mutex::new(exg_api_gateway::middleware::RateLimiter::new(
+            cfg.risk.max_orders_per_second,
+            cfg.risk.max_orders_per_second as f64,
+        ))),
     };
 
     // ── Step 5: spawn matching engine OS thread ───────────────────────────

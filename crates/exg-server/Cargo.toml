@@ -19,6 +19,8 @@ exg-wal = { workspace = true }
 exg-matching-engine = { workspace = true }
 exg-risk-engine = { workspace = true }
 exg-api-gateway = { workspace = true }
+exg-user-service = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true }
 actix-web = { workspace = true }
 parking_lot = { workspace = true }

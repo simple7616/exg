@@ -12,6 +12,8 @@ thiserror = { workspace = true }
 rustc-hash = { workspace = true }
 actix-web = { workspace = true }
 exg-config = { workspace = true }
+exg-user-service = { workspace = true }
+sqlx = { workspace = true }
 exg-ringbuffer = { workspace = true }
 exg-wal = { workspace = true }
 parking_lot = { workspace = true }
@@ -20,4 +22,5 @@ tracing = { workspace = true }
 rkyv = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 tempfile = { workspace = true }

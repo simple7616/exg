@@ -1,4 +1,5 @@
-//! Stage 0 boot-time invariant guards (spec §9 invariants 1-4).
+//! Stage 0 boot-time invariant guards (spec §9 invariants 1-4) and
+//! Stage 1a boot-time invariant guards (spec §9 invariants 11-13).
 //! These tests ensure that misconfigurations fail loudly at startup
 //! rather than silently misbehaving in production.
 
@@ -9,6 +10,9 @@ fn base_cfg(wal_dir: &std::path::Path) -> ExgConfig {
     let mut cfg = ExgConfig::default_config();
     cfg.wal.dir = wal_dir.to_string_lossy().into_owned();
     cfg.server.port = 0; // ephemeral
+    // Stage 1a: override the placeholder to a valid 32-byte secret so the
+    // 4 non-auth invariant tests don't trip on the JWT placeholder check.
+    cfg.auth.jwt_secret = "a".repeat(32);
     cfg
 }
 
@@ -80,4 +84,49 @@ async fn boot_panics_on_invalid_mark_price() {
     let err = result.err().expect("expected Err from run_with_config");
     let msg = format!("{err:#}");
     assert!(msg.contains("mark_price"), "got: {msg}");
+}
+
+// ── Stage 1a: invariants 11-13 ────────────────────────────────────────────
+
+#[actix_web::test]
+async fn boot_panics_on_short_jwt_secret() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.auth.jwt_secret = "short".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("jwt_secret"),
+        "expected jwt_secret-length message, got: {msg}"
+    );
+}
+
+#[actix_web::test]
+async fn boot_panics_on_default_jwt_secret() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.auth.jwt_secret = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("jwt_secret") || msg.contains("placeholder"),
+        "expected placeholder-rejection message, got: {msg}"
+    );
+}
+
+#[actix_web::test]
+async fn boot_panics_on_db_unreachable() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    // Point at a definitely-unreachable port to force connect failure.
+    cfg.database.url = "postgres://exg:exg_dev_password@127.0.0.1:1/exg".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("PG") || msg.contains("connect") || msg.contains("SELECT 1"),
+        "expected PG-connect-failure message, got: {msg}"
+    );
 }

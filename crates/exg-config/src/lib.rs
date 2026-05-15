@@ -19,6 +19,14 @@ pub enum ConfigError {
 // ── Top-level config ──────────────────────────────────────────���────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthConfig {
+    /// Must be at least 32 bytes (256 bits) for HS256 security. Boot validates.
+    pub jwt_secret: String,
+    /// JWT access token lifetime in seconds. Stage 1a defaults to 86400 (24h).
+    pub jwt_expiry_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExgConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -28,6 +36,7 @@ pub struct ExgConfig {
     pub ringbuffer: RingBufferConfig,
     pub trading: TradingConfig,
     pub risk: RiskConfig,
+    pub auth: AuthConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +208,10 @@ impl ExgConfig {
                 funding_interval_hours: 8,
                 interest_rate: "0.0001".into(),
                 impact_notional: "200".into(),
+            },
+            auth: AuthConfig {
+                jwt_secret: "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK".into(),
+                jwt_expiry_secs: 86400,
             },
         }
     }

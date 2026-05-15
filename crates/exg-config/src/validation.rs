@@ -102,6 +102,25 @@ pub(crate) fn validate(cfg: &ExgConfig) -> Result<(), ConfigError> {
         validate_symbol(sym)?;
     }
 
+    // Stage 1a §9 invariant 11: JWT secret length and placeholder check.
+    const JWT_SECRET_PLACEHOLDER: &str = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK";
+    if cfg.auth.jwt_secret.len() < 32 {
+        return Err(ConfigError::Validation(format!(
+            "auth.jwt_secret must be at least 32 bytes, got {}",
+            cfg.auth.jwt_secret.len()
+        )));
+    }
+    if cfg.auth.jwt_secret == JWT_SECRET_PLACEHOLDER {
+        return Err(ConfigError::Validation(
+            "auth.jwt_secret is the placeholder default; set EXG_AUTH_JWT_SECRET env var to a 32+ byte production secret".into()
+        ));
+    }
+    if cfg.auth.jwt_expiry_secs == 0 {
+        return Err(ConfigError::Validation(
+            "auth.jwt_expiry_secs must be > 0".into(),
+        ));
+    }
+
     Ok(())
 }
 
