@@ -6,7 +6,7 @@ admin_port = 9090
 node_id = 1
 
 [database]
-url = "postgres://exg:exg@localhost:5432/exg"
+url = "postgres://exg:exg_dev_password@localhost:5432/exg"
 max_connections = 20
 min_connections = 2
 
@@ -35,6 +35,10 @@ max_position_notional = "10000000"
 funding_interval_hours = 8
 interest_rate = "0.0001"
 impact_notional = "200"
+
+[auth]
+jwt_secret = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK"
+jwt_expiry_secs = 86400
 
 # ── Symbols ─────────────────────────────────────────────────────────────────
 

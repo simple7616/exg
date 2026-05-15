@@ -4,7 +4,8 @@ use super::*;
 
 #[test]
 fn test_default_config_validates() {
-    let cfg = ExgConfig::default_config();
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32);
     cfg.validate().expect("default config should validate");
 }
 
@@ -15,9 +16,17 @@ fn test_load_default_toml() {
     let workspace_root = Path::new(manifest_dir).parent().unwrap().parent().unwrap();
     let config_path = workspace_root.join("config").join("default.toml");
 
-    // Use a custom prefix to avoid interference from real env vars.
-    let cfg = ExgConfig::load_with_prefix(&config_path, "EXG_TEST_UNLIKELY_PREFIX")
-        .expect("should load default.toml");
+    // Deserialize the TOML file directly via the config crate (no env overlay,
+    // no validation) to verify field values parse correctly. Validation is tested
+    // by other tests; this test's purpose is purely structural/parsing.
+    let built = config::Config::builder()
+        .add_source(config::File::from(config_path.as_path()).required(true))
+        .build()
+        .expect("config::Config::builder should succeed");
+    let mut cfg: ExgConfig = built.try_deserialize().expect("should parse default.toml");
+
+    // Override placeholder so any downstream validate call (if added later) works.
+    cfg.auth.jwt_secret = "a".repeat(32);
 
     assert_eq!(cfg.server.host, "127.0.0.1");
     assert_eq!(cfg.server.port, 8080);
@@ -149,6 +158,7 @@ fn test_toml_parsing_all_types() {
 #[test]
 fn test_symbol_mark_price_field_parses() {
     let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32);
     cfg.trading.symbols[0].mark_price = "60000".into();
     assert!(cfg.validate().is_ok());
 }
@@ -167,6 +177,51 @@ fn test_symbol_mark_price_must_parse_as_decimal() {
     let mut cfg = ExgConfig::default_config();
     cfg.trading.symbols[0].mark_price = "not-a-number".into();
     assert!(cfg.validate().is_err());
+}
+
+#[test]
+fn test_auth_jwt_secret_too_short_rejected() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "short".into();
+    let err = cfg.validate().unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("jwt_secret"), "msg: {msg}");
+}
+
+#[test]
+fn test_auth_jwt_secret_placeholder_rejected() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK".into();
+    let err = cfg.validate().unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("jwt_secret") || msg.contains("placeholder"));
+}
+
+#[test]
+fn test_auth_jwt_secret_valid_32_bytes_ok() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32);
+    assert!(cfg.validate().is_ok());
+}
+
+#[test]
+fn test_auth_jwt_expiry_zero_rejected() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32); // override placeholder so we hit the expiry check
+    cfg.auth.jwt_expiry_secs = 0;
+    let err = cfg.validate().unwrap_err();
+    let msg = format!("{err}");
+    assert!(msg.contains("jwt_expiry"), "msg: {msg}");
+}
+
+#[test]
+fn test_database_url_format_sanity() {
+    let cfg = ExgConfig::default_config();
+    assert!(
+        cfg.database.url.starts_with("postgres://"),
+        "default url: {}",
+        cfg.database.url
+    );
 }
 
 /// Write a minimal valid TOML config for testing.
@@ -236,6 +291,10 @@ notional_floor = "50000"
 notional_cap = "250000"
 maintenance_margin_rate = "0.005"
 maintenance_amount = "50"
+
+[auth]
+jwt_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+jwt_expiry_secs = 86400
 "#;
     let mut f = std::fs::File::create(path).unwrap();
     f.write_all(toml.as_bytes()).unwrap();
