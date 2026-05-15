@@ -19,6 +19,8 @@ fn base_cfg(wal_dir: &std::path::Path) -> ExgConfig {
     cfg.server.host = "127.0.0.1".into();
     cfg.server.port = 0; // ephemeral
     cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "a".repeat(32);
+    cfg.server.admin_port = 0;
     cfg
 }
 

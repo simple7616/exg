@@ -12,6 +12,7 @@ pub struct EngineSnapshot {
     pub stop_orders: Vec<BookOrder>,
     pub mark_price: Decimal128,
     pub index_price: Decimal128,
+    pub last_funding_rate: Decimal128,
     pub sequence: u64,
     pub trade_id_counter: u64,
     /// GTD expiry entries: (expire_time_micros, order_id).
@@ -30,9 +31,10 @@ impl crate::engine::MatchingEngine {
         data: &[u8],
         config: exg_risk_engine::SymbolConfig,
         node_id: u16,
+        interest_rate: Decimal128,
     ) -> Self {
         let snapshot: EngineSnapshot =
             serde_json::from_slice(data).expect("snapshot deserialization failed");
-        Self::restore_from_snapshot(snapshot, config, node_id)
+        Self::restore_from_snapshot(snapshot, config, node_id, interest_rate)
     }
 }

@@ -26,10 +26,23 @@ pub struct MatchingEngine {
     trade_id_gen: SnowflakeGen,
     /// Sequence counter for WAL ordering.
     sequence: u64,
+    /// Stage 2: clamp interest rate for funding (from cfg.risk.interest_rate).
+    interest_rate: Decimal128,
+    /// Stage 2: last computed funding rate. ZERO until first ComputeFunding.
+    last_funding_rate: Decimal128,
+    /// Replay-only (Task 9): order ids observed during the current WAL replay
+    /// (via OrderAccepted or triggered-conditional promotion). Lets the
+    /// OrderFilled resolver distinguish a legitimate terminal duplicate taker
+    /// leg of a multi-fill sweep (constant FINAL remaining_qty — id was live
+    /// earlier this replay, now removed: benign no-op) from a genuinely
+    /// corrupt WAL referencing a never-accepted id (must still fail-fast →
+    /// boot abort). NOT engine state: untouched by process_command, excluded
+    /// from snapshots, transient to a replay session.
+    replay_seen_order_ids: rustc_hash::FxHashSet<OrderId>,
 }
 
 impl MatchingEngine {
-    pub fn new(symbol_config: SymbolConfig, node_id: u16) -> Self {
+    pub fn new(symbol_config: SymbolConfig, node_id: u16, interest_rate: Decimal128) -> Self {
         let symbol = symbol_config.symbol;
         Self {
             orderbook: OrderBook::new(symbol),
@@ -40,6 +53,9 @@ impl MatchingEngine {
             expiry_heap: BinaryHeap::new(),
             trade_id_gen: SnowflakeGen::new(node_id),
             sequence: 0,
+            interest_rate,
+            last_funding_rate: Decimal128::ZERO,
+            replay_seen_order_ids: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -105,6 +121,15 @@ impl MatchingEngine {
                 symbol,
                 timestamp,
             } => self.handle_cancel_all(*user_id, *symbol, *timestamp),
+            Command::UpdateMarkPrice {
+                symbol,
+                mark_price,
+                index_price,
+                timestamp,
+            } => self.update_mark_price(*symbol, *mark_price, *index_price, *timestamp),
+            Command::ComputeFunding { symbol, timestamp } => {
+                self.compute_funding(*symbol, *timestamp)
+            }
         }
     }
 
@@ -727,19 +752,40 @@ impl MatchingEngine {
         events
     }
 
-    /// Update mark/index price. Check stop orders for triggering.
+    /// Passive: set mark/index price + reconstruct trailing-peak state.
+    /// Reused by the live path (first half) AND replay. No triggering,
+    /// no matching — Stage 2 §3 passive/active split.
+    pub(crate) fn apply_mark_index_passive(&mut self, mark: Decimal128, index: Decimal128) {
+        self.mark_price = mark;
+        self.index_price = index;
+        self.update_trailing_peaks();
+    }
+
+    /// Live path (process_command → Command::UpdateMarkPrice). Emits
+    /// MarkPriceUpdate first, then any OrderFilled/TradeExecuted from
+    /// triggered stop/take-profit/trailing orders.
     pub fn update_mark_price(
         &mut self,
-        mark_price: Decimal128,
-        index_price: Decimal128,
+        symbol: SymbolId,
+        mark: Decimal128,
+        index: Decimal128,
+        timestamp: UnixMicros,
     ) -> Vec<Event> {
-        self.mark_price = mark_price;
-        self.index_price = index_price;
+        self.apply_mark_index_passive(mark, index);
+        let mut events = vec![Event::MarkPriceUpdate {
+            symbol,
+            mark_price: mark,
+            index_price: index,
+            timestamp,
+        }];
+        events.extend(self.trigger_and_match_stops(timestamp));
+        events
+    }
 
+    /// Active half: check stop triggers + run them through the matcher.
+    /// Live-only. (Body moved from the old update_mark_price tail.)
+    fn trigger_and_match_stops(&mut self, timestamp: UnixMicros) -> Vec<Event> {
         let mut events = Vec::new();
-
-        // Update trailing peak prices
-        self.update_trailing_peaks();
 
         // Check stop triggers
         let mut triggered = self.check_stop_triggers_internal();
@@ -762,7 +808,6 @@ impl MatchingEngine {
                 _ => {}
             }
 
-            let timestamp = UnixMicros::now();
             let match_result = matcher::match_order(&mut self.orderbook, &mut order);
 
             if !match_result.rejected {
@@ -781,6 +826,35 @@ impl MatchingEngine {
         }
 
         events
+    }
+
+    /// Stage 2: compute funding rate from the instantaneous premium.
+    /// premium = (mark - index) / index ; ZERO when index == 0
+    /// (div-by-zero guard — invariant 28). rate via risk-engine clamp.
+    pub fn compute_funding(&mut self, symbol: SymbolId, timestamp: UnixMicros) -> Vec<Event> {
+        let premium = if self.index_price.is_zero() {
+            Decimal128::ZERO
+        } else {
+            (self.mark_price - self.index_price) / self.index_price
+        };
+        let rate = exg_risk_engine::funding::calc_funding_rate(premium, self.interest_rate);
+        self.last_funding_rate = rate;
+        vec![Event::FundingRateUpdate {
+            symbol,
+            funding_rate: rate,
+            timestamp,
+        }]
+    }
+
+    /// Last funding rate (observability / snapshot / replay).
+    pub fn last_funding_rate(&self) -> Decimal128 {
+        self.last_funding_rate
+    }
+
+    /// Replay-only accessor — set last_funding_rate during apply_event.
+    #[doc(hidden)]
+    pub fn set_last_funding_rate(&mut self, rate: Decimal128) {
+        self.last_funding_rate = rate;
     }
 
     /// Check and expire GTD orders.
@@ -985,6 +1059,7 @@ impl MatchingEngine {
             stop_orders: self.stop_orders.clone(),
             mark_price: self.mark_price,
             index_price: self.index_price,
+            last_funding_rate: self.last_funding_rate,
             sequence: self.sequence,
             trade_id_counter: 0, // SnowflakeGen state not easily extractable
             expiry_entries,
@@ -996,10 +1071,12 @@ impl MatchingEngine {
         snapshot: EngineSnapshot,
         config: SymbolConfig,
         node_id: u16,
+        interest_rate: Decimal128,
     ) -> Self {
-        let mut engine = Self::new(config, node_id);
+        let mut engine = Self::new(config, node_id, interest_rate);
         engine.mark_price = snapshot.mark_price;
         engine.index_price = snapshot.index_price;
+        engine.last_funding_rate = snapshot.last_funding_rate;
         engine.sequence = snapshot.sequence;
         engine.stop_orders = snapshot.stop_orders;
 
@@ -1025,6 +1102,14 @@ impl MatchingEngine {
     #[doc(hidden)]
     pub fn orderbook_mut(&mut self) -> &mut OrderBook {
         &mut self.orderbook
+    }
+
+    /// Replay-only (Task 9): mutable access to the set of order ids observed
+    /// so far during the current WAL replay. Used by `apply_event` to tell a
+    /// legitimate terminal duplicate taker leg from a corrupt orphan fill.
+    #[doc(hidden)]
+    pub fn replay_seen_order_ids_mut(&mut self) -> &mut rustc_hash::FxHashSet<OrderId> {
+        &mut self.replay_seen_order_ids
     }
 
     /// Mutable stop-orders access — replay-only.
@@ -1084,6 +1169,10 @@ mod tests {
 
     fn dec(s: &str) -> Decimal128 {
         s.parse().unwrap()
+    }
+
+    fn sample_ts() -> UnixMicros {
+        UnixMicros::from_micros(1_700_000_000_000_000)
     }
 
     fn test_config() -> SymbolConfig {
@@ -1191,7 +1280,7 @@ mod tests {
     // 18. NewOrder → OrderAccepted + fills
     #[test]
     fn test_new_order_accepted_with_fills() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Place a resting sell
         let sell = new_order_cmd(
@@ -1230,7 +1319,7 @@ mod tests {
     // 19. NewOrder rejected (invalid qty)
     #[test]
     fn test_new_order_rejected_invalid() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1249,7 +1338,7 @@ mod tests {
     // 20. CancelOrder → OrderCanceled
     #[test]
     fn test_cancel_order() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1275,7 +1364,7 @@ mod tests {
     // 21. CancelOrder on unknown order → rejected
     #[test]
     fn test_cancel_unknown_order() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cancel = Command::CancelOrder {
             order_id: OrderId::new(999),
             user_id: UserId::new(10),
@@ -1294,7 +1383,7 @@ mod tests {
     // 22. AmendOrder price change → cancel + re-insert
     #[test]
     fn test_amend_order_price_change() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1327,7 +1416,7 @@ mod tests {
     // 23. AmendOrder qty down → in-place modify
     #[test]
     fn test_amend_order_qty_down() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1361,7 +1450,7 @@ mod tests {
     // 24. CancelAllOrders → multiple cancels
     #[test]
     fn test_cancel_all_orders() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1407,7 +1496,7 @@ mod tests {
     // 25. Stop order: set stop, update mark price past trigger → order activated and matched
     #[test]
     fn test_stop_order_trigger() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Place a resting ask
         engine.process_command(&new_order_cmd(
@@ -1438,7 +1527,8 @@ mod tests {
         assert_eq!(engine.stop_order_count(), 1);
 
         // Update mark price to trigger
-        let events = engine.update_mark_price(dec("51000"), dec("51000"));
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("51000"), dec("51000"), sample_ts());
 
         // Stop should have triggered and matched
         assert!(!events.is_empty());
@@ -1450,10 +1540,10 @@ mod tests {
     // 26. Trailing stop: update mark price → peak tracked, reversal triggers
     #[test]
     fn test_trailing_stop() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Set initial mark price
-        engine.update_mark_price(dec("50000"), dec("50000"));
+        engine.update_mark_price(SymbolId::new(1), dec("50000"), dec("50000"), sample_ts());
 
         // Place a resting bid for the triggered sell to match against
         engine.process_command(&new_order_cmd(
@@ -1483,15 +1573,24 @@ mod tests {
         assert!(is_accepted(&events[0]));
 
         // Price goes up — peak should track
-        let events = engine.update_mark_price(dec("52000"), dec("52000"));
-        assert!(events.is_empty()); // no trigger yet (52000 - 1000 = 51000, mark=52000)
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("52000"), dec("52000"), sample_ts());
+        assert!(
+            !events.iter().any(is_filled),
+            "peak tracking only, no trigger yet"
+        );
 
         // Price drops but not enough
-        let events = engine.update_mark_price(dec("51500"), dec("51500"));
-        assert!(events.is_empty()); // peak=52000, trigger at 51000, mark=51500
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("51500"), dec("51500"), sample_ts());
+        assert!(
+            !events.iter().any(is_filled),
+            "still above trigger, no fill"
+        );
 
         // Price drops to trigger level
-        let events = engine.update_mark_price(dec("51000"), dec("51000"));
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("51000"), dec("51000"), sample_ts());
         // Should trigger: peak=52000, delta=1000, trigger at 52000-1000=51000
         let fills: Vec<_> = events.iter().filter(|e| is_filled(e)).collect();
         assert!(!fills.is_empty());
@@ -1501,7 +1600,7 @@ mod tests {
     // 27. GTD expiration
     #[test]
     fn test_gtd_expiration() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Create GTD order — expire_time is automatically set to timestamp + 24h
         let cmd = new_order_cmd(
@@ -1531,7 +1630,7 @@ mod tests {
     // 28. Snapshot take + restore
     #[test]
     fn test_snapshot_restore() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Place some orders
         engine.process_command(&new_order_cmd(
@@ -1568,12 +1667,13 @@ mod tests {
         );
         engine.process_command(&stop);
 
-        engine.update_mark_price(dec("50000"), dec("50000"));
+        engine.update_mark_price(SymbolId::new(1), dec("50000"), dec("50000"), sample_ts());
 
         let snapshot = engine.take_snapshot();
 
         // Restore
-        let restored = MatchingEngine::restore_from_snapshot(snapshot, test_config(), 1);
+        let restored =
+            MatchingEngine::restore_from_snapshot(snapshot, test_config(), 1, dec("0.0001"));
 
         assert_eq!(restored.orderbook().order_count(), 2);
         assert_eq!(restored.stop_order_count(), 1);
@@ -1585,7 +1685,7 @@ mod tests {
     // Snapshot serde roundtrip
     #[test]
     fn test_snapshot_serde_roundtrip() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1608,7 +1708,7 @@ mod tests {
     // Duplicate order rejection
     #[test]
     fn test_duplicate_order_rejected() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1640,7 +1740,7 @@ mod tests {
     // Post-only rejection via engine
     #[test]
     fn test_post_only_rejection_via_engine() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1672,7 +1772,7 @@ mod tests {
     // FOK rejection via engine
     #[test]
     fn test_fok_rejection_via_engine() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1706,7 +1806,7 @@ mod tests {
     // IOC partial fill with cancel via engine
     #[test]
     fn test_ioc_partial_fill_via_engine() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1743,7 +1843,7 @@ mod tests {
     // Market order with no depth
     #[test]
     fn test_market_order_no_depth() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let market = new_order_cmd(
             1,
             10,
@@ -1762,7 +1862,7 @@ mod tests {
     // Limit order with no price → rejected
     #[test]
     fn test_limit_order_no_price() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1778,9 +1878,107 @@ mod tests {
 
     #[test]
     fn set_mark_price_updates_internal_state() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         assert_eq!(engine.mark_price(), Decimal128::ZERO);
         engine.set_mark_price(dec("60000"));
         assert_eq!(engine.mark_price(), dec("60000"));
+    }
+
+    #[test]
+    fn update_mark_price_passive_sets_price_and_peaks_no_fills() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.set_mark_price(dec("60000"));
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("61000"), dec("60950"), sample_ts());
+        assert_eq!(engine.mark_price(), dec("61000"));
+        assert!(matches!(events[0], Event::MarkPriceUpdate { .. }));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::OrderFilled { .. }))
+        );
+    }
+
+    #[test]
+    fn compute_funding_positive_premium() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.update_mark_price(SymbolId::new(1), dec("60600"), dec("60000"), sample_ts());
+        let events = engine.compute_funding(SymbolId::new(1), sample_ts());
+        // premium=(60600-60000)/60000=0.01 ; clamp(0.01+0.0001,±0.0075)=0.0075
+        match &events[0] {
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                assert_eq!(*funding_rate, dec("0.0075"))
+            }
+            _ => panic!("expected FundingRateUpdate"),
+        }
+        assert_eq!(engine.last_funding_rate(), dec("0.0075"));
+    }
+
+    #[test]
+    fn compute_funding_negative_premium() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.update_mark_price(SymbolId::new(1), dec("59400"), dec("60000"), sample_ts());
+        let events = engine.compute_funding(SymbolId::new(1), sample_ts());
+        match &events[0] {
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                assert_eq!(*funding_rate, dec("-0.0075"))
+            }
+            _ => panic!("expected FundingRateUpdate"),
+        }
+    }
+
+    #[test]
+    fn compute_funding_zero_index_no_panic() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        let events = engine.compute_funding(SymbolId::new(1), sample_ts());
+        // index stays ZERO → premium ZERO → clamp(0+0.0001)=0.0001
+        match &events[0] {
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                assert_eq!(*funding_rate, dec("0.0001"))
+            }
+            _ => panic!("expected FundingRateUpdate"),
+        }
+    }
+
+    #[test]
+    fn snapshot_round_trips_last_funding_rate() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.update_mark_price(SymbolId::new(1), dec("60600"), dec("60000"), sample_ts());
+        engine.compute_funding(SymbolId::new(1), sample_ts());
+        let saved = engine.last_funding_rate();
+        assert_ne!(saved, Decimal128::ZERO);
+
+        let snap = engine.take_snapshot();
+        let restored = MatchingEngine::restore_from_snapshot(snap, test_config(), 1, dec("0.0001"));
+        assert_eq!(restored.last_funding_rate(), saved);
+    }
+
+    #[test]
+    fn process_command_update_mark_price_dispatches() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        let events = engine.process_command(&Command::UpdateMarkPrice {
+            symbol: SymbolId::new(1),
+            mark_price: dec("62000"),
+            index_price: dec("61900"),
+            timestamp: sample_ts(),
+        });
+        assert_eq!(engine.mark_price(), dec("62000"));
+        assert!(matches!(events[0], Event::MarkPriceUpdate { .. }));
+    }
+
+    #[test]
+    fn process_command_compute_funding_dispatches() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.process_command(&Command::UpdateMarkPrice {
+            symbol: SymbolId::new(1),
+            mark_price: dec("60300"),
+            index_price: dec("60000"),
+            timestamp: sample_ts(),
+        });
+        let events = engine.process_command(&Command::ComputeFunding {
+            symbol: SymbolId::new(1),
+            timestamp: sample_ts(),
+        });
+        assert!(matches!(events[0], Event::FundingRateUpdate { .. }));
     }
 }

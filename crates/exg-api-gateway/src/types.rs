@@ -214,6 +214,17 @@ pub struct SetLeverageRequest {
     pub leverage: u32,
 }
 
+// ── Admin endpoints (Stage 2) ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminMarkPriceRequest {
+    /// Decimal string, e.g. "60000.5".
+    pub mark_price: String,
+    /// Decimal string. Must be > 0 (funding div-by-zero guard).
+    pub index_price: String,
+}
+
 #[cfg(test)]
 mod password_redaction_tests {
     use super::*;

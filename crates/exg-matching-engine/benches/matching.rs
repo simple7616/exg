@@ -50,7 +50,7 @@ fn bench_single_match(c: &mut Criterion) {
     c.bench_function("single_order_match", |b| {
         b.iter_batched(
             || {
-                let mut engine = MatchingEngine::new(test_config(), 1);
+                let mut engine = MatchingEngine::new(test_config(), 1, "0.0001".parse().unwrap());
                 // Place a resting ask
                 let sell = make_new_order(1, 10, Side::Sell, "50000", "10");
                 engine.process_command(&sell);
@@ -70,7 +70,7 @@ fn bench_insert_and_match_all(c: &mut Criterion) {
     c.bench_function("insert_1000_then_match_all", |b| {
         b.iter_batched(
             || {
-                let mut engine = MatchingEngine::new(test_config(), 1);
+                let mut engine = MatchingEngine::new(test_config(), 1, "0.0001".parse().unwrap());
                 // Insert 1000 sell orders at various prices
                 for i in 0..1000u64 {
                     let price = format!("{}", 50000 + i);
@@ -122,7 +122,7 @@ fn bench_100k_orders(c: &mut Criterion) {
     group.bench_function("100k_orders_insert_match", |b| {
         b.iter_batched(
             || {
-                let engine = MatchingEngine::new(test_config(), 1);
+                let engine = MatchingEngine::new(test_config(), 1, "0.0001".parse().unwrap());
                 // Pre-generate 100k order commands: alternating sell (resting) and buy (crossing)
                 let mut cmds = Vec::with_capacity(100_000);
                 for i in 0..100_000u64 {

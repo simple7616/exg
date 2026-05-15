@@ -15,6 +15,8 @@ fn base_cfg(wal_dir: &std::path::Path) -> ExgConfig {
     cfg.server.host = "127.0.0.1".into();
     cfg.server.port = 0;
     cfg.auth.jwt_secret = "stage1b-test-secret-padding-32-bytes-ok".into();
+    cfg.admin.admin_secret = "stage1b-admin-secret-padding-32-bytes-ok".into();
+    cfg.server.admin_port = 0;
     cfg
 }
 

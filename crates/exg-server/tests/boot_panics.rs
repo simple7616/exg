@@ -13,6 +13,8 @@ fn base_cfg(wal_dir: &std::path::Path) -> ExgConfig {
     // Stage 1a: override the placeholder to a valid 32-byte secret so the
     // 4 non-auth invariant tests don't trip on the JWT placeholder check.
     cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "a".repeat(32);
+    cfg.server.admin_port = 0;
     cfg
 }
 
@@ -303,5 +305,33 @@ async fn boot_panics_on_unknown_order_filled() {
                 || msg.contains("unknown order")
                 || msg.contains("unknown order_id")),
         "expected replay-apply-error message containing UnknownOrder, got: {msg}"
+    );
+}
+
+#[actix_web::test]
+async fn boot_panics_on_short_admin_secret() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.admin.admin_secret = "short".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("admin.admin_secret") && msg.contains("32 bytes"),
+        "expected admin secret length panic, got: {msg}"
+    );
+}
+
+#[actix_web::test]
+async fn boot_panics_on_placeholder_admin_secret() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.admin.admin_secret = "CHANGE-ME-ADMIN-DEV-ONLY-MUST-BE-32-BYTES".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("admin.admin_secret") && msg.contains("placeholder"),
+        "expected admin secret placeholder panic, got: {msg}"
     );
 }
