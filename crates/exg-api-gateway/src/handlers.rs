@@ -29,6 +29,18 @@ fn extract_user_id_from_jwt(req: &HttpRequest, jwt_secret: &[u8]) -> Result<User
     Ok(UserId::new(claims.user_id))
 }
 
+/// Charge one token from the per-user rate limit bucket (`user:{id}` key).
+/// Shared by place / cancel / amend. Returns 429 + ERR_RATE_LIMITED_USER on miss.
+fn consume_user_bucket(state: &AppState, user_id: UserId) -> Result<(), ApiError> {
+    let now_ts = UnixMicros::now();
+    let key = format!("user:{}", user_id.value());
+    let mut limiter = state.rate_limiter.lock();
+    if !limiter.consume(&key, now_ts) {
+        return Err(ApiError::user_rate_limited("rate limit exceeded for user"));
+    }
+    Ok(())
+}
+
 fn now() -> UnixMicros {
     let micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -91,15 +103,7 @@ pub async fn place_order(
 ) -> Result<HttpResponse, ApiError> {
     let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
 
-    // Per-user rate limit gate (in-memory, no PG dependency).
-    {
-        let now_ts = UnixMicros::now();
-        let key = format!("user:{}", user_id.value());
-        let mut limiter = state.rate_limiter.lock();
-        if !limiter.consume(&key, now_ts) {
-            return Err(ApiError::user_rate_limited("rate limit exceeded for user"));
-        }
-    }
+    consume_user_bucket(&state, user_id)?;
 
     // Per-clientOrderId dedup gate (handler-side INSERT ON CONFLICT).
     if let Some(coid_str) = body.client_order_id.as_deref() {
@@ -168,6 +172,7 @@ pub async fn cancel_order(
     body: web::Json<CancelOrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
     let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
+    consume_user_bucket(&state, user_id)?;
     let symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
     let ts = now();
     info!(
@@ -195,6 +200,7 @@ pub async fn amend_order(
     body: web::Json<AmendOrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
     let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
+    consume_user_bucket(&state, user_id)?;
     let symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
     let ts = now();
     info!(
@@ -267,7 +273,12 @@ pub async fn login(
     );
     {
         let mut limiter = state.rate_limiter.lock();
-        if !limiter.consume(&email_key, now_ts) || !limiter.consume(&ip_key, now_ts) {
+        // Charge BOTH buckets unconditionally — || would short-circuit and
+        // skip the second consume if the first refused. An attacker cycling
+        // emails from one IP must still consume the IP bucket.
+        let email_ok = limiter.consume(&email_key, now_ts);
+        let ip_ok = limiter.consume(&ip_key, now_ts);
+        if !email_ok || !ip_ok {
             return Err(ApiError::user_rate_limited("login rate limit exceeded"));
         }
     }
