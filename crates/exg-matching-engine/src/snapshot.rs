@@ -12,6 +12,7 @@ pub struct EngineSnapshot {
     pub stop_orders: Vec<BookOrder>,
     pub mark_price: Decimal128,
     pub index_price: Decimal128,
+    pub last_funding_rate: Decimal128,
     pub sequence: u64,
     pub trade_id_counter: u64,
     /// GTD expiry entries: (expire_time_micros, order_id).

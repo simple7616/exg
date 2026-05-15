@@ -1049,6 +1049,7 @@ impl MatchingEngine {
             stop_orders: self.stop_orders.clone(),
             mark_price: self.mark_price,
             index_price: self.index_price,
+            last_funding_rate: self.last_funding_rate,
             sequence: self.sequence,
             trade_id_counter: 0, // SnowflakeGen state not easily extractable
             expiry_entries,
@@ -1065,6 +1066,7 @@ impl MatchingEngine {
         let mut engine = Self::new(config, node_id, interest_rate);
         engine.mark_price = snapshot.mark_price;
         engine.index_price = snapshot.index_price;
+        engine.last_funding_rate = snapshot.last_funding_rate;
         engine.sequence = snapshot.sequence;
         engine.stop_orders = snapshot.stop_orders;
 
@@ -1918,6 +1920,19 @@ mod tests {
             }
             _ => panic!("expected FundingRateUpdate"),
         }
+    }
+
+    #[test]
+    fn snapshot_round_trips_last_funding_rate() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.update_mark_price(SymbolId::new(1), dec("60600"), dec("60000"), sample_ts());
+        engine.compute_funding(SymbolId::new(1), sample_ts());
+        let saved = engine.last_funding_rate();
+        assert_ne!(saved, Decimal128::ZERO);
+
+        let snap = engine.take_snapshot();
+        let restored = MatchingEngine::restore_from_snapshot(snap, test_config(), 1, dec("0.0001"));
+        assert_eq!(restored.last_funding_rate(), saved);
     }
 
     #[test]
