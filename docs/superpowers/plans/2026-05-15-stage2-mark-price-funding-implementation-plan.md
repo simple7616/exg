@@ -975,19 +975,24 @@ In the replay.rs `#[cfg(test)] mod tests`, add:
         // property; the non-trigger-on-replay property is already covered by
         // apply_event_mark_price_update_passive_only.
 
-        // accept_event_full(order_id, type, tif, qty, price, visible,
-        //                    trailing_delta, trailing_peak_price, stop_price)
-        let accepted = accept_event_full(
-            9,
-            OrderType::TrailingStop,
-            TimeInForce::Gtc,
-            "1.0",
-            "60000",
-            None,
-            Some(dec("100")),    // trailing_delta
-            Some(dec("60000")),  // initial trailing_peak_price (= mark at accept)
-            Some(dec("59900")),  // stop_price
-        );
+        // NOTE (Eng review, execution finding): `accept_event_full` hardcodes
+        // `side: Side::Buy`. A Buy trailing stop tracks the downward trough and
+        // triggers on RISING marks — which makes the ascending-marks "no
+        // trigger" premise false. The test intent requires a SELL trailing
+        // stop (peak tracks the upward high, no trigger on a rising mark), so
+        // this one OrderAccepted is built INLINE with `side: Side::Sell`, all
+        // other fields mirroring:
+        //   accept_event_full(9, TrailingStop, Gtc, "1.0", "60000",
+        //                      None, Some(dec("100")), Some(dec("60000")),
+        //                      Some(dec("59900")))
+        // Build `Event::OrderAccepted` INLINE with the FULL Stage 1b field
+        // set (OrderAccepted has no Default; enumerate every field): order_id
+        // 9, user/symbol per test_engine convention, `side: Side::Sell`,
+        // order_type TrailingStop, Gtc, quantity "1.0", price "60000",
+        // trailing_delta Some(dec("100")), trailing_peak_price
+        // Some(dec("60000")), stop_price Some(dec("59900")), and the
+        // remaining OrderAccepted fields exactly as the Stage 1b schema
+        // requires. Reference implementation: shipped commit 5295900.
         let ascending = ["60500", "61000", "61500"];
 
         // LIVE engine: full update_mark_price path advances the peak each step.
