@@ -1,7 +1,7 @@
 pub mod auth;
 pub mod error;
 pub mod user;
-// pub mod repo; -- Task 3 will add this; do NOT add yet (would break build)
+pub mod repo;
 
 pub use auth::{
     AuthService, JwtClaims, LoginResponse,
@@ -9,3 +9,8 @@ pub use auth::{
 };
 pub use error::AuthError;
 pub use user::{ApiKey, ApiPermissions, KycLevel, SubAccount, User};
+pub use repo::{
+    UserRow, register_user, login_user, find_user_by_id,
+    init_dummy_argon2_hash, init_dummy_argon2_hash_for_tests,
+    DUMMY_ARGON2_HASH,
+};
