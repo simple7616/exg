@@ -21,14 +21,9 @@ pub enum ApplyError {
     #[error("OrderAccepted for order_id={0:?} already present in book")]
     DuplicateOrder(OrderId),
     #[error("OrderFilled fill_qty {got} exceeds existing remaining {have}")]
-    OverFill {
-        got: Decimal128,
-        have: Decimal128,
-    },
+    OverFill { got: Decimal128, have: Decimal128 },
     #[error("event variant {variant} unexpected during replay")]
-    UnexpectedVariant {
-        variant: &'static str,
-    },
+    UnexpectedVariant { variant: &'static str },
 }
 
 impl MatchingEngine {
@@ -255,7 +250,9 @@ mod tests {
     #[test]
     fn apply_order_accepted_inserts_book_order() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         let order = engine.orderbook().get_order(OrderId::new(1)).unwrap();
         assert_eq!(order.remaining_qty, dec("1.0"));
         assert_eq!(order.price, dec("50000"));
@@ -264,7 +261,9 @@ mod tests {
     #[test]
     fn apply_order_canceled_removes_book_order() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         engine
             .apply_event(&Event::OrderCanceled {
                 order_id: OrderId::new(1),
@@ -280,7 +279,9 @@ mod tests {
     #[test]
     fn apply_order_filled_decrements_remaining_qty() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         engine
             .apply_event(&Event::OrderFilled {
                 order_id: OrderId::new(1),
@@ -302,7 +303,9 @@ mod tests {
     #[test]
     fn apply_order_filled_zero_removes_book_order() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         engine
             .apply_event(&Event::OrderFilled {
                 order_id: OrderId::new(1),
@@ -323,7 +326,9 @@ mod tests {
     #[test]
     fn apply_trade_executed_is_noop_on_book() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         engine
             .apply_event(&Event::TradeExecuted {
                 trade_id: TradeId::new(100),
@@ -340,7 +345,11 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            engine.orderbook().get_order(OrderId::new(1)).unwrap().remaining_qty,
+            engine
+                .orderbook()
+                .get_order(OrderId::new(1))
+                .unwrap()
+                .remaining_qty,
             dec("1.0")
         );
     }
@@ -362,7 +371,9 @@ mod tests {
     #[test]
     fn apply_duplicate_order_accepted_returns_err() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         let err = engine
             .apply_event(&accept_event(1, "2.0", "50001"))
             .unwrap_err();
@@ -407,7 +418,9 @@ mod tests {
     #[test]
     fn apply_over_fill_returns_err() {
         let mut engine = test_engine();
-        engine.apply_event(&accept_event(1, "1.0", "50000")).unwrap();
+        engine
+            .apply_event(&accept_event(1, "1.0", "50000"))
+            .unwrap();
         let err = engine
             .apply_event(&Event::OrderFilled {
                 order_id: OrderId::new(1),
@@ -438,7 +451,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ApplyError::UnexpectedVariant { variant: "MarkPriceUpdate" }
+            ApplyError::UnexpectedVariant {
+                variant: "MarkPriceUpdate"
+            }
         ));
     }
 
@@ -622,7 +637,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ApplyError::UnexpectedVariant { variant: "FundingRateUpdate" }
+            ApplyError::UnexpectedVariant {
+                variant: "FundingRateUpdate"
+            }
         ));
     }
 
@@ -640,7 +657,9 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            ApplyError::UnexpectedVariant { variant: "LiquidationOrder" }
+            ApplyError::UnexpectedVariant {
+                variant: "LiquidationOrder"
+            }
         ));
     }
 }

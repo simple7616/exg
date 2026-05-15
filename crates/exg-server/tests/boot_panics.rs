@@ -51,7 +51,6 @@ async fn boot_panics_on_multiple_symbols() {
     );
 }
 
-
 #[actix_web::test]
 async fn boot_panics_on_invalid_mark_price() {
     let tmp = TempDir::new().unwrap();
@@ -148,11 +147,7 @@ async fn boot_panics_on_corrupt_wal_crc() {
     seg1_bytes.extend_from_slice(&1u64.to_le_bytes()); // seq = 1
     seg1_bytes.extend_from_slice(&0u32.to_le_bytes()); // payload_len = 0
     seg1_bytes.extend_from_slice(&0xDEADBEEFu32.to_le_bytes()); // wrong CRC
-    std::fs::write(
-        wal_dir.join("wal-00000000000000000001.log"),
-        &seg1_bytes,
-    )
-    .unwrap();
+    std::fs::write(wal_dir.join("wal-00000000000000000001.log"), &seg1_bytes).unwrap();
 
     // Step 3: hand-craft seg-2 (first_seq=2) so seg-1 becomes non-last.
     // Compute a valid CRC for seq=2, payload=b"ok".
@@ -170,11 +165,7 @@ async fn boot_panics_on_corrupt_wal_crc() {
     seg2_bytes.extend_from_slice(&(payload2.len() as u32).to_le_bytes());
     seg2_bytes.extend_from_slice(payload2);
     seg2_bytes.extend_from_slice(&crc2.to_le_bytes());
-    std::fs::write(
-        wal_dir.join("wal-00000000000000000002.log"),
-        &seg2_bytes,
-    )
-    .unwrap();
+    std::fs::write(wal_dir.join("wal-00000000000000000002.log"), &seg2_bytes).unwrap();
 
     let mut cfg = base_cfg(tmp.path());
     cfg.wal.dir = wal_dir.to_string_lossy().into_owned();
@@ -243,11 +234,7 @@ async fn boot_panics_on_sequence_gap() {
     second.extend_from_slice(&payload_len.to_le_bytes());
     second.extend_from_slice(payload);
     second.extend_from_slice(&crc.to_le_bytes());
-    std::fs::write(
-        wal_dir.join("wal-00000000000000000005.log"),
-        &second,
-    )
-    .unwrap();
+    std::fs::write(wal_dir.join("wal-00000000000000000005.log"), &second).unwrap();
 
     let mut cfg = base_cfg(tmp.path());
     cfg.wal.dir = wal_dir.to_string_lossy().into_owned();
@@ -306,7 +293,9 @@ async fn boot_panics_on_unknown_order_filled() {
     }
 
     let result = exg_server::run_with_config(cfg).await;
-    let err = result.err().expect("expected Err from unknown-order replay");
+    let err = result
+        .err()
+        .expect("expected Err from unknown-order replay");
     let msg = format!("{err:#}");
     assert!(
         msg.contains("WAL replay failed at sequence")

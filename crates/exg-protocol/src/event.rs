@@ -1,4 +1,6 @@
-use exg_common::{Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, TradeId, UnixMicros, UserId};
+use exg_common::{
+    Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, TradeId, UnixMicros, UserId,
+};
 use serde::{Deserialize, Serialize};
 
 /// Rejection reasons for orders.

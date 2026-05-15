@@ -40,12 +40,7 @@ async fn boot_server(cfg: ExgConfig, pool: PgPool) -> (exg_server::ServerHandle,
     panic!("server not ready");
 }
 
-async fn register_and_login(
-    client: &Client,
-    base: &str,
-    email: &str,
-    password: &str,
-) -> String {
+async fn register_and_login(client: &Client, base: &str, email: &str, password: &str) -> String {
     let _ = client
         .post(format!("{base}/api/v1/auth/register"))
         .json(&serde_json::json!({"email": email, "password": password}))
@@ -68,10 +63,7 @@ async fn register_and_login(
 }
 
 /// Reboot the server against the same WAL + pool, exercising the replay path.
-async fn reboot(
-    cfg: ExgConfig,
-    pool: PgPool,
-) -> (exg_server::ServerHandle, String) {
+async fn reboot(cfg: ExgConfig, pool: PgPool) -> (exg_server::ServerHandle, String) {
     boot_server(cfg, pool).await
 }
 
@@ -83,7 +75,11 @@ async fn boot_replays_empty_wal_succeeds(pool: PgPool) {
     let cfg = base_cfg(tmp.path());
     let (handle, base) = boot_server(cfg, pool).await;
     let client = Client::new();
-    let resp = client.get(format!("{base}/api/v1/health")).send().await.unwrap();
+    let resp = client
+        .get(format!("{base}/api/v1/health"))
+        .send()
+        .await
+        .unwrap();
     assert!(resp.status().is_success());
     handle.shutdown().await.unwrap();
 }
@@ -120,15 +116,17 @@ async fn boot_replays_single_order_restores_orderbook(pool: PgPool) {
         .read_from(0, |_seq, payload| {
             // rkyv requires 16-byte aligned input; copy to owned Vec.
             let owned: Vec<u8> = payload.to_vec();
-            let e: Event =
-                rkyv::from_bytes::<Event, rkyv::rancor::Error>(&owned).unwrap();
+            let e: Event = rkyv::from_bytes::<Event, rkyv::rancor::Error>(&owned).unwrap();
             if matches!(e, Event::OrderAccepted { .. }) {
                 accept_count += 1;
             }
             true
         })
         .unwrap();
-    assert!(accept_count >= 1, "WAL must contain at least one OrderAccepted");
+    assert!(
+        accept_count >= 1,
+        "WAL must contain at least one OrderAccepted"
+    );
 
     // Boot 2: replay. Test passes if boot succeeds (replay applied without panic).
     let (handle2, _base2) = reboot(cfg1, pool).await;
@@ -305,7 +303,10 @@ async fn place_then_kill_then_place_continues_sequence(pool: PgPool) {
         .await
         .unwrap();
     let second_oid: u64 = resp["orderId"].as_str().unwrap().parse().unwrap();
-    assert_ne!(first_oid, second_oid, "second boot must allocate fresh order_id");
+    assert_ne!(
+        first_oid, second_oid,
+        "second boot must allocate fresh order_id"
+    );
     handle2.shutdown().await.unwrap();
 }
 

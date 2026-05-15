@@ -290,18 +290,17 @@ pub async fn run_with_config_with_pool(
                 // Copy to an owned Vec before deserializing (same pattern as
                 // stage0_e2e.rs::read_events and the wal-dump utility).
                 let owned: Vec<u8> = payload.to_vec();
-                let event = match rkyv::from_bytes::<exg_protocol::Event, rkyv::rancor::Error>(
-                    &owned,
-                ) {
-                    Ok(e) => e,
-                    Err(e) => {
-                        replay_err = Some(ReplayError::Decode {
-                            seq,
-                            msg: format!("{e}"),
-                        });
-                        return false;
-                    }
-                };
+                let event =
+                    match rkyv::from_bytes::<exg_protocol::Event, rkyv::rancor::Error>(&owned) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            replay_err = Some(ReplayError::Decode {
+                                seq,
+                                msg: format!("{e}"),
+                            });
+                            return false;
+                        }
+                    };
                 if let Err(e) = engine.apply_event(&event) {
                     replay_err = Some(ReplayError::Apply {
                         seq,
