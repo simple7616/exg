@@ -285,8 +285,13 @@ pub async fn run_with_config_with_pool(
                     });
                     return false;
                 }
+                // rkyv requires 16-byte aligned input; the mmap slice may be
+                // misaligned (payload starts at byte 12 into the record header).
+                // Copy to an owned Vec before deserializing (same pattern as
+                // stage0_e2e.rs::read_events and the wal-dump utility).
+                let owned: Vec<u8> = payload.to_vec();
                 let event = match rkyv::from_bytes::<exg_protocol::Event, rkyv::rancor::Error>(
-                    payload,
+                    &owned,
                 ) {
                     Ok(e) => e,
                     Err(e) => {
