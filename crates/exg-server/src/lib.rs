@@ -95,28 +95,6 @@ fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
         );
     }
 
-    // Invariant 3: WAL directory must be empty or not yet created.
-    // Stage 0 has no replay/snapshot; an existing WAL would silently splice
-    // a fresh in-memory state onto an old event timeline. Reject anything
-    // resembling prior data: WAL segments are `wal-N.log`, snapshots are
-    // `snapshot-*`. We treat ANY file in the dir as evidence of prior use
-    // (including stray `.DS_Store`, sentinels from tests, etc.) — the
-    // operator must clear the dir to confirm intent.
-    let wal_dir = PathBuf::from(&cfg.wal.dir);
-    if wal_dir.exists() {
-        let entry_count = std::fs::read_dir(&wal_dir)
-            .with_context(|| format!("cannot read WAL dir: {}", wal_dir.display()))?
-            .filter_map(|e| e.ok())
-            .count();
-        if entry_count > 0 {
-            bail!(
-                "WAL directory {} is non-empty ({} entries); Stage 0 requires a fresh WAL. Clear the dir or pick a new path. (Spec §4.5 step 3b.)",
-                wal_dir.display(),
-                entry_count
-            );
-        }
-    }
-
     // Invariant 11: JWT secret must be at least 32 bytes.
     // Invariant 12: JWT secret must not be the dev placeholder.
     const JWT_PLACEHOLDER: &str = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK";
@@ -257,12 +235,116 @@ pub async fn run_with_config_with_pool(
         .await
         .context("PG ping (SELECT 1) failed")?;
 
+    // ── Step 3.6 (Stage 1b): WAL replay ───────────────────────────────────
+    // Boot may be picking up where a previous instance left off. Replay
+    // every WAL record through engine.apply_event so the matching engine
+    // resumes with the same orderbook state. Step 0 (validate_invariants)
+    // has already passed; Step 3.5 (PG ping) confirms DB connectivity;
+    // replay runs on the boot thread before the matching thread is spawned,
+    // so no locking is needed.
+    let replayed_count: u64 = {
+        use exg_wal::WalReader;
+
+        // Local error enum keeps the closure body single-exit and the post-loop
+        // check single-branch. Variants map 1:1 to the failure modes documented
+        // in the spec §7.1 boot-panic table.
+        enum ReplayError {
+            SequenceGap { expected: u64, got: u64 },
+            Decode { seq: u64, msg: String },
+            Apply { seq: u64, msg: String },
+        }
+        impl std::fmt::Display for ReplayError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    ReplayError::SequenceGap { expected, got } => write!(
+                        f,
+                        "WAL replay failed: sequence gap at expected={expected}, got={got}"
+                    ),
+                    ReplayError::Decode { seq, msg } => {
+                        write!(f, "WAL replay failed: rkyv decode at sequence {seq}: {msg}")
+                    }
+                    ReplayError::Apply { seq, msg } => {
+                        write!(f, "WAL replay failed at sequence {seq}: {msg}")
+                    }
+                }
+            }
+        }
+
+        let wal_dir = PathBuf::from(&cfg.wal.dir);
+        let mut reader = WalReader::open(&wal_dir).context("WAL reader open")?;
+        let mut expected_seq: u64 = 0;
+        let mut replayed_count: u64 = 0;
+        let mut replay_err: Option<ReplayError> = None;
+
+        reader
+            .read_from(0, |seq, payload| {
+                if seq != expected_seq {
+                    replay_err = Some(ReplayError::SequenceGap {
+                        expected: expected_seq,
+                        got: seq,
+                    });
+                    return false;
+                }
+                let event = match rkyv::from_bytes::<exg_protocol::Event, rkyv::rancor::Error>(
+                    payload,
+                ) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        replay_err = Some(ReplayError::Decode {
+                            seq,
+                            msg: format!("{e}"),
+                        });
+                        return false;
+                    }
+                };
+                if let Err(e) = engine.apply_event(&event) {
+                    replay_err = Some(ReplayError::Apply {
+                        seq,
+                        msg: format!("{e}"),
+                    });
+                    return false;
+                }
+                expected_seq = seq + 1;
+                replayed_count += 1;
+                true
+            })
+            .map_err(|e| anyhow::anyhow!("WAL replay failed: {e}"))?;
+
+        if let Some(err) = replay_err {
+            anyhow::bail!("{err}");
+        }
+
+        if replayed_count > 0 {
+            tracing::info!(
+                target: "boot",
+                replayed_count,
+                last_seq = expected_seq.saturating_sub(1),
+                "WAL replay complete"
+            );
+        }
+
+        replayed_count
+    };
+
     // ── Step 3.7 (Stage 1a): DUMMY_ARGON2_HASH OnceCell init ─────────────
     // Pre-compute the timing-safe dummy hash used by login handlers to make
     // timing attacks harder (prevents fast-path on unknown usernames).
     // init_dummy_argon2_hash is idempotent via OnceCell::get_or_try_init.
     exg_user_service::init_dummy_argon2_hash()
         .map_err(|e| anyhow::anyhow!("failed to init DUMMY_ARGON2_HASH: {e:?}"))?;
+
+    // ── Step 3.8 (Stage 1b): invariant 21 post-replay consistency check ──
+    // Lives in its own block AFTER Step 3.7 to match spec §3 ordering.
+    // The check is purely a sanity assertion; it has no dependencies on
+    // DUMMY_ARGON2_HASH but the placement keeps spec ↔ plan aligned.
+    {
+        let writer_next = wal.lock().current_sequence();
+        if replayed_count != writer_next {
+            anyhow::bail!(
+                "invariant 21 violated: replayed_count={replayed_count}, wal_writer.current_seq={writer_next}"
+            );
+        }
+    }
 
     // ── Step 4: build shared AppState ────────────────────────────────────
     let state = AppState {
