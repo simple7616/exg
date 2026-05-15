@@ -307,3 +307,31 @@ async fn boot_panics_on_unknown_order_filled() {
         "expected replay-apply-error message containing UnknownOrder, got: {msg}"
     );
 }
+
+#[actix_web::test]
+async fn boot_panics_on_short_admin_secret() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.admin.admin_secret = "short".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("admin.admin_secret") && msg.contains("32 bytes"),
+        "expected admin secret length panic, got: {msg}"
+    );
+}
+
+#[actix_web::test]
+async fn boot_panics_on_placeholder_admin_secret() {
+    let tmp = TempDir::new().unwrap();
+    let mut cfg = base_cfg(tmp.path());
+    cfg.admin.admin_secret = "CHANGE-ME-ADMIN-DEV-ONLY-MUST-BE-32-BYTES".into();
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("admin.admin_secret") && msg.contains("placeholder"),
+        "expected admin secret placeholder panic, got: {msg}"
+    );
+}
