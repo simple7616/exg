@@ -22,4 +22,5 @@ tracing = { workspace = true }
 rkyv = { workspace = true }
 
 [dev-dependencies]
+chrono = { workspace = true }
 tempfile = { workspace = true }

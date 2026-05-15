@@ -1,9 +1,12 @@
 use std::sync::Arc;
 
 use exg_common::SnowflakeGen;
-use exg_config::ExgConfig;
+use exg_config::{AuthConfig, ExgConfig};
 use exg_ringbuffer::Producer;
 use parking_lot::Mutex;
+use sqlx::PgPool;
+
+use crate::middleware::RateLimiter;
 
 /// Shared state injected into every Actix handler.
 ///
@@ -16,4 +19,7 @@ pub struct AppState {
     pub producer: Arc<Mutex<Producer>>,
     pub snowflake: Arc<SnowflakeGen>,
     pub cfg: Arc<ExgConfig>,
+    pub pool: PgPool,
+    pub auth_cfg: Arc<AuthConfig>,
+    pub rate_limiter: Arc<Mutex<RateLimiter>>,
 }

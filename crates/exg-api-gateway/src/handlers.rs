@@ -11,19 +11,22 @@ use crate::types::{
     PlaceOrderResponse,
 };
 
-/// Extract `X-User-Id` numeric header → `UserId`.
-fn extract_user_id(req: &HttpRequest) -> Result<UserId, ApiError> {
+/// Extract and verify the `Authorization: Bearer <jwt>` header, returning the
+/// authenticated `UserId` on success.
+fn extract_user_id_from_jwt(req: &HttpRequest, jwt_secret: &[u8]) -> Result<UserId, ApiError> {
     let h = req
         .headers()
-        .get("X-User-Id")
-        .ok_or_else(|| ApiError::unauthorized("missing X-User-Id header"))?;
+        .get("Authorization")
+        .ok_or_else(|| ApiError::unauthorized("missing Authorization header"))?;
     let s = h
         .to_str()
-        .map_err(|_| ApiError::unauthorized("X-User-Id is not valid ASCII"))?;
-    let n: u64 = s
-        .parse()
-        .map_err(|_| ApiError::unauthorized("X-User-Id is not numeric"))?;
-    Ok(UserId::new(n))
+        .map_err(|_| ApiError::unauthorized("Authorization not valid ASCII"))?;
+    let token = s
+        .strip_prefix("Bearer ")
+        .ok_or_else(|| ApiError::unauthorized("Authorization must be 'Bearer <jwt>'"))?;
+    let claims = exg_user_service::verify_jwt(jwt_secret, token)
+        .map_err(|_| ApiError::unauthorized("invalid or expired token"))?;
+    Ok(UserId::new(claims.user_id))
 }
 
 fn now() -> UnixMicros {
@@ -60,6 +63,23 @@ fn enqueue(state: &AppState, cmd: &Command) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn map_auth_error(e: exg_user_service::AuthError) -> ApiError {
+    use exg_user_service::AuthError;
+    match e {
+        AuthError::InvalidInput(msg) => ApiError::bad_request(msg),
+        AuthError::EmailExists | AuthError::EmailAlreadyExists => {
+            ApiError::duplicate_resource("email already registered")
+        }
+        AuthError::InvalidCredentials => ApiError::unauthorized("invalid credentials"),
+        AuthError::DbError(_) => ApiError::internal("database unavailable"),
+        AuthError::JwtError(_) | AuthError::InvalidToken(_) | AuthError::TokenExpired => {
+            ApiError::unauthorized("invalid token")
+        }
+        AuthError::HashError(msg) => ApiError::internal(msg),
+        other => ApiError::internal(format!("auth error: {other}")),
+    }
+}
+
 pub async fn health() -> HttpResponse {
     HttpResponse::Ok().json(HealthResponse { status: "ok" })
 }
@@ -69,7 +89,39 @@ pub async fn place_order(
     req: HttpRequest,
     body: web::Json<PlaceOrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
-    let user_id = extract_user_id(&req)?;
+    let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
+
+    // Per-user rate limit gate (in-memory, no PG dependency).
+    {
+        let now_ts = UnixMicros::now();
+        let key = format!("user:{}", user_id.value());
+        let mut limiter = state.rate_limiter.lock();
+        if !limiter.consume(&key, now_ts) {
+            return Err(ApiError::user_rate_limited("rate limit exceeded for user"));
+        }
+    }
+
+    // Per-clientOrderId dedup gate (handler-side INSERT ON CONFLICT).
+    if let Some(coid_str) = body.client_order_id.as_deref() {
+        let coid: u64 = coid_str
+            .parse()
+            .map_err(|_| ApiError::bad_request("clientOrderId must be numeric"))?;
+        let now_micros = UnixMicros::now().as_micros() as i64;
+        let inserted = sqlx::query(
+            "INSERT INTO user_client_order_ids (user_id, client_order_id, created_at)
+             VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        )
+        .bind(user_id.value() as i64)
+        .bind(coid as i64)
+        .bind(now_micros)
+        .execute(&state.pool)
+        .await
+        .map_err(ApiError::db_unavailable)?;
+        if inserted.rows_affected() == 0 {
+            return Err(ApiError::duplicate_resource("duplicate clientOrderId"));
+        }
+    }
+
     let symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
     let order_id = OrderId::new(state.snowflake.next_id());
     let ts = now();
@@ -89,9 +141,6 @@ pub async fn place_order(
 
     let resp = PlaceOrderResponse {
         order_id: order_id.value().to_string(),
-        // PlaceOrderResponse.client_order_id is Option<u64>; PlaceOrderRequest.client_order_id
-        // is Option<String>. The conversion fn already parsed it into u64 inside the Command;
-        // return None here (client echoing deferred to Stage 1 read-path).
         client_order_id: None,
         status: "ACCEPTED",
     };
@@ -110,7 +159,7 @@ pub async fn cancel_order(
     req: HttpRequest,
     body: web::Json<CancelOrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
-    let user_id = extract_user_id(&req)?;
+    let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
     let symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
     let ts = now();
     info!(
@@ -137,7 +186,7 @@ pub async fn amend_order(
     req: HttpRequest,
     body: web::Json<AmendOrderRequest>,
 ) -> Result<HttpResponse, ApiError> {
-    let user_id = extract_user_id(&req)?;
+    let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
     let symbol = lookup_symbol_id(&state.cfg, &body.symbol)?;
     let ts = now();
     info!(
@@ -161,19 +210,85 @@ pub async fn amend_order(
     Ok(HttpResponse::Ok().json(resp))
 }
 
+pub async fn register(
+    state: web::Data<AppState>,
+    body: web::Json<crate::types::RegisterRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let user_id =
+        exg_user_service::register_user(&state.pool, &state.snowflake, &body.email, &body.password)
+            .await
+            .map_err(map_auth_error)?;
+    let resp = crate::types::RegisterResponseBody {
+        user_id: user_id.value().to_string(),
+        email: body.email.to_lowercase(),
+        status: "REGISTERED",
+    };
+    Ok(HttpResponse::Created().json(resp))
+}
+
+pub async fn login(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<crate::types::LoginRequest>,
+) -> Result<HttpResponse, ApiError> {
+    let now_ts = UnixMicros::now();
+    let email_key = format!("login:email:{}", body.email.to_lowercase());
+    let ip_key = format!(
+        "login:ip:{}",
+        req.peer_addr()
+            .map(|a| a.ip().to_string())
+            .unwrap_or_else(|| "unknown".into())
+    );
+    {
+        let mut limiter = state.rate_limiter.lock();
+        if !limiter.consume(&email_key, now_ts) || !limiter.consume(&ip_key, now_ts) {
+            return Err(ApiError::user_rate_limited("login rate limit exceeded"));
+        }
+    }
+    let resp_inner =
+        exg_user_service::login_user(&state.pool, &state.auth_cfg, &body.email, &body.password)
+            .await
+            .map_err(map_auth_error)?;
+    let resp = crate::types::LoginResponseBody {
+        access_token: resp_inner.access_token,
+        expires_in: resp_inner.expires_in,
+        user_id: resp_inner.user_id.to_string(),
+    };
+    Ok(HttpResponse::Ok().json(resp))
+}
+
+pub async fn me(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+) -> Result<HttpResponse, ApiError> {
+    let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
+    let row = exg_user_service::find_user_by_id(&state.pool, user_id)
+        .await
+        .map_err(map_auth_error)?
+        .ok_or_else(|| ApiError::unauthorized("user not found"))?;
+    let resp = crate::types::MeResponse {
+        user_id: row.user_id.value().to_string(),
+        email: row.email,
+        kyc_level: row.kyc_level,
+    };
+    Ok(HttpResponse::Ok().json(resp))
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
 
     use actix_web::{http::StatusCode, test};
     use exg_common::SnowflakeGen;
-    use exg_config::ExgConfig;
+    use exg_config::{AuthConfig, ExgConfig};
     use exg_ringbuffer::RingBuffer;
     use parking_lot::Mutex;
+    use sqlx::PgPool;
 
     use super::*;
     use crate::app_factory::build_app;
     use crate::error::ERR_UNAUTHORIZED;
+    use crate::middleware::RateLimiter;
 
     fn test_state() -> AppState {
         // Leak the RingBuffer so it lives for the duration of the test binary.
@@ -183,11 +298,33 @@ mod tests {
         // simplest safe substitute.
         let rb = Box::leak(Box::new(RingBuffer::new(16, 4096).unwrap()));
         let (producer, _consumer) = rb.split();
+        let pool = PgPool::connect_lazy(
+            "postgres://exg:exg_dev_password@localhost:5433/exg",
+        )
+        .unwrap();
         AppState {
             producer: Arc::new(Mutex::new(producer)),
             snowflake: Arc::new(SnowflakeGen::new(1)),
             cfg: Arc::new(ExgConfig::default_config()),
+            pool,
+            auth_cfg: Arc::new(AuthConfig {
+                jwt_secret: "a".repeat(32),
+                jwt_expiry_secs: 3600,
+            }),
+            rate_limiter: Arc::new(Mutex::new(RateLimiter::new(100, 10.0))),
         }
+    }
+
+    /// Mint a valid JWT for the given user_id using the test state's auth_cfg.
+    fn test_jwt_for_user(state: &AppState, user_id: u64) -> String {
+        use exg_user_service::{JwtClaims, sign_jwt};
+        let now = chrono::Utc::now().timestamp() as u64;
+        let claims = JwtClaims {
+            user_id,
+            iat: now,
+            exp: now + 3600,
+        };
+        sign_jwt(state.auth_cfg.jwt_secret.as_bytes(), &claims).unwrap()
     }
 
     #[actix_web::test]
@@ -214,12 +351,13 @@ mod tests {
     }
 
     #[actix_web::test]
-    async fn place_order_non_numeric_header_returns_401() {
+    async fn place_order_bad_authorization_returns_401() {
         let app = test::init_service(build_app(test_state())).await;
         let body = r#"{"symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT","timeInForce":"GTC","quantity":"0.001","price":"60000"}"#;
+        // Send a malformed (non-Bearer) Authorization header.
         let req = test::TestRequest::post()
             .uri("/api/v1/order")
-            .insert_header(("X-User-Id", "abc"))
+            .insert_header(("Authorization", "Basic abc"))
             .insert_header(("Content-Type", "application/json"))
             .set_payload(body)
             .to_request();
@@ -229,10 +367,12 @@ mod tests {
 
     #[actix_web::test]
     async fn place_order_malformed_json_returns_400() {
-        let app = test::init_service(build_app(test_state())).await;
+        let state = test_state();
+        let token = test_jwt_for_user(&state, 42);
+        let app = test::init_service(build_app(state)).await;
         let req = test::TestRequest::post()
             .uri("/api/v1/order")
-            .insert_header(("X-User-Id", "42"))
+            .insert_header(("Authorization", format!("Bearer {token}")))
             .insert_header(("Content-Type", "application/json"))
             .set_payload("not json")
             .to_request();
@@ -246,11 +386,14 @@ mod tests {
 
     #[actix_web::test]
     async fn place_order_happy_returns_200_with_order_id() {
-        let app = test::init_service(build_app(test_state())).await;
+        let state = test_state();
+        let token = test_jwt_for_user(&state, 42);
+        let app = test::init_service(build_app(state)).await;
+        // No clientOrderId → dedup gate is skipped (no PG dependency).
         let body = r#"{"symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT","timeInForce":"GTC","quantity":"0.001","price":"60000"}"#;
         let req = test::TestRequest::post()
             .uri("/api/v1/order")
-            .insert_header(("X-User-Id", "42"))
+            .insert_header(("Authorization", format!("Bearer {token}")))
             .insert_header(("Content-Type", "application/json"))
             .set_payload(body)
             .to_request();
