@@ -137,23 +137,63 @@ pub struct TickerResponse {
 
 // ── Auth endpoints ───────────────────────────────────────────────────────
 
-#[derive(Debug, Deserialize)]
-pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
-    pub totp_code: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct LoginResponse {
-    pub token: String,
-    pub expires_at: u64,
-}
-
-#[derive(Debug, Deserialize)]
+/// Register request. NOTE: password is NOT a derive(Debug) field —
+/// see manual impl below to prevent accidental log exposure (§9 #18).
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RegisterRequest {
     pub email: String,
     pub password: String,
+}
+
+impl std::fmt::Debug for RegisterRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterRequest")
+            .field("email", &self.email)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest")
+            .field("email", &self.email)
+            .field("password", &"***")
+            .finish()
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginResponseBody {
+    pub access_token: String,
+    pub expires_in: u64,
+    /// Stringified u64 per Binance convention.
+    pub user_id: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeResponse {
+    pub user_id: String,
+    pub email: String,
+    pub kyc_level: i16,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RegisterResponseBody {
+    pub user_id: String,
+    pub email: String,
+    pub status: &'static str,
 }
 
 // ── Transfer/Withdraw ────────────────────────────────────────────────────
@@ -169,4 +209,33 @@ pub struct TransferRequest {
 pub struct SetLeverageRequest {
     pub symbol: String,
     pub leverage: u32,
+}
+
+#[cfg(test)]
+mod password_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn register_request_debug_does_not_leak_password() {
+        let req = RegisterRequest {
+            email: "alice@example.com".into(),
+            password: "super-secret-password".into(),
+        };
+        let s = format!("{req:?}");
+        assert!(
+            !s.contains("super-secret-password"),
+            "Debug leaked password: {s}"
+        );
+        assert!(s.contains("***"), "Debug missing redaction: {s}");
+    }
+
+    #[test]
+    fn login_request_debug_does_not_leak_password() {
+        let req = LoginRequest {
+            email: "alice@example.com".into(),
+            password: "super-secret-password".into(),
+        };
+        let s = format!("{req:?}");
+        assert!(!s.contains("super-secret-password"));
+    }
 }
