@@ -4,7 +4,7 @@
 
 **Goal:** Make the exchange survive a restart by replaying the WAL into a fresh matching engine; clean up four Stage 1a forward pointers in the same PR.
 
-**Architecture:** Boot lifecycle gains `Step 3.6 — WAL replay` between PG ping and DUMMY init. `MatchingEngine::apply_event(&Event)` reverse-maps WAL records (`OrderAccepted` → insert, `OrderCanceled` → remove, `OrderFilled` → decrement-or-remove, `TradeExecuted` → no-op since both sides' `OrderFilled` events already updated the book) onto a freshly-built engine. Stage 0 invariant 3 (`WAL must be empty at boot`) is removed; new invariants 21–23 govern replay consistency. The `OrderAccepted` event schema gains seven fields so replay can rebuild a full `BookOrder`. Polish: cancel/amend share `user:{N}` token bucket; login `||` short-circuit fix; JWT tamper / token reuse / kyc_level e2e gaps closed.
+**Architecture:** Boot lifecycle gains `Step 3.6 — WAL replay` between PG ping and DUMMY init, and `Step 3.8 — invariant 21 post-replay consistency check` after DUMMY init (per Eng review B1). `MatchingEngine::apply_event(&Event)` reverse-maps WAL records (`OrderAccepted` → insert into book or stop_orders or push to expiry_heap for GTD, `OrderCanceled` → remove, `OrderFilled` → decrement-or-remove, `TradeExecuted` → no-op since both sides' `OrderFilled` events already updated the book) onto a freshly-built engine. Stage 0 invariant 3 (`WAL must be empty at boot`) is removed; new invariants 21–23 govern replay consistency. The `OrderAccepted` event schema gains **ten new fields** (Eng review B5 + B6: side, order_type, time_in_force, price, quantity, stop_price, reduce_only, visible_quantity, trailing_delta, trailing_peak_price) so replay can rebuild a full `BookOrder` for every order type today's API accepts including iceberg / GTD / trailing-stop. Polish: cancel/amend share `user:{N}` token bucket; login `||` short-circuit fix; JWT tamper / token reuse / kyc_level e2e gaps closed.
 
 **Tech Stack:** Rust 2024 workspace · rkyv (event encoding) · sqlx + PostgreSQL on host port 5433 · jsonwebtoken + Argon2id (Stage 1a libs) · `#[sqlx::test]` for per-test DB isolation · `tempfile::TempDir` for WAL dirs.
 
@@ -38,13 +38,13 @@
 
 ### Test surface
 
-- **Unit (in `replay.rs`):** 12 tests covering each dispatch arm + error paths + a round-trip golden test.
-- **Integration (`stage1b_e2e.rs`):** 17 tests — 10 replay correctness + 7 polish (the 10th replay test is `replay_survived_order_matches_post_reboot_taker`, added per CEO review A4).
-- **Existing test deltas:** `boot_panics.rs` net +1 (removes 1 obsolete test, adds 2 new corruption tests). `stage0_e2e.rs` + `stage1a_e2e.rs` source unchanged (rest-pattern matches forward-compat with `OrderAccepted` field additions).
+- **Unit (in `replay.rs`):** 19 tests covering each dispatch arm + error paths + iceberg/GTD/trailing schema-field round-trip + a process_command→apply_event round-trip golden test (Eng review B12, B13, B6 added 7).
+- **Integration (`stage1b_e2e.rs`):** 16 tests — 9 replay correctness + 7 polish (CEO A4 added 1 "replay survived matching" test; Eng B10 removed 1 duplicate of the unit-level round-trip).
+- **Existing test deltas:** `boot_panics.rs` net +2 (removes 1 obsolete test, adds 3 new tests: CRC corruption + sequence gap + unknown-order-filled per Eng review B11). `stage0_e2e.rs` + `stage1a_e2e.rs` source unchanged (rest-pattern matches forward-compat with `OrderAccepted` field additions).
 
 Target counts:
-- Workspace tests rise by `12 + 17 + (2 - 1) = +30`
-- `cargo test --workspace` total grows from ~390 to ~420
+- Workspace tests rise by `19 + 16 + (3 - 1) = +37`
+- `cargo test --workspace` total grows from ~390 to ~427
 
 ---
 
@@ -53,11 +53,11 @@ Target counts:
 | # | Task | Files touched | Tests added |
 |---|------|---------------|-------------|
 | 1 | `OrderAccepted` schema bump + engine fillers | event.rs, lib.rs (protocol tests), engine.rs (5 sites) | 0 new; existing tests stay green |
-| 2 | `apply_event` + `ApplyError` + 12 unit tests | replay.rs (NEW), matching-engine lib.rs | 12 unit |
-| 3 | Boot lifecycle: remove invariant 3, add Step 3.6 + 3.8 | server lib.rs | 0 (existing test removal in Task 4) |
-| 4 | Boot panic test update + new corrupt/gap tests | boot_panics.rs | net +2 |
+| 2 | `apply_event` + `ApplyError` + 19 unit tests (Eng B12+B13+B6 added 7) | replay.rs (NEW), matching-engine lib.rs | 19 unit |
+| 3 | Boot lifecycle: remove invariant 3, add Step 3.6 / 3.7 / 3.8 (Eng B1 split) | server lib.rs | 0 (existing test removal in Task 4) |
+| 4 | Boot panic test update + 3 new corrupt/gap/unknown tests (Eng B11) | boot_panics.rs | net +2 (was net +1) |
 | 5 | Handler polish (cancel/amend bucket via `consume_user_bucket` helper + login double-consume) | api-gateway handlers.rs | 0 new (covered in Task 6) |
-| 6 | Stage 1b e2e suite (17 cases: 10 replay + 7 polish) | stage1b_e2e.rs (NEW) | 17 integration |
+| 6 | Stage 1b e2e suite (16 cases: 9 replay + 7 polish; Eng B10 removed 1 dup) | stage1b_e2e.rs (NEW) | 16 integration |
 | 7 | Demo script + WAL-replay-failed runbook + final acceptance | scripts/demo-stage1b.sh (NEW), docs/runbooks/wal-replay-failed.md (NEW) | — |
 
 Total LOC delta (excluding tests): ~250 prod + ~600 test. Plan execution order is strict — each task depends on the previous.
@@ -91,7 +91,7 @@ If Stage 1b merges and breaks production: `git revert <merge>` → `rm -rf data/
 
 Stage 0/1a Events are rkyv-encoded into a fixed binary layout. Adding fields without updating all constructor sites won't compile. Schema bump + every construction site must land in one atomic commit; tests must stay green throughout.
 
-### Step 1: Update the `Event::OrderAccepted` variant
+### Step 1: Update the `Event::OrderAccepted` variant (10 new fields, per Eng review B5 + B6)
 
 In `crates/exg-protocol/src/event.rs`, replace the existing variant (lines ~46-52) with:
 
@@ -114,6 +114,14 @@ In `crates/exg-protocol/src/event.rs`, replace the existing variant (lines ~46-5
         quantity: Decimal128,
         stop_price: Option<Decimal128>,
         reduce_only: bool,
+        /// Iceberg visible slice size. `None` for non-iceberg orders.
+        visible_quantity: Option<Decimal128>,
+        /// Trailing-stop offset. `None` for non-trailing orders.
+        trailing_delta: Option<Decimal128>,
+        /// Trailing-stop reference price at accept time (= engine.mark_price at the time).
+        /// `None` for non-trailing orders. Cannot be reconstructed at replay time because
+        /// mark_price may have moved.
+        trailing_peak_price: Option<Decimal128>,
     },
 ```
 
@@ -129,7 +137,7 @@ use exg_common::{Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, Tr
 cargo check --workspace 2>&1 | grep -E "missing.*field|missing structure field" | head -30
 ```
 
-Expected: 7 errors listing the OrderAccepted construction sites missing the new fields (2 in `exg-protocol/src/lib.rs::all_events()`, 5 in `exg-matching-engine/src/engine.rs`).
+Expected: 7 errors listing the OrderAccepted construction sites missing **10 new fields each** (2 in `exg-protocol/src/lib.rs::all_events()`, 5 in `exg-matching-engine/src/engine.rs`). Each site needs `side`, `order_type`, `time_in_force`, `price`, `quantity`, `stop_price`, `reduce_only`, `visible_quantity`, `trailing_delta`, `trailing_peak_price`.
 
 - [ ] **Step 3: Fix `exg-protocol/src/lib.rs` test helper**
 
@@ -149,6 +157,9 @@ In `crates/exg-protocol/src/lib.rs`, locate the `all_events()` helper (currently
                 quantity: dec("1.0"),
                 stop_price: None,
                 reduce_only: false,
+                visible_quantity: None,
+                trailing_delta: None,
+                trailing_peak_price: None,
             },
             Event::OrderAccepted {
                 order_id: OrderId::new(1002),
@@ -163,6 +174,9 @@ In `crates/exg-protocol/src/lib.rs`, locate the `all_events()` helper (currently
                 quantity: dec("0.5"),
                 stop_price: None,
                 reduce_only: true,
+                visible_quantity: None,
+                trailing_delta: None,
+                trailing_peak_price: None,
             },
 ```
 
@@ -188,8 +202,17 @@ The 5 sites are inside `handle_new_order` (2 emissions: conditional path, then a
                 quantity,
                 stop_price,
                 reduce_only,
+                visible_quantity,
+                trailing_delta,
+                trailing_peak_price: if trailing_delta.is_some() {
+                    Some(self.mark_price)
+                } else {
+                    None
+                },
             });
 ```
+
+(The `trailing_peak_price` calculation matches the existing `BookOrder { trailing_peak_price: ... }` initialization at engine.rs:241-244 — only set when this is a trailing order.)
 
 **Site 2** — `handle_new_order` accept-before-match path. Same body as Site 1 (locals in scope are identical). Replace the existing `Event::OrderAccepted` block with the same code.
 
@@ -209,6 +232,9 @@ The 5 sites are inside `handle_new_order` (2 emissions: conditional path, then a
                 quantity: amended.original_qty,
                 stop_price: amended.stop_price,
                 reduce_only: amended.is_reduce_only,
+                visible_quantity: amended.visible_qty,
+                trailing_delta: amended.trailing_delta,
+                trailing_peak_price: amended.trailing_peak_price,
             });
 ```
 
@@ -231,6 +257,9 @@ The 5 sites are inside `handle_new_order` (2 emissions: conditional path, then a
                 quantity: existing.original_qty,
                 stop_price: existing.stop_price,
                 reduce_only: existing.is_reduce_only,
+                visible_quantity: existing.visible_qty,
+                trailing_delta: existing.trailing_delta,
+                trailing_peak_price: existing.trailing_peak_price,
             }]
 ```
 
@@ -252,6 +281,9 @@ The 5 sites are inside `handle_new_order` (2 emissions: conditional path, then a
                 quantity: existing.original_qty,
                 stop_price: existing.stop_price,
                 reduce_only: existing.is_reduce_only,
+                visible_quantity: existing.visible_qty,
+                trailing_delta: existing.trailing_delta,
+                trailing_peak_price: existing.trailing_peak_price,
             }]
 ```
 
@@ -279,12 +311,14 @@ git add crates/exg-protocol/src/event.rs \
         crates/exg-protocol/src/lib.rs \
         crates/exg-matching-engine/src/engine.rs
 git commit -m "$(cat <<'EOF'
-feat(protocol): extend OrderAccepted with replay-required fields
+feat(protocol): extend OrderAccepted with replay-required fields (10 new)
 
 WAL replay (Stage 1b) needs to rebuild a BookOrder from a single
 OrderAccepted event. Add: side, order_type, time_in_force, price,
-quantity, stop_price, reduce_only. All 5 emission sites in the
-matching engine populate the new fields from in-scope locals.
+quantity, stop_price, reduce_only, visible_quantity (Eng B5),
+trailing_delta + trailing_peak_price (Eng B6). All 5 emission sites
+in the matching engine populate the new fields from in-scope locals;
+trailing_peak_price = self.mark_price when trailing_delta is Some.
 
 Breaking change to event.rs schema; rkyv-encoded WAL files predating
 this commit cannot be replayed. Acceptable — no production WAL.
@@ -379,27 +413,45 @@ impl MatchingEngine {
                 quantity,
                 stop_price,
                 reduce_only,
+                visible_quantity,
+                trailing_delta,
+                trailing_peak_price,
             } => {
                 if self.orderbook_mut().get_order(*order_id).is_some() {
                     return Err(ApplyError::DuplicateOrder(*order_id));
                 }
+                // Derive expire_time for GTD orders (matches engine.rs:215-224 logic).
+                let expire_time = if *time_in_force == exg_common::TimeInForce::Gtd {
+                    let twenty_four_hours_micros: u64 = 24 * 3600 * 1_000_000;
+                    Some(exg_common::UnixMicros::from_micros(
+                        timestamp.as_micros() + twenty_four_hours_micros,
+                    ))
+                } else {
+                    None
+                };
+                // Derive hidden_qty for iceberg orders (matches engine.rs:206-213 logic).
+                let hidden_qty = match visible_quantity {
+                    Some(vis) => *quantity - *vis,
+                    None => Decimal128::ZERO,
+                };
+                let remaining_qty = visible_quantity.unwrap_or(*quantity);
                 let book_order = BookOrder {
                     order_id: *order_id,
                     user_id: *user_id,
                     symbol: *symbol,
                     side: *side,
                     price: *price,
-                    remaining_qty: *quantity,
+                    remaining_qty,
                     original_qty: *quantity,
                     order_type: *order_type,
                     time_in_force: *time_in_force,
                     is_reduce_only: *reduce_only,
                     timestamp: *timestamp,
-                    visible_qty: None,
-                    hidden_qty: Decimal128::ZERO,
-                    trailing_delta: None,
-                    trailing_peak_price: None,
-                    expire_time: None,
+                    visible_qty: *visible_quantity,
+                    hidden_qty,
+                    trailing_delta: *trailing_delta,
+                    trailing_peak_price: *trailing_peak_price,
+                    expire_time,
                     client_order_id: *client_order_id,
                     stop_price: *stop_price,
                 };
@@ -408,6 +460,14 @@ impl MatchingEngine {
                     self.stop_orders_mut().push(book_order);
                 } else {
                     self.orderbook_mut().insert_order(book_order);
+                }
+                // GTD orders must also be tracked by the expiry heap so the GTD
+                // sweeper can find them after replay (matches engine.rs:414).
+                if *time_in_force == exg_common::TimeInForce::Gtd {
+                    if let Some(expire) = expire_time {
+                        self.expiry_heap_mut()
+                            .push(std::cmp::Reverse((expire, *order_id)));
+                    }
                 }
                 Ok(())
             }
@@ -483,6 +543,18 @@ In `crates/exg-matching-engine/src/engine.rs`, find the existing `pub fn orderbo
     pub fn stop_orders_mut(&mut self) -> &mut Vec<BookOrder> {
         &mut self.stop_orders
     }
+
+    /// Mutable expiry-heap access — replay-only (Eng review B6). GTD orders
+    /// must be re-registered in the heap during replay so the GTD sweeper
+    /// finds them at expiry time.
+    #[doc(hidden)]
+    pub fn expiry_heap_mut(
+        &mut self,
+    ) -> &mut std::collections::BinaryHeap<
+        std::cmp::Reverse<(exg_common::UnixMicros, exg_common::OrderId)>,
+    > {
+        &mut self.expiry_heap
+    }
 ```
 
 - [ ] **Step 4: Run `cargo check -p exg-matching-engine`**
@@ -556,6 +628,41 @@ mod tests {
             quantity: dec(qty),
             stop_price: None,
             reduce_only: false,
+            visible_quantity: None,
+            trailing_delta: None,
+            trailing_peak_price: None,
+        }
+    }
+
+    /// Builder for OrderAccepted with custom fields (B6 schema-field tests).
+    #[allow(clippy::too_many_arguments)]
+    fn accept_event_full(
+        order_id: u64,
+        order_type: OrderType,
+        time_in_force: TimeInForce,
+        qty: &str,
+        price: &str,
+        visible_quantity: Option<Decimal128>,
+        trailing_delta: Option<Decimal128>,
+        trailing_peak_price: Option<Decimal128>,
+        stop_price: Option<Decimal128>,
+    ) -> Event {
+        Event::OrderAccepted {
+            order_id: OrderId::new(order_id),
+            user_id: UserId::new(42),
+            symbol: SymbolId::new(1),
+            client_order_id: None,
+            timestamp: ts(),
+            side: Side::Buy,
+            order_type,
+            time_in_force,
+            price: dec(price),
+            quantity: dec(qty),
+            stop_price,
+            reduce_only: false,
+            visible_quantity,
+            trailing_delta,
+            trailing_peak_price,
         }
     }
 
@@ -790,6 +897,173 @@ mod tests {
             "replayed engine must have same order count as live engine"
         );
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Eng review B12: conditional / stop-order replay paths
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_order_accepted_conditional_pushes_to_stop_orders() {
+        let mut engine = test_engine();
+        let evt = accept_event_full(
+            42,
+            OrderType::StopLimit,
+            TimeInForce::Gtc,
+            "1.0",
+            "50000",
+            None,
+            None,
+            None,
+            Some(dec("49000")), // stop_price triggers the conditional path
+        );
+        engine.apply_event(&evt).unwrap();
+        // Conditional order does NOT land in the main book.
+        assert!(engine.orderbook().get_order(OrderId::new(42)).is_none());
+        // It lives in stop_orders. Use the replay-only accessor.
+        assert_eq!(engine.stop_orders_mut().len(), 1);
+        assert_eq!(engine.stop_orders_mut()[0].order_id, OrderId::new(42));
+    }
+
+    #[test]
+    fn apply_order_canceled_removes_from_stop_orders() {
+        let mut engine = test_engine();
+        let accept = accept_event_full(
+            43,
+            OrderType::StopMarket,
+            TimeInForce::Gtc,
+            "1.0",
+            "50000",
+            None,
+            None,
+            None,
+            Some(dec("49500")),
+        );
+        engine.apply_event(&accept).unwrap();
+        assert_eq!(engine.stop_orders_mut().len(), 1);
+        engine
+            .apply_event(&Event::OrderCanceled {
+                order_id: OrderId::new(43),
+                user_id: UserId::new(42),
+                symbol: SymbolId::new(1),
+                remaining_qty: dec("1.0"),
+                timestamp: ts(),
+            })
+            .unwrap();
+        assert_eq!(engine.stop_orders_mut().len(), 0);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Eng review B6: schema-field replay paths (iceberg / GTD / trailing)
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_order_accepted_iceberg_preserves_visible_quantity() {
+        let mut engine = test_engine();
+        let evt = accept_event_full(
+            100,
+            OrderType::Iceberg,
+            TimeInForce::Gtc,
+            "10.0",
+            "50000",
+            Some(dec("1.0")), // visible_quantity
+            None,
+            None,
+            None,
+        );
+        engine.apply_event(&evt).unwrap();
+        let order = engine.orderbook().get_order(OrderId::new(100)).unwrap();
+        assert_eq!(order.visible_qty, Some(dec("1.0")));
+        assert_eq!(order.hidden_qty, dec("9.0")); // 10 - 1
+        assert_eq!(order.remaining_qty, dec("1.0")); // visible slice
+        assert_eq!(order.original_qty, dec("10.0"));
+    }
+
+    #[test]
+    fn apply_order_accepted_gtd_pushes_to_expiry_heap() {
+        let mut engine = test_engine();
+        let evt = accept_event_full(
+            200,
+            OrderType::Limit,
+            TimeInForce::Gtd, // GTD triggers expiry_heap push
+            "1.0",
+            "50000",
+            None,
+            None,
+            None,
+            None,
+        );
+        engine.apply_event(&evt).unwrap();
+        // Expiry heap must contain the order with timestamp + 24h expiry.
+        let heap = engine.expiry_heap_mut();
+        assert_eq!(heap.len(), 1);
+        let std::cmp::Reverse((expire_time, order_id)) = heap.peek().unwrap();
+        assert_eq!(*order_id, OrderId::new(200));
+        let expected = ts().as_micros() + 24 * 3600 * 1_000_000;
+        assert_eq!(expire_time.as_micros(), expected);
+        // Order itself is on the book (non-conditional).
+        let order = engine.orderbook().get_order(OrderId::new(200)).unwrap();
+        assert!(order.expire_time.is_some());
+    }
+
+    #[test]
+    fn apply_order_accepted_trailing_preserves_peak_price() {
+        let mut engine = test_engine();
+        let evt = accept_event_full(
+            300,
+            OrderType::TrailingStop,
+            TimeInForce::Gtc,
+            "1.0",
+            "50000",
+            None,
+            Some(dec("100")), // trailing_delta
+            Some(dec("60000")), // trailing_peak_price (= engine.mark_price at accept time)
+            Some(dec("59900")), // stop_price
+        );
+        engine.apply_event(&evt).unwrap();
+        // TrailingStop is conditional → lives in stop_orders.
+        assert_eq!(engine.stop_orders_mut().len(), 1);
+        let order = &engine.stop_orders_mut()[0];
+        assert_eq!(order.trailing_delta, Some(dec("100")));
+        assert_eq!(order.trailing_peak_price, Some(dec("60000")));
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Eng review B13: UnexpectedVariant arms for Funding / Liquidation
+    // ────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_funding_rate_update_returns_unexpected_variant() {
+        let mut engine = test_engine();
+        let err = engine
+            .apply_event(&Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.0001"),
+                timestamp: ts(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::UnexpectedVariant { variant: "FundingRateUpdate" }
+        ));
+    }
+
+    #[test]
+    fn apply_liquidation_order_returns_unexpected_variant() {
+        let mut engine = test_engine();
+        let err = engine
+            .apply_event(&Event::LiquidationOrder {
+                user_id: UserId::new(42),
+                symbol: SymbolId::new(1),
+                side: Side::Buy,
+                quantity: dec("1.0"),
+                timestamp: ts(),
+            })
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            ApplyError::UnexpectedVariant { variant: "LiquidationOrder" }
+        ));
+    }
 }
 ```
 
@@ -814,8 +1088,15 @@ test replay::tests::apply_unknown_order_filled_returns_err ... ok
 test replay::tests::apply_over_fill_returns_err ... ok
 test replay::tests::apply_mark_price_update_returns_unexpected_variant ... ok
 test replay::tests::replay_then_take_snapshot_round_trip ... ok
+test replay::tests::apply_order_accepted_conditional_pushes_to_stop_orders ... ok
+test replay::tests::apply_order_canceled_removes_from_stop_orders ... ok
+test replay::tests::apply_order_accepted_iceberg_preserves_visible_quantity ... ok
+test replay::tests::apply_order_accepted_gtd_pushes_to_expiry_heap ... ok
+test replay::tests::apply_order_accepted_trailing_preserves_peak_price ... ok
+test replay::tests::apply_funding_rate_update_returns_unexpected_variant ... ok
+test replay::tests::apply_liquidation_order_returns_unexpected_variant ... ok
 
-test result: ok. 12 passed; 0 failed; ...
+test result: ok. 19 passed; 0 failed; ...
 ```
 
 - [ ] **Step 7: Commit**
@@ -830,16 +1111,23 @@ feat(matching-engine): add apply_event for WAL replay
 
 Stage 1b lifecycle (Step 3.6) feeds each WAL event back through this
 function to rebuild engine state from scratch. Dispatch covers:
-- OrderAccepted: insert BookOrder into book or stop_orders by type
+- OrderAccepted: insert BookOrder into orderbook (non-conditional) or
+  stop_orders (conditional). For GTD orders, additionally push
+  (expire_time, order_id) into the expiry_heap so the GTD sweeper can
+  find them. expire_time derived from timestamp + 24h. For iceberg
+  orders, visible_qty / hidden_qty / remaining_qty are reconstructed
+  from the event's visible_quantity field.
 - OrderRejected: no-op
-- OrderCanceled: remove from book (or stop_orders for conditionals)
+- OrderCanceled: remove from book; fall back to stop_orders if not on book
 - OrderFilled: decrement remaining_qty; remove when zero
 - TradeExecuted: no-op (OrderFilled events on both sides cover state)
 - MarkPriceUpdate / FundingRateUpdate / LiquidationOrder: rejected
   (Stage 0/1a never emit these; explicit error catches schema drift)
 
 ApplyError enumerates: UnknownOrder, DuplicateOrder, OverFill,
-UnexpectedVariant. 10 unit tests cover happy + error paths.
+UnexpectedVariant. 19 unit tests cover happy + error paths +
+schema-field round-trip for iceberg / GTD / trailing (Eng review
+B6/B12/B13).
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -867,9 +1155,9 @@ cargo check -p exg-server 2>&1 | tail -5
 
 Expected: clean. The `PathBuf` import may become unused — leave it for now (used elsewhere in the file).
 
-- [ ] **Step 3: Add Step 3.6 (WAL replay) inside `run_with_config_with_pool` (CEO review A3 — single `ReplayError` enum)**
+- [ ] **Step 3: Add Step 3.6 (WAL replay) inside `run_with_config_with_pool` (CEO review A3 — single `ReplayError` enum; Eng review B1 — invariant 21 lives in a separate Step 3.8 block after Step 3.7)**
 
-In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing Step 3.7 (`init_dummy_argon2_hash`). Insert Step 3.6 immediately before it, using a single `Option<ReplayError>` for error propagation instead of three separate option captures:
+In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing Step 3.7 (`init_dummy_argon2_hash`). Insert Step 3.6 immediately before it. Step 3.6 returns `replayed_count` so the Step 3.8 check after Step 3.7 can verify the invariant — this matches the spec §3 architecture diagram exactly:
 
 ```rust
     // ── Step 3.6 (Stage 1b): WAL replay ───────────────────────────────────
@@ -879,7 +1167,7 @@ In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing 
     // has already passed; Step 3.5 (PG ping) confirms DB connectivity;
     // replay runs on the boot thread before the matching thread is spawned,
     // so no locking is needed.
-    {
+    let replayed_count: u64 = {
         use exg_wal::WalReader;
 
         // Local error enum keeps the closure body single-exit and the post-loop
@@ -951,20 +1239,29 @@ In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing 
             anyhow::bail!("{err}");
         }
 
-        // ── Step 3.8 (Stage 1b): invariant 21 ─────────────────────────────
-        let writer_next = wal.lock().current_sequence();
-        if replayed_count != writer_next {
-            anyhow::bail!(
-                "invariant 21 violated: replayed_count={replayed_count}, wal_writer.current_seq={writer_next}"
-            );
-        }
-
         if replayed_count > 0 {
             tracing::info!(
                 target: "boot",
                 replayed_count,
                 last_seq = expected_seq.saturating_sub(1),
                 "WAL replay complete"
+            );
+        }
+
+        replayed_count
+    };
+
+    // ── Step 3.7 stays here (init_dummy_argon2_hash); already present from Stage 1a ──
+
+    // ── Step 3.8 (Stage 1b): invariant 21 post-replay consistency check ──
+    // Lives in its own block AFTER Step 3.7 to match spec §3 ordering.
+    // The check is purely a sanity assertion; it has no dependencies on
+    // DUMMY_ARGON2_HASH but the placement keeps spec ↔ plan aligned.
+    {
+        let writer_next = wal.lock().current_sequence();
+        if replayed_count != writer_next {
+            anyhow::bail!(
+                "invariant 21 violated: replayed_count={replayed_count}, wal_writer.current_seq={writer_next}"
             );
         }
     }
@@ -996,14 +1293,18 @@ Expected: 12/12 still passing. The replay path runs on every boot now; with empt
 ```bash
 git add crates/exg-server/src/lib.rs
 git commit -m "$(cat <<'EOF'
-feat(server): WAL replay at boot (Stage 1b Step 3.6 + 3.8)
+feat(server): WAL replay at boot (Stage 1b Steps 3.6 / 3.7 / 3.8)
 
 - Remove Stage 0 invariant 3 (WAL must be empty); non-empty WAL is now
   the expected state after restart
 - Step 3.6: scan every WAL record from seq 0, decode via rkyv,
   apply_event onto the empty engine; boot panics with WAL replay
-  message on sequence gap / rkyv decode / apply_event error
-- Step 3.8: invariant 21 — replayed_count == wal_writer.current_sequence()
+  message on sequence gap / rkyv decode / apply_event error. Returns
+  replayed_count for Step 3.8.
+- Step 3.7 (existing): init_dummy_argon2_hash (Stage 1a).
+- Step 3.8: invariant 21 — replayed_count == wal_writer.current_sequence().
+  Lives in its own block AFTER Step 3.7 (per Eng review B1) to match
+  spec §3 architecture diagram.
 - WalWriter::open already handles tail truncation + mid-stream CRC
   panic from Stage 0; Stage 1b just adds the consumer side
 
@@ -1151,22 +1452,74 @@ crc32fast = { workspace = true }
 
 Also add `exg-wal = { workspace = true }` to `[dev-dependencies]` if not present.
 
-- [ ] **Step 4: Update `base_cfg()` to point WAL at the wal subdirectory by default**
+- [ ] **Step 4: Add the new `boot_panics_on_unknown_order_filled` test (Eng review B11)**
 
-The existing `base_cfg` uses `wal_dir = tmp.path()`. The new tests put the WAL under `tmp.path().join("wal")` to keep the temp dir tidy and avoid name collisions with the new segment files. Keep base_cfg unchanged; the new tests override `cfg.wal.dir` themselves.
+Spec §8.2 listed this test alongside the corrupt-CRC and sequence-gap variants — the earlier plan draft missed it. The test writes a hand-crafted WAL containing one `OrderFilled` event with no preceding `OrderAccepted`, then asserts boot panics through the `apply_event` → `ApplyError::UnknownOrder` path. Append:
 
-- [ ] **Step 5: Run the boot panic suite**
+```rust
+#[actix_web::test]
+async fn boot_panics_on_unknown_order_filled() {
+    use exg_protocol::Event;
+    use exg_wal::{WalConfig, WalWriter};
+
+    let tmp = TempDir::new().unwrap();
+    let wal_dir = tmp.path().join("wal");
+    std::fs::create_dir(&wal_dir).unwrap();
+
+    // Write a single OrderFilled event for an order that was never accepted.
+    {
+        let mut w = WalWriter::open(WalConfig {
+            dir: wal_dir.clone(),
+            segment_size: 64 * 1024 * 1024,
+            flush_interval_us: 1000,
+            flush_every_n: 1,
+        })
+        .unwrap();
+        let evt = Event::OrderFilled {
+            order_id: exg_common::OrderId::new(9999),
+            trade_id: exg_common::TradeId::new(1),
+            user_id: exg_common::UserId::new(42),
+            symbol: exg_common::SymbolId::new(1),
+            side: exg_common::Side::Buy,
+            fill_price: "50000".parse().unwrap(),
+            fill_qty: "1.0".parse().unwrap(),
+            is_maker: false,
+            remaining_qty: exg_common::Decimal128::ZERO,
+            timestamp: exg_common::UnixMicros::now(),
+        };
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&evt).unwrap();
+        w.append(&bytes).unwrap();
+        w.flush().unwrap();
+    }
+
+    let mut cfg = base_cfg(tmp.path());
+    cfg.wal.dir = wal_dir.to_string_lossy().into_owned();
+
+    let result = exg_server::run_with_config(cfg).await;
+    let err = result.err().expect("expected Err from unknown-order replay");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("WAL replay failed at sequence")
+            && (msg.contains("UnknownOrder") || msg.contains("unknown order")),
+        "expected replay-apply-error message containing UnknownOrder, got: {msg}"
+    );
+}
+```
+
+- [ ] **Step 5: Update `base_cfg()` if needed**
+
+The existing `base_cfg` uses `wal_dir = tmp.path()`. The new tests put the WAL under `tmp.path().join("wal")` to avoid name collisions. Keep `base_cfg` unchanged; the new tests override `cfg.wal.dir` themselves.
+
+- [ ] **Step 6: Run the boot panic suite**
 
 ```bash
 DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg \
-  cargo test -p exg-server --test boot_panics 2>&1 | tail -10
+  cargo test -p exg-server --test boot_panics 2>&1 | tail -12
 ```
 
-Expected: **8 tests pass** (6 retained from Stage 0/1a — minus the removed nonempty_wal_dir = 6 — plus 2 new = **8 total**).
+Expected: **9 tests pass**. Math: Stage 1a left 7/7 (4 Stage 0 + 3 Stage 1a). Stage 1b removes `boot_panics_on_nonempty_wal_dir` (−1) and adds three new tests (corrupt_wal_crc + sequence_gap + unknown_order_filled = +3). Net 7 − 1 + 3 = **9 total**.
 
-Wait — Stage 1a's count was 7/7 (4 Stage 0 + 3 Stage 1a). Remove `boot_panics_on_nonempty_wal_dir` → 6 retained. Add `boot_panics_on_corrupt_wal_crc` + `boot_panics_on_sequence_gap` → **8 total**.
-
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/exg-server/tests/boot_panics.rs crates/exg-server/Cargo.toml
@@ -1178,8 +1531,11 @@ test(server): replace WAL-empty boot panic with replay-corruption tests
   recover_state path (CRC failure at writer open, before replay)
 - Add boot_panics_on_sequence_gap — surgically craft a WAL with a
   missing sequence, replay rejects with 'sequence gap'
+- Add boot_panics_on_unknown_order_filled (Eng review B11) — hand-write
+  an OrderFilled with no preceding OrderAccepted, replay panics on
+  ApplyError::UnknownOrder
 
-Net delta: 7 -> 8 boot panic tests.
+Net delta: 7 -> 9 boot panic tests.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -1693,82 +2049,13 @@ async fn boot_replays_three_orders_inspectable_via_wal(pool: PgPool) {
 
 (That covers replay tests 1-7 of the 9. Tests 8 and 9 — `boot_panics_on_corrupt_wal_crc` and `boot_panics_on_sequence_gap` — already live in `boot_panics.rs` from Task 4, so we drop them from the e2e suite to avoid duplication.)
 
-Spec listed 9 replay-correctness tests; we have 7 in this file plus the 2 corruption tests in boot_panics.rs = 9 total replay tests. Update the running count: stage1b_e2e.rs has 7 replay + 7 polish = **14 tests**, not 16. The spec's "16" is the e2e-only count; with the boot_panics relocation it lands at 14.
+Stage 1b e2e count after Eng review B10 (duplicate removed): **9 replay + 7 polish = 16 e2e tests in stage1b_e2e.rs**, plus 3 corruption tests in boot_panics.rs.
 
-Add two more replay-correctness tests to keep stage1b_e2e.rs at 16 if you want exact spec parity:
+The `replay_engine_state_matches_pre_kill_snapshot` test that originally lived here is removed per Eng review B10 — it duplicated the `replay_then_take_snapshot_round_trip` unit test in `replay.rs::tests`. That unit test runs faster (no sqlx::test DB overhead) and exercises the same code path. The remaining 8 replay-correctness e2e tests + 1 from CEO A4 = 9 total.
+
+Add one more replay-correctness test (`boot_with_only_rejected_events_succeeds`) which exercises the OrderRejected no-op arm in apply_event by writing events directly into a WAL:
 
 ```rust
-#[sqlx::test(migrations = "../../migrations")]
-async fn replay_engine_state_matches_pre_kill_snapshot(pool: PgPool) {
-    // Sanity check that replay produces the same engine state as a
-    // live engine that processed the same commands. Exercises apply_event
-    // on a realistic event stream.
-    use exg_common::SnowflakeGen;
-    use exg_protocol::Command;
-    use exg_risk_engine::{MarginTier, SymbolConfig};
-    use exg_common::{Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
-
-    fn dec(s: &str) -> Decimal128 { s.parse().unwrap() }
-
-    // Drop the unused pool argument; this test stays in-process.
-    drop(pool);
-
-    let cfg = SymbolConfig {
-        symbol: SymbolId::new(1),
-        tick_size: dec("0.01"),
-        lot_size: dec("0.001"),
-        min_notional: dec("10"),
-        max_leverage: dec("125"),
-        maker_fee: dec("0.0002"),
-        taker_fee: dec("0.0005"),
-        margin_tiers: vec![MarginTier {
-            notional_floor: dec("0"),
-            notional_cap: dec("50000"),
-            maintenance_margin_rate: dec("0.004"),
-            maintenance_amount: dec("0"),
-        }],
-        impact_notional: dec("200"),
-    };
-
-    let snowflake = SnowflakeGen::new(1);
-
-    // Live engine: process 3 commands.
-    let mut live = MatchingEngine::new(cfg.clone(), 1);
-    live.set_mark_price(dec("60000"));
-    let mut events_for_replay: Vec<Event> = Vec::new();
-    for i in 0..3 {
-        let cmd = Command::NewOrder {
-            order_id: OrderId::new(snowflake.next_id()),
-            user_id: UserId::new(42),
-            symbol: SymbolId::new(1),
-            side: Side::Buy,
-            order_type: OrderType::Limit,
-            time_in_force: TimeInForce::Gtc,
-            price: Some(dec(&format!("{}", 55000 + i))),
-            quantity: dec("0.001"),
-            stop_price: None,
-            trailing_delta: None,
-            visible_quantity: None,
-            reduce_only: false,
-            timestamp: UnixMicros::now(),
-            client_order_id: None,
-        };
-        events_for_replay.extend(live.process_command(&cmd));
-    }
-
-    // Replayed engine: apply the same events into an empty engine.
-    let mut replayed = MatchingEngine::new(cfg, 1);
-    for evt in &events_for_replay {
-        replayed.apply_event(evt).unwrap();
-    }
-
-    assert_eq!(
-        live.orderbook().order_count(),
-        replayed.orderbook().order_count(),
-        "replay order_count must match live"
-    );
-}
-
 #[sqlx::test(migrations = "../../migrations")]
 async fn boot_with_only_rejected_events_succeeds(pool: PgPool) {
     // Exercises the OrderRejected no-op arm in apply_event. We can't easily
@@ -2160,7 +2447,7 @@ DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg \
   cargo test -p exg-server --test stage1b_e2e 2>&1 | tail -25
 ```
 
-Expected: **17 passed** (10 replay + 7 polish).
+Expected: **16 passed** (9 replay + 7 polish; the duplicate `replay_engine_state_matches_pre_kill_snapshot` was removed per Eng review B10 in favor of the unit-level `replay_then_take_snapshot_round_trip`).
 
 Common failure modes to debug if not green:
 - `boot_replays_three_orders_inspectable_via_wal` count mismatch: the matching engine emits OrderAccepted both for the conditional-order path and the regular path; verify only one OrderAccepted per submitted order.
@@ -2192,9 +2479,11 @@ If the IP-bucket test is flaky, replace its logic with:
 ```bash
 git add crates/exg-server/tests/stage1b_e2e.rs crates/exg-server/Cargo.toml
 git commit -m "$(cat <<'EOF'
-test(server): add Stage 1b e2e suite (17 cases)
+test(server): add Stage 1b e2e suite (16 cases)
 
-Replay correctness (10):
+Replay correctness (9; the unit-level round-trip test in replay.rs
+covers the live-vs-replayed-engine state-equivalence path that an
+earlier draft duplicated here):
 - boot on empty WAL succeeds
 - boot replays single order
 - boot replays place+cancel
@@ -2202,7 +2491,6 @@ Replay correctness (10):
 - boot replays matched trade (2 sides)
 - second boot allocates fresh order_id (Snowflake doesn't collide)
 - boot replays N orders inspectable via wal-dump count
-- replay engine state matches live engine for same command stream
 - boot with OrderRejected-only WAL succeeds (no-op arm)
 - replay-survived order matches post-reboot taker (CEO review A4)
 
@@ -2441,11 +2729,11 @@ scripts/demo-stage1b.sh
 
 Expected pass counts:
 - `cargo test --workspace`: all green (~415 tests)
-- `stage1b_e2e`: 17/17
+- `stage1b_e2e`: 16/16
 - `stage1a_e2e`: 12/12
 - `stage0_e2e`: 7/7
-- `boot_panics`: 8/8
-- `exg-matching-engine --lib`: 12 new + existing
+- `boot_panics`: 9/9
+- `exg-matching-engine --lib`: 19 new + existing
 - `demo-stage1b.sh`: clean exit, second boot health-checks green
 
 If `cargo fmt --check` flags issues, run `cargo fmt`, stage the modified `.rs` files, commit as a separate `style: cargo fmt` commit.
@@ -2509,8 +2797,9 @@ EOF
 | §4.7 JWT/kyc e2e                            | Task 6                   |
 | §6 Data flow                                | Task 3 (lifecycle)       |
 | §7.1 New boot panics                        | Task 3 (impl), Task 4 (tests) |
-| §8.1 Unit tests (12)                        | Task 2                   |
-| §8.2 Integration tests (17)                 | Task 6                   |
+| §8.1 Unit tests (19, after Eng B12/B13/B6)  | Task 2                   |
+| §8.2 Integration tests (16, after Eng B10)  | Task 6                   |
+| §8.3 boot_panics 9/9 (after Eng B11)        | Task 4                   |
 | §9.5 Migration from Stage 1a                | Plan header (cutover)    |
 | §9.6 Rollback to Stage 1a                   | Plan header (rollback)   |
 | §8.3 Existing test deltas                   | Task 4 (boot_panics)     |

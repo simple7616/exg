@@ -21,7 +21,7 @@ In scope:
 
 1. **WAL replay on restart** — boot reads every WAL record, applies events to the matching engine, validates post-replay state, then opens HTTP listener.
 2. **Stage 0 invariant 3 removed** — WAL directory may be non-empty; that is now the expected state.
-3. **`OrderAccepted` event schema bump** — add `side`, `order_type`, `time_in_force`, `price`, `quantity`, `stop_price`, `reduce_only` so the event carries enough data to rebuild a `BookOrder`. Pre-Stage-1b WAL files are not supported (no production data exists yet).
+3. **`OrderAccepted` event schema bump** — add `side`, `order_type`, `time_in_force`, `price`, `quantity`, `stop_price`, `reduce_only`, `visible_quantity`, `trailing_delta`, `trailing_peak_price` (10 new fields total) so the event carries enough data to rebuild a `BookOrder` for every order type today's API accepts: limit, market, stop-limit/stop-market, take-profit-limit/take-profit-market, trailing-stop, and iceberg. `visible_quantity` was the original 8th field added during Eng review (iceberg replay); `trailing_delta` + `trailing_peak_price` are required for trailing-stop replay correctness because the peak price reflects the mark price at acceptance time and cannot be reconstructed from later state. `expire_time` is derived in `apply_event` from `timestamp + 24h` when `time_in_force = Gtd` (no new event field needed — the engine uses the same formula). Pre-Stage-1b WAL files are not supported (no production data exists yet).
 4. **`MatchingEngine::apply_event`** — new replay-only API that updates engine state from a historical event without re-running matching.
 5. **`cancel_order` / `amend_order` per-user rate limit** — share the same `user:{N}` token bucket key with `place_order`.
 6. **Login `||` short-circuit fix** — charge both email and IP buckets unconditionally so the IP bucket is always advanced.
@@ -100,7 +100,7 @@ Dispatch table:
 
 | Event variant       | Apply action                                                                                     | Error condition                                |
 | ------------------- | ------------------------------------------------------------------------------------------------ | ---------------------------------------------- |
-| `OrderAccepted`     | Construct `BookOrder` from event fields, insert into order book or stop-order book by `order_type`. | duplicate `order_id` → `DuplicateOrder`        |
+| `OrderAccepted`     | Construct `BookOrder` from event fields including `visible_quantity`, `trailing_delta`, `trailing_peak_price`. Derive `expire_time` from `timestamp + 24h` when `time_in_force = Gtd` (else `None`), and `hidden_qty = quantity - visible_qty` for iceberg orders (else `ZERO`). If `order_type.is_conditional()`, push to `stop_orders`. Else insert into `orderbook`. If GTD, also push `(expire_time, order_id)` to `expiry_heap`. | duplicate `order_id` → `DuplicateOrder`        |
 | `OrderRejected`     | no-op (rejected orders never entered the book)                                                   | —                                              |
 | `OrderCanceled`     | remove `order_id` from book                                                                      | `order_id` not present → `UnknownOrder`        |
 | `OrderFilled`       | decrement `BookOrder.remaining_qty` by `fill_qty`; if result is zero, remove from book.          | order not present → `UnknownOrder`; `fill_qty > remaining` → `OverFill` |
@@ -121,24 +121,32 @@ Current shape:
 OrderAccepted { order_id, user_id, symbol, client_order_id, timestamp }
 ```
 
-New shape:
+New shape (10 new fields total — extended from 7 to 10 during Eng review B6):
 
 ```rust
 OrderAccepted {
     order_id, user_id, symbol, client_order_id, timestamp,
+    // Replay-required fields (Eng review B5/B6):
     side: Side,
     order_type: OrderType,
     time_in_force: TimeInForce,
-    price: Decimal128,         // for market orders, the reference price at accept time
-    quantity: Decimal128,      // original submitted quantity
-    stop_price: Option<Decimal128>,
+    price: Decimal128,                       // for market orders, the reference price at accept time
+    quantity: Decimal128,                    // original submitted quantity
+    stop_price: Option<Decimal128>,          // for stop / take-profit conditional orders
     reduce_only: bool,
+    visible_quantity: Option<Decimal128>,    // iceberg visible slice (None for non-iceberg)
+    trailing_delta: Option<Decimal128>,      // trailing-stop offset
+    trailing_peak_price: Option<Decimal128>, // trailing-stop reference price at accept (= mark_price at the time)
 }
 ```
 
-All seven new fields are present on the `Command::NewOrder` variant already; `engine.process_command` discards them when building the event. Stage 1b just preserves them.
+All 10 new fields are derivable from `Command::NewOrder` input + engine state at accept time:
+- `side`, `order_type`, `time_in_force`, `price`, `quantity`, `stop_price`, `reduce_only`, `visible_quantity`, `trailing_delta` come directly from the command.
+- `trailing_peak_price` comes from `self.mark_price` at accept time (engine.rs:241-244). The engine sets it for trailing orders; the event must carry it because mark_price at replay time may differ.
 
-For market orders without a price (some venues accept market orders with no price field): the engine still has a working reference price internally; emit that. Tests use limit orders so this is not exercised in Stage 1b.
+`expire_time` (used for GTD orders) is NOT a new event field. `apply_event` reconstructs it from `timestamp + 24h` when `time_in_force = Gtd`, matching engine.rs:215-224. The engine also pushes `(expire_time, order_id)` into `expiry_heap` for GTD orders — `apply_event` does the same.
+
+For market orders without a price (some venues accept market orders with no price field): the engine has a working reference price internally; emit that. Tests use limit orders so this is not exercised in Stage 1b.
 
 Existing test assertions use `matches!(e, Event::OrderAccepted { .. })` with the rest-pattern, so adding fields does not break them. The `wal-dump` tool prints the variant name only; new fields render automatically via `Debug`.
 
@@ -302,38 +310,44 @@ Unchanged. Handler errors map to `ApiError` codes per Stage 1a §7.1.
 
 ### 8.1 Unit tests (`crates/exg-matching-engine/src/replay.rs::tests`)
 
-Ten tests, all in-process, no fixtures:
+Nineteen tests, all in-process, no fixtures (Eng review B12 added stop-order paths, B13 added other UnexpectedVariant arms, B6 added schema-field paths):
 
-1. `apply_order_accepted_inserts_book_order`
-2. `apply_order_canceled_removes_book_order`
-3. `apply_order_filled_decrements_remaining_qty`
-4. `apply_order_filled_zero_removes_book_order`
-5. `apply_trade_executed_is_noop_on_book`
-6. `apply_order_rejected_is_noop`
-7. `apply_duplicate_order_accepted_returns_err`
-8. `apply_unknown_order_canceled_returns_err`
-9. `apply_unknown_order_filled_returns_err`
-10. `apply_over_fill_returns_err`
-11. `apply_mark_price_update_returns_unexpected_variant`
-12. `replay_then_take_snapshot_round_trip` (golden round-trip via process_command → events → apply_event into empty engine; compare order counts)
-
-Twelve tests (spec originally said ten; landed on twelve after self-review to keep coverage tight).
+1. `apply_order_accepted_inserts_book_order` (Limit, non-conditional)
+2. `apply_order_accepted_conditional_pushes_to_stop_orders` (StopLimit / TrailingStop / Iceberg — B12)
+3. `apply_order_accepted_gtd_pushes_to_expiry_heap` (B6 — verifies GTD heap insertion)
+4. `apply_order_accepted_iceberg_preserves_visible_quantity` (B6 — visible_qty round-trip)
+5. `apply_order_accepted_trailing_preserves_peak_price` (B6 — trailing_peak_price round-trip)
+6. `apply_order_canceled_removes_book_order`
+7. `apply_order_canceled_removes_from_stop_orders` (B12 — fallback path for conditional cancel)
+8. `apply_order_filled_decrements_remaining_qty`
+9. `apply_order_filled_zero_removes_book_order`
+10. `apply_trade_executed_is_noop_on_book`
+11. `apply_order_rejected_is_noop`
+12. `apply_duplicate_order_accepted_returns_err`
+13. `apply_unknown_order_canceled_returns_err`
+14. `apply_unknown_order_filled_returns_err`
+15. `apply_over_fill_returns_err`
+16. `apply_mark_price_update_returns_unexpected_variant`
+17. `apply_funding_rate_update_returns_unexpected_variant` (B13)
+18. `apply_liquidation_order_returns_unexpected_variant` (B13)
+19. `replay_then_take_snapshot_round_trip` (golden round-trip via process_command → events → apply_event into empty engine; compare order counts)
 
 ### 8.2 Integration tests (`crates/exg-server/tests/stage1b_e2e.rs`)
 
-Seventeen tests, each `#[sqlx::test(migrations = "../../migrations")]`:
+Sixteen tests, each `#[sqlx::test(migrations = "../../migrations")]`:
 
-Replay correctness (10):
+Replay correctness (9 — the duplicate `replay_engine_state_matches_pre_kill_snapshot` was removed during Eng review B10; it duplicated the unit-level round-trip test):
 - `boot_replays_empty_wal_succeeds`
 - `boot_replays_single_order_restores_orderbook`
 - `boot_replays_place_cancel_restores_empty_orderbook`
 - `boot_replays_place_amend_restores_amended_price`
 - `boot_replays_matched_trade_restores_post_match_state`
-- `boot_panics_on_corrupt_wal_crc`
-- `boot_panics_on_sequence_gap`
-- `boot_panics_on_unknown_order_filled`
 - `place_then_kill_then_place_continues_sequence`
+- `boot_replays_three_orders_inspectable_via_wal`
+- `boot_with_only_rejected_events_succeeds`
 - **`replay_survived_order_matches_post_reboot_taker`** (CEO review A4): boot 1 places maker bid; kill; boot 2 places aggressive taker at maker price; second WAL contains an `OrderFilled` event referencing the maker `order_id` from boot 1 — proves replay restored the order to the matchable book, not just to "boot didn't panic."
+
+The three corruption tests (`boot_panics_on_corrupt_wal_crc`, `boot_panics_on_sequence_gap`, `boot_panics_on_unknown_order_filled` — the third added during Eng review B11) live in `boot_panics.rs` rather than `stage1b_e2e.rs` because they assert boot-time panic behavior, not steady-state replay correctness.
 
 Polish (7):
 - `cancel_order_rate_limit`
@@ -346,11 +360,11 @@ Polish (7):
 
 ### 8.3 Existing test deltas
 
-- `boot_panics.rs`: remove `boot_panics_on_nonempty_wal_dir` (invariant 3 gone). Result: 6/6 (down from 7/7).
+- `boot_panics.rs`: remove `boot_panics_on_nonempty_wal_dir` (invariant 3 gone); add `boot_panics_on_corrupt_wal_crc`, `boot_panics_on_sequence_gap`, `boot_panics_on_unknown_order_filled` (the third added during Eng review B11). Result: 9/9 (was 7, net +2).
 - `stage0_e2e.rs`: no source change (rest-pattern match is forward-compat). Result: 7/7.
 - `stage1a_e2e.rs`: no source change. Result: 12/12.
 
-Acceptance target: **26 new tests + all existing tests still pass**.
+Acceptance target: **35 new tests + all existing tests still pass** (19 unit + 16 e2e — boot_panics counted in "existing test deltas" above).
 
 ## 9. Invariants
 
@@ -421,8 +435,8 @@ PR passes when:
 2. `cargo clippy --workspace -- -D warnings` clean.
 3. `cargo fmt --check` clean.
 4. `cargo test --workspace` all green (≥390 tests).
-5. New tests: replay unit 12/12, stage1b_e2e 17/17 (one extra "replay survived matching" e2e added per CEO review A4).
-6. Existing tests: stage0_e2e 7/7, stage1a_e2e 12/12, boot_panics 6/6 (was 7, one removed), user-service 30/30.
+5. New tests: replay unit 19/19, stage1b_e2e 16/16 (CEO A4 added 1, Eng B10 removed 1 duplicate).
+6. Existing tests: stage0_e2e 7/7, stage1a_e2e 12/12, boot_panics 9/9 (was 7, net +2 after Eng B11), user-service 30/30.
 7. New script `scripts/demo-stage1b.sh` walks: docker-compose up → migrate reset → boot → place order → ^C → boot again → GET /me/orders shows order persists (or equivalent — use take_snapshot inspection if no orders endpoint yet) → ^C → wal-dump shows event count > 0.
 
 ## 11. Forward pointers (Stage 2+)
