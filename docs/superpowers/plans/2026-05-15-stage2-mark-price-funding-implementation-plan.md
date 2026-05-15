@@ -2143,3 +2143,19 @@ If `cargo fmt` needed changes during Step 4, commit them first as `style: cargo 
 | §9 forward pointers (incl. CEO C2 stop-cascade, C3 fwd-compat replay) | Spec doc |
 
 All spec sections covered. CEO review C2–C10 (6 findings) applied: C2/C3 → spec §8.5+§9, C5 → invariant 29 + Task 6 guard + Task 8 e2e, C6 → invariant 30 + Task 6 audit lines, C8 → Task 5 unit, C10 → Task 8 observable assertion.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (PLAN) | mode: HOLD_SCOPE, 0 critical gaps, 6 findings all accepted (C2,C3,C5,C6,C8,C10) |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | no UI scope |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**UNRESOLVED:** 0 across all reviews.
+
+**VERDICT:** CEO CLEARED — proceed to `/plan-eng-review` (architecture / tests / regression edges under HOLD SCOPE rigor; dual-server shutdown drain + interest_rate cascade are regression-sensitive). Eng review is the required shipping gate.
