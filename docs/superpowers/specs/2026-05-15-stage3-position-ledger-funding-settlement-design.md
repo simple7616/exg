@@ -186,19 +186,45 @@ pub struct PostTradeProcessor {
     `fill_qty` exceeds current size). Call
     `positions.open_or_increase(..)` or `positions.reduce_or_close(..)`.
     `reduce_or_close(user, symbol, qty, exit_price) -> ExgResult<(pnl,
-    Option<&Position>)>` returns a **signed** `realized_pnl`; if it is
-    non-zero, settle vs the system pool with idempotency key
-    `pnl_{seq}_{user}_{symbol}`: profit → `ledger.deposit(user,
-    pnl.abs(), key, ts)` (SYSTEM→user, `WalletType::Funding`); loss →
-    `ledger.withdraw(user, pnl.abs(), key, ts)` (user→SYSTEM). Push
-    `Event::RealizedPnl { .. , amount: realized_pnl /* signed */, .. }`.
-    Note: `withdraw` errors `InsufficientBalance` if the user's Funding
-    available cannot cover the loss → live fail-fast (Stage 3 has no
-    margin/liquidation to prevent it; documented limitation, §5.4 / §9 →
-    Stage 4). Tests/demo admin-credit users before any losing close.
+    Option<&Position>)>` returns a **signed** `realized_pnl`. Settlement
+    (CEO review C1/C1b — must NOT panic the single-threaded exchange on a
+    user's underfunded losing close, and must keep `verify_all_invariants`
+    true: `verify_account_invariant` hard-forbids a negative user wallet
+    `available`):
+    - **profit** (`pnl > 0`): credit user Funding from the SYSTEM pool —
+      `Ledger::settle_realized_pnl(user, pnl /*signed*/, key, ts)`.
+    - **loss** (`pnl < 0`): the ledger op debits **only**
+      `moved = min(pnl.abs(), user.Funding.available)` (caps the user at
+      exactly 0 — never negative, never errors on insufficiency) and
+      journals that balanced `moved` user→SYSTEM-Funding-pool transfer.
+      The uncollected remainder `pnl.abs() - moved` is **implicit Stage-3
+      bad debt** (no separate journal entry — keeping only balanced
+      transfers on the books is what preserves `verify_global_invariant`;
+      the SYSTEM Funding pool may legitimately go negative, §4.3). Stage 4
+      margin/liquidation guarantees `moved == pnl.abs()` (no bad debt).
+    - **Event:** push `Event::RealizedPnl { .., amount: moved_signed, .. }`
+      where `moved_signed` is the **actually-moved** signed amount
+      (`+pnl` for profit; `-(moved)` for loss). The event records the
+      real money movement (a fact), so replay applies it directly with no
+      recompute (invariant 36 intact) and `verify_all_invariants` holds on
+      replay by construction. The position's true vs collected PnL gap
+      (bad debt) is derivable from positions; precise bad-debt accounting
+      is Stage 4. Idempotency key `pnl_{seq}_{user}_{symbol}`.
+    `settle_realized_pnl` is a **new** `exg-ledger` op (no existing
+    primitive caps-at-available: `withdraw`/`settle_funding` both error on
+    insufficiency; `transfer` is same-user). It journals user↔`SYSTEM_USER_ID`
+    `WalletType::Funding`, never drives the user `available` negative, and
+    never returns `InsufficientBalance`.
   - `MarkPriceUpdate { mark_price, .. }` → `self.mark_price = mark_price`
     (needed for funding notional). No money move.
-  - `FundingRateUpdate { funding_rate, .. }` → `funding_period_id += 1`;
+  - `FundingRateUpdate { funding_rate, .. }` → **CEO review C3 guard:** if
+    any open (non-zero size) position exists **and** `self.mark_price`
+    is zero (no `MarkPriceUpdate` consumed yet), emit
+    `tracing::warn!(target: "post_trade", "funding tick skipped: mark_price
+    unset with N open positions")` and skip the tick entirely (do **not**
+    increment `funding_period_id`, do **not** emit `FundingSettled`). A
+    zero-notional silent "success" that charges nobody is a silent
+    correctness failure. Otherwise `funding_period_id += 1`;
     for each open position: `notional = position.size * self.mark_price`;
     `payment = notional * funding_rate` (Long pays when rate > 0 → debit
     user; Short receives → credit user; signs handled by
@@ -208,26 +234,43 @@ pub struct PostTradeProcessor {
     `funding_{period}_{user}_{symbol}` — deterministic, replay-safe).
     Push `Event::FundingSettled { .., funding_period_id, amount: payment,
     .. }` per position. The whole loop is one atomic batch with this tick
-    (Invariant 33). After the batch, call
+    (Invariant 33). After the batch: emit a
+    `tracing::info!(target: "post_trade", period, settled_count,
+    total_abs, "funding batch")` audit line (CEO review C4), then call
     `ledger.verify_all_invariants()` (Invariant 32) — failure ⇒ fail-fast
-    (matching thread aborts; WAL is truth).
+    (matching thread aborts; WAL is truth). Funding payment uses
+    `settle_funding_checked` which debits available then margin and
+    **errors `InsufficientBalance`** if the user cannot cover a funding
+    *payment* (Long, rate>0). In Stage 3 this is the same underfunded
+    class as C1; the live funding-payment path also routes through the
+    C1/C1b cap-at-available rule via `settle_realized_pnl`-style handling
+    (the implementer reuses one capped-debit ledger primitive for both
+    realized loss and funding payment so neither can panic the exchange;
+    funding *receipts* (Short, rate<0) are plain credits). The recorded
+    `FundingSettled.amount` is the actually-moved signed amount.
 - `apply_event(&mut self, e: &Event)` — replay path:
   - `OrderFilled`/`TradeExecuted` → **re-project position qty/avg-entry
     only** (same `open_or_increase`/`reduce_or_close` arithmetic, which
     is pure additive). Do **NOT** emit or recompute money here.
-  - `RealizedPnl { user_id, amount, .. }` → apply the **recorded** signed
-    amount via the same `deposit`(>0)/`withdraw`(<0) rule + same
-    `pnl_{seq}_{user}_{symbol}` idempotency key. No PnL recomputation
-    (the sign→direction mapping is a fixed deterministic rule applied to
-    the recorded number — not a recompute).
-  - `FundingSettled { user_id, funding_period_id, amount, .. }` → apply
-    the **recorded** signed `amount` via
-    `ledger.settle_funding_checked(.., funding_period_id, amount, ..)`;
-    its deterministic idempotency key makes a duplicate apply a no-op.
-    Also advance `self.funding_period_id` to `max(self, period)`.
-  - `AdminCredited { user_id, amount, .. }` → `ledger.deposit(user,
-    amount, "admincredit_{user}_{seq}", ts)` (the ledger journals
-    SYSTEM→user `WalletType::Funding`; idempotent on the key).
+  - `RealizedPnl { user_id, amount, .. }` → `amount` is the
+    **actually-moved** signed amount (already capped at the user's
+    available on the live path, C1/C1b). Replay applies it directly via
+    `Ledger::settle_realized_pnl(user, amount, "pnl_{seq}_{user}_{symbol}",
+    ts)` — a pure recorded-fact application, **no** cap recomputation, no
+    recompute (invariant 36). Because `amount` was already capped live,
+    re-applying it never drives the user negative and
+    `verify_all_invariants` holds on replay by construction.
+  - `FundingSettled { user_id, funding_period_id, amount, .. }` → `amount`
+    is the actually-moved signed amount (capped live, C1/C1b). Apply it
+    directly via the same capped-debit primitive used live (the recorded
+    amount never re-caps because it was already the moved amount); key
+    `funding_{period}_{user}_{symbol}` makes a duplicate apply a no-op.
+    Advance `self.funding_period_id` to `max(self, period)`.
+  - `AdminCredited { user_id, amount, idempotency_key, .. }` →
+    `ledger.deposit(user, amount, idempotency_key, ts)` using the event's
+    **recorded** `idempotency_key` (CEO review C2: a unique key, not a
+    `ts`-derived one — see §4.7); the ledger journals SYSTEM→user
+    `WalletType::Funding`; idempotent on the key.
   - `MarkPriceUpdate` → `self.mark_price = mark_price` (so a post-replay
     funding tick has the right notional).
   - `FundingRateUpdate` on replay → **NO-OP for settlement** (only
@@ -316,8 +359,18 @@ stringified decimal — Stage 2 shape). Reject `amount <= 0` → 400 / -1100
 (symmetric with Stage 2 markPrice guard). Emits the
 `tracing::info!(target:"admin", ..)` audit line before enqueue (invariant
 30 reuse). Builds `Command::AdminCredit { user_id, amount,
-idempotency_key: format!("admincredit_{user_id}_{}", UnixMicros::now()),
-timestamp }` and pushes to the shared ring buffer.
+idempotency_key, timestamp }` and pushes to the shared ring buffer.
+
+**CEO review C2 — idempotency key must be collision-free.** A
+`ts.as_micros()`-only key collides when two same-user credits land in the
+same microsecond (the e2e/demo issue rapid sequential credits) → the
+second `deposit` silently no-ops → **silently lost funds** (violates
+zero-silent-failures). The key MUST embed a process-unique monotonic
+discriminator: `format!("admincredit_{user_id}_{}_{}",
+UnixMicros::now().as_micros(), N)` where `N` comes from a single process
+`AtomicU64` counter (or a UUID). The command carries this key; replay
+re-applies the **recorded** key (deterministic), so cross-machine replay
+stays idempotent. No `ts`-only keys anywhere in Stage 3.
 
 ## 5. Data Flow & Error Handling
 
@@ -357,8 +410,9 @@ contiguously in WAL order (one tick = rate + settlement; Invariant 33).
 |-----------|----------|
 | admin credit amount ≤ 0 | 400 at handler; no Command produced |
 | ledger op fails live (e.g. account-not-found) | matching thread aborts (fail-fast; WAL is truth) — no silent skip |
-| realized **loss** exceeds user Funding available (`withdraw` → `InsufficientBalance`) | live fail-fast (no margin/liquidation in Stage 3 to prevent it); documented limitation → Stage 4. Tests/demo admin-credit users before any losing close |
-| `verify_all_invariants()` fails live | fail-fast abort |
+| realized **loss** / funding **payment** exceeds user Funding available | **CEO C1/C1b: NOT fail-fast.** Capped-debit primitive moves only `min(owed, available)` (user floored at 0, never negative, never errors); uncollected remainder = implicit Stage-3 bad debt absorbed by the SYSTEM Funding pool (allowed negative). The exchange never panics on a user's normal underfunded close. Stage 4 margin/liquidation removes bad debt. |
+| funding tick with open positions but `mark_price == 0` | **CEO C3:** `tracing::warn!` + skip the tick (no period bump, no `FundingSettled`); never a silent zero-charge "success" |
+| `verify_all_invariants()` fails live | fail-fast abort (this is a real corruption/bug, not a user condition — the capped-debit primitive guarantees it cannot fire from an underfunded user) |
 | replay `apply_event` ledger error | `ReplayError::Apply` → boot panic |
 | replay end `verify_all_invariants()` fails | boot panic |
 | duplicate idempotency key (replay re-apply) | ledger no-op `Ok` (by design — Invariant 31) |
@@ -385,8 +439,9 @@ by regression baselines).
   settlement batch on the live path and at the end of boot replay.
 - **#33** Funding settlement is atomic with the `FundingRateUpdate` tick
   that drove it — all `FundingSettled` events for a tick are produced and
-  WAL-appended contiguously with that `FundingRateUpdate`; a per-position
-  ledger failure aborts the process (no partial batch persists).
+  WAL-appended contiguously with that `FundingRateUpdate`. A per-position
+  ledger *corruption* aborts the process; an underfunded user is NOT a
+  corruption (handled by #37, no abort, no partial-batch concern).
 - **#34** Position quantity / weighted-average entry price is a pure
   projection of `OrderFilled` **only** (`TradeExecuted` is never used for
   projection — anti-double-count); never separately evented; live and
@@ -399,8 +454,29 @@ by regression baselines).
   `NON_NEGATIVE_SYSTEM_WALLETS` (Funding pool excluded by design).
 - **#36** On replay, `PostTradeProcessor` never recomputes a money amount
   — `FundingRateUpdate` is a settlement no-op; all money state comes from
-  recorded `AdminCredited`/`RealizedPnl`/`FundingSettled` facts (explicit
+  recorded `AdminCredited`/`RealizedPnl`/`FundingSettled` facts (whose
+  `amount` is the actually-moved value, not a notional) (explicit
   Stage 2-P1 regression guard).
+- **#37** (CEO review C1/C1b) A user's realized loss or funding payment
+  NEVER panics the matching thread and NEVER drives the user wallet
+  `available` negative. The capped-debit ledger primitive moves only
+  `min(owed, user.Funding.available)`; the uncollected remainder is
+  implicit bad debt absorbed by the SYSTEM Funding pool (allowed
+  negative). One user's normal underfunded close cannot take the
+  single-threaded exchange down for everyone. Recorded
+  `RealizedPnl`/`FundingSettled.amount` = the actually-moved signed
+  amount, so replay is a pure fact-apply and `verify_all_invariants`
+  holds on replay by construction.
+- **#38** (CEO review C3) A `FundingRateUpdate` consumed while any open
+  position exists but `mark_price == 0` is `tracing::warn!`-logged and
+  skipped (no `funding_period_id` bump, no `FundingSettled`). Never a
+  silent zero-charge "success".
+- **#39** (CEO review C4) Every funding settlement batch emits a
+  `tracing::info!(target: "post_trade", period, settled_count,
+  total_abs)` audit line, and every realized-PnL move emits a
+  `tracing::info!(target: "post_trade", user, symbol, amount)` line,
+  before `verify_all_invariants` — operators can reconstruct money
+  movement from logs without `wal-dump` (parity with Stage 2 inv #30).
 
 ## 7. Testing
 
@@ -418,6 +494,17 @@ by regression baselines).
 6. `verify_all_invariants_after_settlement_batch`.
 7. `settle_funding_checked_idempotent` — same `funding_period_id`
    re-applied → no double charge.
+8. (CEO C1/C1b) `underfunded_realized_loss_caps_at_zero_no_panic` — user
+   with `available = 100` closes at `-500` loss: ledger op returns `Ok`
+   (no panic, no `InsufficientBalance`), user Funding `available == 0`
+   (never negative), SYSTEM Funding pool went negative by the moved
+   amount, `RealizedPnl.amount == -100` (moved, not -500),
+   `verify_all_invariants` holds.
+9. (CEO C1/C1b) `underfunded_funding_payment_caps_at_zero_no_panic` —
+   symmetric for a Long funding payment exceeding available.
+10. (CEO C3) `funding_tick_zero_mark_with_open_positions_warns_skips` —
+    open position + `mark_price == 0` → no `FundingSettled`,
+    `funding_period_id` unchanged.
 
 ### 7.2 Replay round-trip equivalence (mandatory — Stage 2 C10 discipline)
 
@@ -438,6 +525,11 @@ and the full journal length/entries.
 4. `replay_funding_rate_update_is_settlement_noop` — assert replaying
    `FundingRateUpdate` alone moves no funds (only recorded
    `FundingSettled` does).
+5. (CEO C1/C1b) `replay_underfunded_loss_equivalent` — live: fund user
+   small, open, close at a loss exceeding balance (capped); reboot;
+   assert user `available`, SYSTEM Funding pool, positions, and journal
+   length identical live vs replayed (the capped `RealizedPnl.amount`
+   replays as a pure fact — no re-cap, `verify_all_invariants` holds).
 
 ### 7.3 Integration (`exg-server/tests/stage3_e2e.rs`, `#[sqlx::test]`)
 
@@ -475,7 +567,9 @@ PR passes when:
 2. `cargo clippy --workspace -- -D warnings` clean.
 3. `cargo fmt --check` clean.
 4. `cargo test --workspace` all green.
-5. New: stage3_e2e (5+), post_trade unit (7+), replay round-trip (4),
+5. New: stage3_e2e (5+), post_trade unit (10+, incl. CEO C1/C1b
+   underfunded-loss + underfunded-funding + C3 zero-mark), replay
+   round-trip (5, incl. CEO C1/C1b underfunded-loss equivalence),
    boot_panics (+1..2).
 6. Regression: stage0 7, stage1a 12, stage1b 16, stage2 11 — all green.
 7. `scripts/demo-stage3.sh`: docker postgres → migrate reset → boot →
@@ -512,12 +606,16 @@ remains deferred to Stage 5+ (tracked below).
   post-trade pipeline on `MarkPriceUpdate`; emit `LiquidationOrder`;
   matcher executes forced close; `close_position_settled` with margin;
   replay arm for `LiquidationOrder` (currently `UnexpectedVariant`).
-- **Initial margin + realized-loss solvency** (Stage 4): reserve
+- **Initial margin + bad-debt elimination** (Stage 4): reserve
   user Funding→margin on position open, release on close; order-acceptance
-  rejects on insufficient margin; this also removes the Stage 3
-  "realized loss exceeds Funding available → `withdraw` fail-fast"
-  limitation (§5.4) — margin/liquidation guarantees a closing user can
-  cover the loss.
+  rejects on insufficient margin. This eliminates Stage 3's **implicit
+  bad debt** (CEO C1/C1b): when a user's realized loss / funding payment
+  exceeds their available, Stage 3 caps the debit at their balance and
+  the SYSTEM Funding pool absorbs the uncollected remainder (no panic,
+  invariant-safe). Stage 4 margin/liquidation guarantees a closing user
+  can always cover, so the capped-debit primitive's bad-debt branch
+  becomes unreachable; Stage 4 also adds explicit bad-debt /
+  insurance-fund accounting to replace the implicit SYSTEM-pool sink.
 - **Insurance fund** (Stage 4): replace the SYSTEM Funding-pool net-sink
   with a real `WalletType::InsuranceFund` account + bankruptcy/ADL
   waterfall; precise per-trade PnL counterparty accounting.
