@@ -27,10 +27,8 @@ pub struct MatchingEngine {
     /// Sequence counter for WAL ordering.
     sequence: u64,
     /// Stage 2: clamp interest rate for funding (from cfg.risk.interest_rate).
-    #[allow(dead_code)] // Task 2: stored; consumed in Task 3
     interest_rate: Decimal128,
     /// Stage 2: last computed funding rate. ZERO until first ComputeFunding.
-    #[allow(dead_code)] // Task 2: stored; consumed in Task 3
     last_funding_rate: Decimal128,
 }
 
@@ -113,8 +111,15 @@ impl MatchingEngine {
                 symbol,
                 timestamp,
             } => self.handle_cancel_all(*user_id, *symbol, *timestamp),
-            // Stage 2 Task 1 placeholder — replaced with real dispatch in Task 3.
-            Command::UpdateMarkPrice { .. } | Command::ComputeFunding { .. } => Vec::new(),
+            Command::UpdateMarkPrice {
+                symbol,
+                mark_price,
+                index_price,
+                timestamp,
+            } => self.update_mark_price(*symbol, *mark_price, *index_price, *timestamp),
+            Command::ComputeFunding { symbol, timestamp } => {
+                self.compute_funding(*symbol, *timestamp)
+            }
         }
     }
 
@@ -737,19 +742,40 @@ impl MatchingEngine {
         events
     }
 
-    /// Update mark/index price. Check stop orders for triggering.
+    /// Passive: set mark/index price + reconstruct trailing-peak state.
+    /// Reused by the live path (first half) AND replay. No triggering,
+    /// no matching — Stage 2 §3 passive/active split.
+    pub(crate) fn apply_mark_index_passive(&mut self, mark: Decimal128, index: Decimal128) {
+        self.mark_price = mark;
+        self.index_price = index;
+        self.update_trailing_peaks();
+    }
+
+    /// Live path (process_command → Command::UpdateMarkPrice). Emits
+    /// MarkPriceUpdate first, then any OrderFilled/TradeExecuted from
+    /// triggered stop/take-profit/trailing orders.
     pub fn update_mark_price(
         &mut self,
-        mark_price: Decimal128,
-        index_price: Decimal128,
+        symbol: SymbolId,
+        mark: Decimal128,
+        index: Decimal128,
+        timestamp: UnixMicros,
     ) -> Vec<Event> {
-        self.mark_price = mark_price;
-        self.index_price = index_price;
+        self.apply_mark_index_passive(mark, index);
+        let mut events = vec![Event::MarkPriceUpdate {
+            symbol,
+            mark_price: mark,
+            index_price: index,
+            timestamp,
+        }];
+        events.extend(self.trigger_and_match_stops(timestamp));
+        events
+    }
 
+    /// Active half: check stop triggers + run them through the matcher.
+    /// Live-only. (Body moved from the old update_mark_price tail.)
+    fn trigger_and_match_stops(&mut self, timestamp: UnixMicros) -> Vec<Event> {
         let mut events = Vec::new();
-
-        // Update trailing peak prices
-        self.update_trailing_peaks();
 
         // Check stop triggers
         let mut triggered = self.check_stop_triggers_internal();
@@ -772,7 +798,6 @@ impl MatchingEngine {
                 _ => {}
             }
 
-            let timestamp = UnixMicros::now();
             let match_result = matcher::match_order(&mut self.orderbook, &mut order);
 
             if !match_result.rejected {
@@ -791,6 +816,35 @@ impl MatchingEngine {
         }
 
         events
+    }
+
+    /// Stage 2: compute funding rate from the instantaneous premium.
+    /// premium = (mark - index) / index ; ZERO when index == 0
+    /// (div-by-zero guard — invariant 28). rate via risk-engine clamp.
+    pub fn compute_funding(&mut self, symbol: SymbolId, timestamp: UnixMicros) -> Vec<Event> {
+        let premium = if self.index_price.is_zero() {
+            Decimal128::ZERO
+        } else {
+            (self.mark_price - self.index_price) / self.index_price
+        };
+        let rate = exg_risk_engine::funding::calc_funding_rate(premium, self.interest_rate);
+        self.last_funding_rate = rate;
+        vec![Event::FundingRateUpdate {
+            symbol,
+            funding_rate: rate,
+            timestamp,
+        }]
+    }
+
+    /// Last funding rate (observability / snapshot / replay).
+    pub fn last_funding_rate(&self) -> Decimal128 {
+        self.last_funding_rate
+    }
+
+    /// Replay-only accessor — set last_funding_rate during apply_event.
+    #[doc(hidden)]
+    pub fn set_last_funding_rate(&mut self, rate: Decimal128) {
+        self.last_funding_rate = rate;
     }
 
     /// Check and expire GTD orders.
@@ -1095,6 +1149,10 @@ mod tests {
 
     fn dec(s: &str) -> Decimal128 {
         s.parse().unwrap()
+    }
+
+    fn sample_ts() -> UnixMicros {
+        UnixMicros::from_micros(1_700_000_000_000_000)
     }
 
     fn test_config() -> SymbolConfig {
@@ -1449,7 +1507,8 @@ mod tests {
         assert_eq!(engine.stop_order_count(), 1);
 
         // Update mark price to trigger
-        let events = engine.update_mark_price(dec("51000"), dec("51000"));
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("51000"), dec("51000"), sample_ts());
 
         // Stop should have triggered and matched
         assert!(!events.is_empty());
@@ -1464,7 +1523,7 @@ mod tests {
         let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Set initial mark price
-        engine.update_mark_price(dec("50000"), dec("50000"));
+        engine.update_mark_price(SymbolId::new(1), dec("50000"), dec("50000"), sample_ts());
 
         // Place a resting bid for the triggered sell to match against
         engine.process_command(&new_order_cmd(
@@ -1494,15 +1553,24 @@ mod tests {
         assert!(is_accepted(&events[0]));
 
         // Price goes up — peak should track
-        let events = engine.update_mark_price(dec("52000"), dec("52000"));
-        assert!(events.is_empty()); // no trigger yet (52000 - 1000 = 51000, mark=52000)
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("52000"), dec("52000"), sample_ts());
+        assert!(
+            !events.iter().any(is_filled),
+            "peak tracking only, no trigger yet"
+        );
 
         // Price drops but not enough
-        let events = engine.update_mark_price(dec("51500"), dec("51500"));
-        assert!(events.is_empty()); // peak=52000, trigger at 51000, mark=51500
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("51500"), dec("51500"), sample_ts());
+        assert!(
+            !events.iter().any(is_filled),
+            "still above trigger, no fill"
+        );
 
         // Price drops to trigger level
-        let events = engine.update_mark_price(dec("51000"), dec("51000"));
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("51000"), dec("51000"), sample_ts());
         // Should trigger: peak=52000, delta=1000, trigger at 52000-1000=51000
         let fills: Vec<_> = events.iter().filter(|e| is_filled(e)).collect();
         assert!(!fills.is_empty());
@@ -1579,12 +1647,13 @@ mod tests {
         );
         engine.process_command(&stop);
 
-        engine.update_mark_price(dec("50000"), dec("50000"));
+        engine.update_mark_price(SymbolId::new(1), dec("50000"), dec("50000"), sample_ts());
 
         let snapshot = engine.take_snapshot();
 
         // Restore
-        let restored = MatchingEngine::restore_from_snapshot(snapshot, test_config(), 1, dec("0.0001"));
+        let restored =
+            MatchingEngine::restore_from_snapshot(snapshot, test_config(), 1, dec("0.0001"));
 
         assert_eq!(restored.orderbook().order_count(), 2);
         assert_eq!(restored.stop_order_count(), 1);
@@ -1793,5 +1862,90 @@ mod tests {
         assert_eq!(engine.mark_price(), Decimal128::ZERO);
         engine.set_mark_price(dec("60000"));
         assert_eq!(engine.mark_price(), dec("60000"));
+    }
+
+    #[test]
+    fn update_mark_price_passive_sets_price_and_peaks_no_fills() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.set_mark_price(dec("60000"));
+        let events =
+            engine.update_mark_price(SymbolId::new(1), dec("61000"), dec("60950"), sample_ts());
+        assert_eq!(engine.mark_price(), dec("61000"));
+        assert!(matches!(events[0], Event::MarkPriceUpdate { .. }));
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::OrderFilled { .. }))
+        );
+    }
+
+    #[test]
+    fn compute_funding_positive_premium() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.update_mark_price(SymbolId::new(1), dec("60600"), dec("60000"), sample_ts());
+        let events = engine.compute_funding(SymbolId::new(1), sample_ts());
+        // premium=(60600-60000)/60000=0.01 ; clamp(0.01+0.0001,±0.0075)=0.0075
+        match &events[0] {
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                assert_eq!(*funding_rate, dec("0.0075"))
+            }
+            _ => panic!("expected FundingRateUpdate"),
+        }
+        assert_eq!(engine.last_funding_rate(), dec("0.0075"));
+    }
+
+    #[test]
+    fn compute_funding_negative_premium() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.update_mark_price(SymbolId::new(1), dec("59400"), dec("60000"), sample_ts());
+        let events = engine.compute_funding(SymbolId::new(1), sample_ts());
+        match &events[0] {
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                assert_eq!(*funding_rate, dec("-0.0075"))
+            }
+            _ => panic!("expected FundingRateUpdate"),
+        }
+    }
+
+    #[test]
+    fn compute_funding_zero_index_no_panic() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        let events = engine.compute_funding(SymbolId::new(1), sample_ts());
+        // index stays ZERO → premium ZERO → clamp(0+0.0001)=0.0001
+        match &events[0] {
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                assert_eq!(*funding_rate, dec("0.0001"))
+            }
+            _ => panic!("expected FundingRateUpdate"),
+        }
+    }
+
+    #[test]
+    fn process_command_update_mark_price_dispatches() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        let events = engine.process_command(&Command::UpdateMarkPrice {
+            symbol: SymbolId::new(1),
+            mark_price: dec("62000"),
+            index_price: dec("61900"),
+            timestamp: sample_ts(),
+        });
+        assert_eq!(engine.mark_price(), dec("62000"));
+        assert!(matches!(events[0], Event::MarkPriceUpdate { .. }));
+    }
+
+    #[test]
+    fn process_command_compute_funding_dispatches() {
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
+        engine.process_command(&Command::UpdateMarkPrice {
+            symbol: SymbolId::new(1),
+            mark_price: dec("60300"),
+            index_price: dec("60000"),
+            timestamp: sample_ts(),
+        });
+        let events = engine.process_command(&Command::ComputeFunding {
+            symbol: SymbolId::new(1),
+            timestamp: sample_ts(),
+        });
+        assert!(matches!(events[0], Event::FundingRateUpdate { .. }));
     }
 }
