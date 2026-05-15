@@ -13,6 +13,8 @@ fn base_cfg(wal_dir: &std::path::Path) -> ExgConfig {
     // Stage 1a: override the placeholder to a valid 32-byte secret so the
     // 4 non-auth invariant tests don't trip on the JWT placeholder check.
     cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "a".repeat(32);
+    cfg.server.admin_port = 0;
     cfg
 }
 

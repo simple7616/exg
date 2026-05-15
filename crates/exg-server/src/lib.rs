@@ -41,6 +41,9 @@ pub struct ServerHandle {
     /// The TCP port the HTTP server is bound to. Useful in tests with port 0.
     pub bound_port: u16,
     pub actix_handle: ActixServerHandle,
+    /// Stage 2: admin server bound port (for tests) + actix handle.
+    pub admin_bound_port: u16,
+    admin_actix_handle: ActixServerHandle,
     /// `Some` until `shutdown()` consumes it.
     matching_thread: Option<JoinHandle<()>>,
     shutdown_flag: Arc<AtomicBool>,
@@ -52,6 +55,13 @@ impl ServerHandle {
     /// Step 1 (await ctrl-c) is the caller's responsibility — the binary does
     /// it in `main.rs`; integration tests call this directly.
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
+        // Stage 2: drain the admin server FIRST — it produces commands into
+        // the same ring buffer the matching thread drains. Stopping it before
+        // the main server keeps the Stage 0 §9 drain invariant intact (no new
+        // commands enter after shutdown begins). Order: admin stop → main
+        // stop → matching-thread signal → join.
+        self.admin_actix_handle.stop(true).await;
+
         // Step 2: gracefully drain in-flight HTTP requests.
         self.actix_handle.stop(true).await;
 
@@ -106,6 +116,18 @@ fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
     }
     if cfg.auth.jwt_secret == JWT_PLACEHOLDER {
         bail!("Stage 1a: auth.jwt_secret is the placeholder; override via EXG_AUTH_JWT_SECRET");
+    }
+
+    // Stage 2 §6 invariant 24/25: admin secret length + placeholder.
+    const ADMIN_SECRET_PLACEHOLDER: &str = "CHANGE-ME-ADMIN-DEV-ONLY-MUST-BE-32-BYTES";
+    if cfg.admin.admin_secret.len() < 32 {
+        bail!(
+            "Stage 2: admin.admin_secret must be at least 32 bytes, got {}",
+            cfg.admin.admin_secret.len()
+        );
+    }
+    if cfg.admin.admin_secret == ADMIN_SECRET_PLACEHOLDER {
+        bail!("Stage 2: admin.admin_secret is the placeholder; override via EXG_ADMIN_SECRET");
     }
 
     Ok(())
@@ -216,7 +238,12 @@ pub async fn run_with_config_with_pool(
     let symbol_config =
         symbol_config_from_entry(sym_entry).context("failed to parse symbol config")?;
 
-    let mut engine = MatchingEngine::new(symbol_config, cfg.server.node_id);
+    let interest_rate: Decimal128 = cfg
+        .risk
+        .interest_rate
+        .parse()
+        .with_context(|| format!("invalid risk.interest_rate: {}", cfg.risk.interest_rate))?;
+    let mut engine = MatchingEngine::new(symbol_config, cfg.server.node_id, interest_rate);
     engine.set_mark_price(mark_price);
 
     // ── Step 3.5 (Stage 1a): connect PG pool ─────────────────────────────
@@ -463,9 +490,31 @@ pub async fn run_with_config_with_pool(
         "exg-server listening"
     );
 
+    // ── Stage 2: admin HTTP server on admin_port ───────────────────────────
+    let admin_port = cfg.server.admin_port;
+    let admin_listener = TcpListener::bind((host.as_str(), admin_port))
+        .with_context(|| format!("failed to bind admin {host}:{admin_port}"))?;
+    let admin_bound_port = admin_listener
+        .local_addr()
+        .context("failed to get admin local addr")?
+        .port();
+    let admin_state = state.clone();
+    let admin_server = actix_web::HttpServer::new(move || {
+        exg_api_gateway::admin::build_admin_app(admin_state.clone())
+    })
+    .listen(admin_listener)
+    .context("actix admin HttpServer::listen failed")?
+    .run();
+    let admin_actix_handle = admin_server.handle();
+    tokio::spawn(admin_server);
+
+    info!(host = %host, admin_port = admin_bound_port, "exg-server admin listening");
+
     Ok(ServerHandle {
         bound_port,
         actix_handle,
+        admin_bound_port,
+        admin_actix_handle,
         matching_thread: Some(matching_thread),
         shutdown_flag,
     })
