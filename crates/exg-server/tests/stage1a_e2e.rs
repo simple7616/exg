@@ -251,8 +251,7 @@ async fn cross_user_idor_via_jwt_blocked(pool: PgPool) {
     let cfg = base_cfg(tmp.path());
     let (handle, base) = boot_server(cfg, pool).await;
     let client = Client::new();
-    let token_a =
-        register_and_login(&client, &base, "alice-idor@e.com", "hunter2hunter2").await;
+    let token_a = register_and_login(&client, &base, "alice-idor@e.com", "hunter2hunter2").await;
     let token_b = register_and_login(&client, &base, "bob-idor@e.com", "hunter2hunter2").await;
 
     let place: serde_json::Value = client
@@ -307,7 +306,10 @@ async fn login_rate_limit_per_email(pool: PgPool) {
             break;
         }
     }
-    assert!(saw_429, "expected at least one 429 from per-email login limit");
+    assert!(
+        saw_429,
+        "expected at least one 429 from per-email login limit"
+    );
     handle.shutdown().await.unwrap();
 }
 

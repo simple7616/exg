@@ -127,9 +127,7 @@ fn validate_invariants(cfg: &ExgConfig) -> anyhow::Result<()> {
         );
     }
     if cfg.auth.jwt_secret == JWT_PLACEHOLDER {
-        bail!(
-            "Stage 1a: auth.jwt_secret is the placeholder; override via EXG_AUTH_JWT_SECRET"
-        );
+        bail!("Stage 1a: auth.jwt_secret is the placeholder; override via EXG_AUTH_JWT_SECRET");
     }
 
     Ok(())
@@ -273,12 +271,10 @@ pub async fn run_with_config_with_pool(
         cfg: Arc::clone(&cfg),
         pool: pool.clone(),
         auth_cfg: Arc::new(cfg.auth.clone()),
-        rate_limiter: Arc::new(Mutex::new(
-            exg_api_gateway::middleware::RateLimiter::new(
-                cfg.risk.max_orders_per_second,
-                cfg.risk.max_orders_per_second as f64,
-            ),
-        )),
+        rate_limiter: Arc::new(Mutex::new(exg_api_gateway::middleware::RateLimiter::new(
+            cfg.risk.max_orders_per_second,
+            cfg.risk.max_orders_per_second as f64,
+        ))),
     };
 
     // ── Step 5: spawn matching engine OS thread ───────────────────────────

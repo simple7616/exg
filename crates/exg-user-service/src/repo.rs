@@ -6,10 +6,7 @@ use once_cell::sync::OnceCell;
 use sqlx::PgPool;
 use tracing::warn;
 
-use crate::{
-    AuthError, JwtClaims, LoginResponse,
-    hash_password, sign_jwt, verify_password,
-};
+use crate::{AuthError, JwtClaims, LoginResponse, hash_password, sign_jwt, verify_password};
 
 /// Argon2id hash of a fixed constant, computed once at boot. Used by
 /// `login_user` when the email lookup misses, so verify_password is always
@@ -100,16 +97,15 @@ pub async fn login_user(
 ) -> Result<LoginResponse, AuthError> {
     let email_lc = email.to_lowercase();
 
-    let row: Option<(i64, String, bool)> = sqlx::query_as(
-        "SELECT user_id, password_hash, is_active FROM users WHERE email = $1",
-    )
-    .bind(&email_lc)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| {
-        warn!(target: "repo", err = %e, "login_user db error");
-        AuthError::DbError(e.to_string())
-    })?;
+    let row: Option<(i64, String, bool)> =
+        sqlx::query_as("SELECT user_id, password_hash, is_active FROM users WHERE email = $1")
+            .bind(&email_lc)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                warn!(target: "repo", err = %e, "login_user db error");
+                AuthError::DbError(e.to_string())
+            })?;
 
     let dummy = DUMMY_ARGON2_HASH
         .get()
@@ -143,17 +139,13 @@ pub async fn login_user(
 }
 
 /// Find a user by ID. Returns None if not found.
-pub async fn find_user_by_id(
-    pool: &PgPool,
-    user_id: UserId,
-) -> Result<Option<UserRow>, AuthError> {
-    let row: Option<(i64, String, i16, bool)> = sqlx::query_as(
-        "SELECT user_id, email, kyc_level, is_active FROM users WHERE user_id = $1",
-    )
-    .bind(user_id.value() as i64)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| AuthError::DbError(e.to_string()))?;
+pub async fn find_user_by_id(pool: &PgPool, user_id: UserId) -> Result<Option<UserRow>, AuthError> {
+    let row: Option<(i64, String, i16, bool)> =
+        sqlx::query_as("SELECT user_id, email, kyc_level, is_active FROM users WHERE user_id = $1")
+            .bind(user_id.value() as i64)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| AuthError::DbError(e.to_string()))?;
     Ok(row.map(|(uid, email, kyc, active)| UserRow {
         user_id: UserId::new(uid as u64),
         email,

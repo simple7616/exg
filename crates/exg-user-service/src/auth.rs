@@ -35,7 +35,7 @@ pub struct LoginResponse {
 
 /// Sign a JWT (HS256) with the given secret and claims.
 pub fn sign_jwt(secret: &[u8], claims: &JwtClaims) -> Result<String, AuthError> {
-    use jsonwebtoken::{encode, EncodingKey, Header};
+    use jsonwebtoken::{EncodingKey, Header, encode};
     encode(
         &Header::default(),
         claims,
@@ -46,17 +46,13 @@ pub fn sign_jwt(secret: &[u8], claims: &JwtClaims) -> Result<String, AuthError> 
 
 /// Verify a JWT and return its claims. Rejects expired tokens and bad signatures.
 pub fn verify_jwt(secret: &[u8], token: &str) -> Result<JwtClaims, AuthError> {
-    use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+    use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode};
     let mut validation = Validation::new(Algorithm::HS256);
     validation.validate_exp = true;
     validation.leeway = 0; // Stage 1a: no clock skew tolerance
-    decode::<JwtClaims>(
-        token,
-        &DecodingKey::from_secret(secret),
-        &validation,
-    )
-    .map(|td| td.claims)
-    .map_err(|e| AuthError::JwtError(e.to_string()))
+    decode::<JwtClaims>(token, &DecodingKey::from_secret(secret), &validation)
+        .map(|td| td.claims)
+        .map_err(|e| AuthError::JwtError(e.to_string()))
 }
 
 /// Hash a password using Argon2id with default OWASP-recommended parameters.
@@ -410,7 +406,11 @@ mod stage1a_crypto_tests {
     fn test_sign_verify_jwt_roundtrip() {
         let secret = b"32-byte-secret-for-test-padding!";
         let now = chrono::Utc::now().timestamp() as u64;
-        let claims = JwtClaims { user_id: 12345, iat: now, exp: now + 3600 };
+        let claims = JwtClaims {
+            user_id: 12345,
+            iat: now,
+            exp: now + 3600,
+        };
         let token = sign_jwt(secret, &claims).unwrap();
         let decoded = verify_jwt(secret, &token).unwrap();
         assert_eq!(decoded.user_id, 12345);
@@ -419,7 +419,11 @@ mod stage1a_crypto_tests {
     #[test]
     fn test_verify_jwt_expired_rejected() {
         let secret = b"32-byte-secret-for-test-padding!";
-        let claims = JwtClaims { user_id: 1, iat: 50, exp: 100 };
+        let claims = JwtClaims {
+            user_id: 1,
+            iat: 50,
+            exp: 100,
+        };
         let token = sign_jwt(secret, &claims).unwrap();
         assert!(verify_jwt(secret, &token).is_err());
     }
@@ -429,7 +433,11 @@ mod stage1a_crypto_tests {
         let s1 = b"32-byte-secret-for-test-padding!";
         let s2 = b"DIFFERENT-secret-equal-length-x!";
         let now = chrono::Utc::now().timestamp() as u64;
-        let claims = JwtClaims { user_id: 1, iat: now, exp: now + 3600 };
+        let claims = JwtClaims {
+            user_id: 1,
+            iat: now,
+            exp: now + 3600,
+        };
         let token = sign_jwt(s1, &claims).unwrap();
         assert!(verify_jwt(s2, &token).is_err());
     }

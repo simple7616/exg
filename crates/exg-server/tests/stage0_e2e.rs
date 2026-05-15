@@ -22,10 +22,7 @@ fn base_cfg(wal_dir: &std::path::Path) -> ExgConfig {
     cfg
 }
 
-async fn boot_server_with_pool(
-    cfg: ExgConfig,
-    pool: PgPool,
-) -> (exg_server::ServerHandle, String) {
+async fn boot_server_with_pool(cfg: ExgConfig, pool: PgPool) -> (exg_server::ServerHandle, String) {
     let handle = exg_server::run_with_config_with_pool(cfg, Some(pool))
         .await
         .expect("server boot");
@@ -414,7 +411,10 @@ async fn duplicate_client_order_id_returns_409(pool: PgPool) {
         .iter()
         .filter(|e| matches!(e, Event::OrderAccepted { .. }))
         .count();
-    assert_eq!(accepted, 1, "dedup must prevent second order; got {accepted}");
+    assert_eq!(
+        accepted, 1,
+        "dedup must prevent second order; got {accepted}"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

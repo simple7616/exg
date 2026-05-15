@@ -48,9 +48,7 @@ async fn login_time_constant_regardless_of_email_existence(pool: PgPool) {
     let unknown_median = unknown_times[SAMPLES / 2];
     let diff = known_median.abs_diff(unknown_median);
 
-    eprintln!(
-        "known median: {known_median}us, unknown median: {unknown_median}us, diff: {diff}us"
-    );
+    eprintln!("known median: {known_median}us, unknown median: {unknown_median}us, diff: {diff}us");
 
     // Argon2id is ~50ms. Spec §9 #20 requires diff < 5ms (5000us).
     // In practice we expect <500us. 5ms is the documented spec bound.

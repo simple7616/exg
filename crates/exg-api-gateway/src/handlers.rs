@@ -257,10 +257,7 @@ pub async fn login(
     Ok(HttpResponse::Ok().json(resp))
 }
 
-pub async fn me(
-    state: web::Data<AppState>,
-    req: HttpRequest,
-) -> Result<HttpResponse, ApiError> {
+pub async fn me(state: web::Data<AppState>, req: HttpRequest) -> Result<HttpResponse, ApiError> {
     let user_id = extract_user_id_from_jwt(&req, state.auth_cfg.jwt_secret.as_bytes())?;
     let row = exg_user_service::find_user_by_id(&state.pool, user_id)
         .await
@@ -298,10 +295,8 @@ mod tests {
         // simplest safe substitute.
         let rb = Box::leak(Box::new(RingBuffer::new(16, 4096).unwrap()));
         let (producer, _consumer) = rb.split();
-        let pool = PgPool::connect_lazy(
-            "postgres://exg:exg_dev_password@localhost:5433/exg",
-        )
-        .unwrap();
+        let pool =
+            PgPool::connect_lazy("postgres://exg:exg_dev_password@localhost:5433/exg").unwrap();
         AppState {
             producer: Arc::new(Mutex::new(producer)),
             snowflake: Arc::new(SnowflakeGen::new(1)),

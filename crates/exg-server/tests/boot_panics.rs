@@ -106,8 +106,7 @@ async fn boot_panics_on_short_jwt_secret() {
 async fn boot_panics_on_default_jwt_secret() {
     let tmp = TempDir::new().unwrap();
     let mut cfg = base_cfg(tmp.path());
-    cfg.auth.jwt_secret =
-        "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK".into();
+    cfg.auth.jwt_secret = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK".into();
     let result = exg_server::run_with_config(cfg).await;
     let err = result.err().expect("expected Err");
     let msg = format!("{err:#}");
