@@ -145,12 +145,22 @@ impl MatchingEngine {
                 Ok(())
             }
             Event::TradeExecuted { .. } => Ok(()),
-            Event::MarkPriceUpdate { .. } => Err(ApplyError::UnexpectedVariant {
-                variant: "MarkPriceUpdate",
-            }),
-            Event::FundingRateUpdate { .. } => Err(ApplyError::UnexpectedVariant {
-                variant: "FundingRateUpdate",
-            }),
+            Event::MarkPriceUpdate {
+                mark_price,
+                index_price,
+                ..
+            } => {
+                // Passive only — triggered OrderFilled/TradeExecuted events
+                // are separate WAL records replayed via their own arms.
+                // Re-triggering here would double-count fills (same principle
+                // as OrderAccepted not re-matching). Invariant 27.
+                self.apply_mark_index_passive(*mark_price, *index_price);
+                Ok(())
+            }
+            Event::FundingRateUpdate { funding_rate, .. } => {
+                self.set_last_funding_rate(*funding_rate);
+                Ok(())
+            }
             Event::LiquidationOrder { .. } => Err(ApplyError::UnexpectedVariant {
                 variant: "LiquidationOrder",
             }),
@@ -439,22 +449,116 @@ mod tests {
     }
 
     #[test]
-    fn apply_mark_price_update_returns_unexpected_variant() {
+    fn apply_event_mark_price_update_passive_only() {
         let mut engine = test_engine();
-        let err = engine
+        let accept = accept_event_full(
+            7,
+            OrderType::StopMarket,
+            TimeInForce::Gtc,
+            "1.0",
+            "59000",
+            None,
+            None,
+            None,
+            Some(dec("59000")),
+        );
+        engine.apply_event(&accept).unwrap();
+        engine
             .apply_event(&Event::MarkPriceUpdate {
                 symbol: SymbolId::new(1),
-                mark_price: dec("50000"),
-                index_price: dec("50000"),
+                mark_price: dec("58000"),
+                index_price: dec("58000"),
                 timestamp: ts(),
             })
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ApplyError::UnexpectedVariant {
-                variant: "MarkPriceUpdate"
-            }
-        ));
+            .unwrap();
+        assert_eq!(engine.mark_price(), dec("58000"));
+        assert_eq!(
+            engine.stop_orders_mut().len(),
+            1,
+            "stop must NOT trigger on replay"
+        );
+    }
+
+    #[test]
+    fn apply_event_funding_rate_update_sets_last_rate() {
+        let mut engine = test_engine();
+        engine
+            .apply_event(&Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.0042"),
+                timestamp: ts(),
+            })
+            .unwrap();
+        assert_eq!(engine.last_funding_rate(), dec("0.0042"));
+    }
+
+    #[test]
+    fn apply_event_mark_price_replay_preserves_trailing_peak() {
+        // Eng/CEO review C8: guards the Stage 1b silent-corruption-on-replay
+        // class for trailing peaks. STRICTLY ASCENDING marks so neither
+        // engine triggers the trailing sell — isolates peak-fidelity.
+        //
+        // accept_event_full hardcodes side = Buy; a Buy trailing stop tracks
+        // the downward trough and triggers on rising price, which would make
+        // the ascending-marks premise false. The test intent requires a SELL
+        // trailing stop (peak tracks the upward high, no trigger on rising
+        // mark), so this one OrderAccepted is built inline with Side::Sell.
+        // All other fields mirror accept_event_full(9, TrailingStop, Gtc,
+        // "1.0", "60000", None, Some(100), Some(60000), Some(59900)).
+        let accepted = Event::OrderAccepted {
+            order_id: OrderId::new(9),
+            user_id: UserId::new(42),
+            symbol: SymbolId::new(1),
+            client_order_id: None,
+            timestamp: ts(),
+            side: Side::Sell,
+            order_type: OrderType::TrailingStop,
+            time_in_force: TimeInForce::Gtc,
+            price: dec("60000"),
+            quantity: dec("1.0"),
+            stop_price: Some(dec("59900")),
+            reduce_only: false,
+            visible_quantity: None,
+            trailing_delta: Some(dec("100")),
+            trailing_peak_price: Some(dec("60000")),
+        };
+        let ascending = ["60500", "61000", "61500"];
+
+        let mut live = test_engine();
+        live.apply_event(&accepted).unwrap();
+        for px in ascending {
+            let _ = live.update_mark_price(SymbolId::new(1), dec(px), dec(px), ts());
+        }
+        assert_eq!(
+            live.stop_orders_mut().len(),
+            1,
+            "ascending marks must not trigger a trailing sell"
+        );
+        let live_peak = live.stop_orders_mut()[0].trailing_peak_price;
+
+        let mut replayed = test_engine();
+        replayed.apply_event(&accepted).unwrap();
+        for px in ascending {
+            replayed
+                .apply_event(&Event::MarkPriceUpdate {
+                    symbol: SymbolId::new(1),
+                    mark_price: dec(px),
+                    index_price: dec(px),
+                    timestamp: ts(),
+                })
+                .unwrap();
+        }
+        let replayed_peak = replayed.stop_orders_mut()[0].trailing_peak_price;
+
+        assert_eq!(
+            live_peak,
+            Some(dec("61500")),
+            "live peak should track the 61500 high"
+        );
+        assert_eq!(
+            replayed_peak, live_peak,
+            "replayed trailing_peak_price must equal live — no silent drift"
+        );
     }
 
     #[test]
@@ -622,29 +726,12 @@ mod tests {
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Eng review B13: UnexpectedVariant arms for Funding / Liquidation
+    // Stage 2 Task 5: LiquidationOrder still rejected (Stage 3+); full
+    // mark-price + funding replay round-trip.
     // ────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn apply_funding_rate_update_returns_unexpected_variant() {
-        let mut engine = test_engine();
-        let err = engine
-            .apply_event(&Event::FundingRateUpdate {
-                symbol: SymbolId::new(1),
-                funding_rate: dec("0.0001"),
-                timestamp: ts(),
-            })
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            ApplyError::UnexpectedVariant {
-                variant: "FundingRateUpdate"
-            }
-        ));
-    }
-
-    #[test]
-    fn apply_liquidation_order_returns_unexpected_variant() {
+    fn apply_event_liquidation_order_still_unexpected_variant() {
         let mut engine = test_engine();
         let err = engine
             .apply_event(&Event::LiquidationOrder {
@@ -661,5 +748,54 @@ mod tests {
                 variant: "LiquidationOrder"
             }
         ));
+    }
+
+    #[test]
+    fn replay_round_trip_with_mark_price_and_funding() {
+        use exg_protocol::Command;
+        let mut live2 = test_engine();
+        let mut all_events = Vec::new();
+        for cmd in [
+            Command::NewOrder {
+                order_id: OrderId::new(1),
+                user_id: UserId::new(42),
+                symbol: SymbolId::new(1),
+                side: Side::Buy,
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Gtc,
+                price: Some(dec("59000")),
+                quantity: dec("0.001"),
+                stop_price: None,
+                trailing_delta: None,
+                visible_quantity: None,
+                reduce_only: false,
+                margin_mode: MarginMode::Cross,
+                leverage: Some(dec("10")),
+                client_order_id: None,
+                timestamp: ts(),
+            },
+            Command::UpdateMarkPrice {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60600"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            },
+            Command::ComputeFunding {
+                symbol: SymbolId::new(1),
+                timestamp: ts(),
+            },
+        ] {
+            all_events.extend(live2.process_command(&cmd));
+        }
+        let mut replayed = test_engine();
+        for evt in &all_events {
+            replayed.apply_event(evt).unwrap();
+        }
+        assert_eq!(
+            live2.orderbook().order_count(),
+            replayed.orderbook().order_count()
+        );
+        assert_eq!(live2.mark_price(), replayed.mark_price());
+        assert_eq!(live2.last_funding_rate(), replayed.last_funding_rate());
     }
 }
