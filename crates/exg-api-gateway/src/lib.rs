@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod app_factory;
 pub mod conversion;
 pub mod error;
