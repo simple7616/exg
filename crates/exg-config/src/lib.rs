@@ -27,6 +27,12 @@ pub struct AuthConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminConfig {
+    /// Must be at least 32 bytes for admin HTTP auth. Boot validates.
+    pub admin_secret: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExgConfig {
     pub server: ServerConfig,
     pub database: DatabaseConfig,
@@ -37,6 +43,7 @@ pub struct ExgConfig {
     pub trading: TradingConfig,
     pub risk: RiskConfig,
     pub auth: AuthConfig,
+    pub admin: AdminConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,6 +219,9 @@ impl ExgConfig {
             auth: AuthConfig {
                 jwt_secret: "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK".into(),
                 jwt_expiry_secs: 86400,
+            },
+            admin: AdminConfig {
+                admin_secret: "CHANGE-ME-ADMIN-DEV-ONLY-MUST-BE-32-BYTES".into(),
             },
         }
     }

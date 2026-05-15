@@ -40,6 +40,9 @@ impact_notional = "200"
 jwt_secret = "CHANGE-ME-DEV-ONLY-MUST-BE-AT-LEAST-32-BYTES-OK"
 jwt_expiry_secs = 86400
 
+[admin]
+admin_secret = "CHANGE-ME-ADMIN-DEV-ONLY-MUST-BE-32-BYTES"
+
 # ── Symbols ─────────────────────────────────────────────────────────────────
 
 [[trading.symbols]]

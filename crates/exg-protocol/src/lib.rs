@@ -141,6 +141,16 @@ mod tests {
                 symbol: SymbolId::new(1),
                 timestamp: sample_timestamp(),
             },
+            Command::UpdateMarkPrice {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("59950"),
+                timestamp: sample_timestamp(),
+            },
+            Command::ComputeFunding {
+                symbol: SymbolId::new(1),
+                timestamp: sample_timestamp(),
+            },
         ]
     }
 

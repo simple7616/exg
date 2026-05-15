@@ -105,6 +105,8 @@ impl MatchingEngine {
                 symbol,
                 timestamp,
             } => self.handle_cancel_all(*user_id, *symbol, *timestamp),
+            // Stage 2 Task 1 placeholder — replaced with real dispatch in Task 3.
+            Command::UpdateMarkPrice { .. } | Command::ComputeFunding { .. } => Vec::new(),
         }
     }
 

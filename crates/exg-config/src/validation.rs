@@ -121,6 +121,20 @@ pub(crate) fn validate(cfg: &ExgConfig) -> Result<(), ConfigError> {
         ));
     }
 
+    // Stage 2 §6 invariant 24/25: admin secret length + placeholder check.
+    const ADMIN_SECRET_PLACEHOLDER: &str = "CHANGE-ME-ADMIN-DEV-ONLY-MUST-BE-32-BYTES";
+    if cfg.admin.admin_secret.len() < 32 {
+        return Err(ConfigError::Validation(format!(
+            "admin.admin_secret must be at least 32 bytes, got {}",
+            cfg.admin.admin_secret.len()
+        )));
+    }
+    if cfg.admin.admin_secret == ADMIN_SECRET_PLACEHOLDER {
+        return Err(ConfigError::Validation(
+            "admin.admin_secret is the placeholder default; set EXG_ADMIN_SECRET env var to a 32+ byte production secret".into(),
+        ));
+    }
+
     Ok(())
 }
 

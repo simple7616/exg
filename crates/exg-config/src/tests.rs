@@ -6,6 +6,7 @@ use super::*;
 fn test_default_config_validates() {
     let mut cfg = ExgConfig::default_config();
     cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "b".repeat(32);
     cfg.validate().expect("default config should validate");
 }
 
@@ -159,6 +160,7 @@ fn test_toml_parsing_all_types() {
 fn test_symbol_mark_price_field_parses() {
     let mut cfg = ExgConfig::default_config();
     cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "b".repeat(32);
     cfg.trading.symbols[0].mark_price = "60000".into();
     assert!(cfg.validate().is_ok());
 }
@@ -201,6 +203,7 @@ fn test_auth_jwt_secret_placeholder_rejected() {
 fn test_auth_jwt_secret_valid_32_bytes_ok() {
     let mut cfg = ExgConfig::default_config();
     cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "b".repeat(32);
     assert!(cfg.validate().is_ok());
 }
 
@@ -212,6 +215,34 @@ fn test_auth_jwt_expiry_zero_rejected() {
     let err = cfg.validate().unwrap_err();
     let msg = format!("{err}");
     assert!(msg.contains("jwt_expiry"), "msg: {msg}");
+}
+
+#[test]
+fn admin_secret_placeholder_rejected() {
+    let cfg = ExgConfig::default_config();
+    let err = cfg.validate().unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("admin.admin_secret") || msg.contains("jwt_secret"),
+        "expected admin or jwt secret rejection, got: {msg}"
+    );
+}
+
+#[test]
+fn admin_secret_too_short_rejected() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "short".into();
+    let err = cfg.validate().unwrap_err();
+    assert!(format!("{err}").contains("admin.admin_secret must be at least 32"));
+}
+
+#[test]
+fn admin_secret_valid_passes() {
+    let mut cfg = ExgConfig::default_config();
+    cfg.auth.jwt_secret = "a".repeat(32);
+    cfg.admin.admin_secret = "b".repeat(32);
+    assert!(cfg.validate().is_ok());
 }
 
 #[test]
@@ -295,6 +326,9 @@ maintenance_amount = "50"
 [auth]
 jwt_secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 jwt_expiry_secs = 86400
+
+[admin]
+admin_secret = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 "#;
     let mut f = std::fs::File::create(path).unwrap();
     f.write_all(toml.as_bytes()).unwrap();

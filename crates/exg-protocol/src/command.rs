@@ -58,4 +58,17 @@ pub enum Command {
         symbol: SymbolId,
         timestamp: UnixMicros,
     },
+    /// Stage 2: admin-injected mark/index price. Drives stop/trailing
+    /// triggering + funding premium. Produced by the admin HTTP server.
+    UpdateMarkPrice {
+        symbol: SymbolId,
+        mark_price: Decimal128,
+        index_price: Decimal128,
+        timestamp: UnixMicros,
+    },
+    /// Stage 2: admin-triggered funding rate computation.
+    ComputeFunding {
+        symbol: SymbolId,
+        timestamp: UnixMicros,
+    },
 }
