@@ -2219,6 +2219,133 @@ If `cargo fmt` needed changes during Step 4, commit them first as `style: cargo 
 
 ---
 
+## Task 9: replay triggered-conditional fill reconciliation (execution finding — P1)
+
+**Files:**
+- Modify: `crates/exg-matching-engine/src/replay.rs` (the `Event::OrderFilled` resolution path; possibly the qty-bookkeeping shared by `TradeExecuted`)
+- Test: `crates/exg-matching-engine/src/replay.rs` (`#[cfg(test)] mod tests` — new round-trip equivalence tests)
+- Re-run: `crates/exg-server/tests/stage2_e2e.rs::replay_mark_price_trigger_survives_reboot` (CEO C10 — must go green; no edit, it is the acceptance witness)
+
+### Why this task exists
+
+Task 8's CEO-C10 e2e caught a real P1 state-safety/recoverability defect: a `MarkPriceUpdate`-triggered `STOP_MARKET` (any conditional) fill makes the WAL **unreplayable** — the exchange cannot reboot after such an event. Root cause (verified in source): replay's `MarkPriceUpdate` arm is passive (invariant 27, no re-trigger), so a triggered conditional order stays in `stop_orders`; but the `Event::OrderFilled` replay arm resolves `order_id` **only** against the orderbook (`book.get_order` → `None` → `ApplyError::UnknownOrder` → boot abort). The sibling `Event::OrderCanceled` arm already has the correct `stop_orders` fallback; `OrderFilled` was never extended for it. Stage 1b never hit this because it rejected `MarkPriceUpdate` (so triggered-stop fills never reached the WAL). Spec §4.4.1 + amended invariant 27 specify the fix.
+
+### Discipline (read before coding)
+
+This is a **state-safety fix** (CLAUDE.md §2 priority #1). Correctness is defined by **live↔replay state equivalence**, NOT by prose or assumption. The exact multi-fill / partial-fill / leftover semantics MUST be derived from the live engine via TDD round-trip tests, not guessed. Replay stays **matcher-free** (invariant 27 preserved): fill quantities come entirely from WAL events; the fix only reconciles *where* the order lives (stop_orders vs orderbook), performing the deterministic, matcher-free analogue of the live `trigger_and_match_stops` promotion.
+
+- [ ] **Step 1: Read the live trigger + fill emission precisely**
+
+```bash
+sed -n '/fn trigger_and_match_stops/,/^    }/p' crates/exg-matching-engine/src/engine.rs
+sed -n '/fn emit_fill_events/,/^    }/p' crates/exg-matching-engine/src/engine.rs
+sed -n '/fn check_stop_triggers_internal/,/^    }/p' crates/exg-matching-engine/src/engine.rs
+```
+Confirm: conditional `OrderAccepted` → `stop_orders` (replay.rs ~92); trigger `swap_remove`s from `stop_orders`; type conversion `StopMarket|TakeProfitMarket|TrailingStop → Market` (price `Decimal128::MAX` for Buy / `ZERO` for Sell), `StopLimit|TakeProfitLimit → Limit`; live reinserts leftover **only if** `!remaining_qty.is_zero() && order_type.is_limit()` (Market leftover dropped, never rests). `emit_fill_events` pushes per-fill: maker `OrderFilled` (maker is orderbook-resident → existing arm), taker `OrderFilled` (the conditional's id — the gap), `TradeExecuted` (replay currently `Ok(())` no-op). Note the taker `OrderFilled.remaining_qty` value source (it is `taker.remaining_qty` post-match — observe its exact multi-fill behavior empirically; do not assume).
+
+- [ ] **Step 2: Write failing round-trip equivalence tests (TDD red)**
+
+In `replay.rs` `#[cfg(test)] mod tests`, add tests following the existing `replay_round_trip_with_mark_price_and_funding` pattern (build a live `test_engine()`, run a `Command` stream via `process_command`, collect **all** emitted events, replay them into a fresh `test_engine()` via `apply_event`, then assert FULL state equivalence). Add a helper:
+
+```rust
+    fn assert_live_replay_equivalent(commands: &[exg_protocol::Command]) {
+        let mut live = test_engine();
+        let mut all_events = Vec::new();
+        for c in commands {
+            all_events.extend(live.process_command(c));
+        }
+        let mut replayed = test_engine();
+        for e in &all_events {
+            replayed.apply_event(e).unwrap_or_else(|err| panic!("replay failed on {e:?}: {err:?}"));
+        }
+        assert_eq!(live.orderbook().order_count(), replayed.orderbook().order_count(), "order_count");
+        assert_eq!(live.stop_order_count(), replayed.stop_order_count(), "stop_order_count");
+        assert_eq!(live.mark_price(), replayed.mark_price(), "mark_price");
+        assert_eq!(live.last_funding_rate(), replayed.last_funding_rate(), "last_funding_rate");
+        // Per-order remaining-qty equivalence for every resting order id seen live.
+        for id in live.orderbook().order_ids() {
+            let l = live.orderbook().get_order(id).map(|o| o.remaining_qty);
+            let r = replayed.orderbook().get_order(id).map(|o| o.remaining_qty);
+            assert_eq!(l, r, "remaining_qty mismatch for order {id:?}");
+        }
+    }
+```
+(If `orderbook().order_ids()` / `stop_order_count()` accessors do not exist, add the minimal `#[doc(hidden)] pub` accessor(s) on the engine/orderbook the same way Stage 1b added `orderbook_mut` — grep first; reuse existing ones if present, e.g. `stop_orders_mut().len()`.)
+
+Add at minimum these scenarios as distinct `#[test]` fns calling the helper (each builds the `Command` vec: a resting counterparty `NewOrder` limit + a conditional `NewOrder` + `UpdateMarkPrice` that crosses the stop [+ more marks / makers per scenario]):
+1. `replay_equiv_stop_market_single_maker_full_fill`
+2. `replay_equiv_stop_market_sweeps_two_makers` (two resting limits at different prices; triggered StopMarket qty spans both)
+3. `replay_equiv_stop_limit_partial_then_rests_then_fills` (StopLimit triggers, partially fills, remainder rests as Limit, a later `NewOrder` crosses and fills the remainder)
+4. `replay_equiv_stop_market_insufficient_liquidity_partial` (resting qty < stop qty → partial fill, Market leftover dropped — live order gone)
+5. `replay_equiv_trailing_stop_triggered`
+
+Run `cargo test -p exg-matching-engine --lib replay_equiv 2>&1 | tail` — expect RED: at least scenario 1/2/4 panic with `replay failed ... UnknownOrder` (the P1), scenario 3 likely `UnknownOrder` or state mismatch.
+
+- [ ] **Step 3: Implement the reconciliation (green) — matcher-free**
+
+In `replay.rs`, extend the fill-resolution path so that when `order_id` is **not** in the orderbook, it is looked up in `stop_orders` (mirror the existing `OrderCanceled` arm's fallback structure, replay.rs ~108-119). On finding the triggered conditional in `stop_orders`:
+- Remove it from `stop_orders`.
+- Apply the **exact** conditional→type conversion from `trigger_and_match_stops` (`StopMarket|TakeProfitMarket|TrailingStop → Market`, price `Decimal128::MAX`(Buy)/`ZERO`(Sell); `StopLimit|TakeProfitLimit → Limit`).
+- Reconcile the fill so replayed state equals live: drive the order's `remaining_qty` from the WAL `OrderFilled`; a fully-filled order OR a `Market`-converted order with leftover ends **removed** (Market never rests — leftover dropped, mirroring `!is_limit()` non-reinsert); a `Limit`-converted order with `remaining_qty > 0` ends **resting in the orderbook** with the correct remaining qty so subsequent `OrderFilled`/`OrderCanceled` for that id resolve via the normal orderbook path.
+
+Derive the precise handling of multi-`OrderFilled` sequences (Step 1's observed taker `remaining_qty` behavior) and the promote-once vs per-fill question **from making the Step 2 tests pass** — the tests are the spec. Do NOT run the matcher; do NOT re-evaluate triggers. Keep the change localized to the resolution/bookkeeping; do not alter the passive `MarkPriceUpdate` arm.
+
+If the existing orderbook-only `OrderFilled` arm also mishandles the normal multi-maker-sweep taker (it may surface while writing scenario 2), fix it consistently within this task and note it — but only as needed to achieve round-trip equivalence; no unrelated refactor.
+
+- [ ] **Step 4: Verify green + full regression**
+
+```bash
+docker compose up -d postgres
+sleep 3
+cargo test -p exg-matching-engine --lib 2>&1 | grep "test result" | tail
+cargo clippy --workspace -- -D warnings 2>&1 | tail -3
+cargo fmt --check 2>&1 | tail -3
+DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo test -p exg-server --test stage2_e2e 2>&1 | grep -E "test result|FAILED" | tail
+DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo test -p exg-server --test stage1b_e2e --test stage1a_e2e --test stage0_e2e --test boot_panics 2>&1 | grep -E "test result|FAILED" | tail
+DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo test --workspace 2>&1 | grep -E "test result:|FAILED|error\[" | tail -30
+```
+Expected: exg-matching-engine `--lib` = 70 + the new replay_equiv tests, all green; **`stage2_e2e` 11/11 — `replay_mark_price_trigger_survives_reboot` now passes** (the C10 witness); regression stage0 7/7, stage1a 12/12, stage1b 16/16, boot_panics 11/11; full `cargo test --workspace` green; clippy/fmt clean. Then run `bash scripts/demo-stage2.sh 2>&1 | tail -30` — boot 2 must now replay cleanly (health 200) and wal-dump must show MarkPriceUpdate + OrderFilled + FundingRateUpdate.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add crates/exg-matching-engine/src/replay.rs
+# include engine/orderbook if a #[doc(hidden)] accessor was added:
+# git add crates/exg-matching-engine/src/engine.rs crates/exg-matching-engine/src/orderbook.rs
+git commit -m "$(cat <<'EOF'
+fix(matching-engine): replay reconciles triggered-conditional fills (P1)
+
+CEO-C10 e2e caught a P1 recoverability defect: a MarkPriceUpdate-
+triggered conditional (STOP_MARKET etc.) fill made the WAL unreplayable
+— replay's MarkPriceUpdate arm is passive (invariant 27) so the
+triggered order stays in stop_orders, but the OrderFilled arm resolved
+order_id only against the orderbook -> UnknownOrder -> boot abort. The
+OrderCanceled arm already had the stop_orders fallback; OrderFilled did
+not. Stage 1b never hit this (it rejected MarkPriceUpdate).
+
+Fix (matcher-free, invariant 27 preserved): OrderFilled resolution falls
+back to stop_orders, performs the deterministic analogue of the live
+trigger (remove from stop_orders, conditional->Market/Limit conversion),
+and drives replayed state to live-equivalent — Market leftover dropped
+(never rests), Limit leftover rests with correct remaining. Fill
+quantities come entirely from WAL events; no matcher, no re-trigger.
+
+Correctness pinned by live<->replay round-trip equivalence tests:
+StopMarket single/sweep/insufficient-liquidity, StopLimit
+partial-then-rests-then-fills, TrailingStop. stage2_e2e C10
+(replay_mark_price_trigger_survives_reboot) now green. Event enum
+unchanged — Stage 1b WALs still replay (spec §4.2/§4.4.1, inv 27).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+### Self-review
+Re-read diff: fallback mirrors `OrderCanceled` structure; conversion matches `trigger_and_match_stops` exactly; Market-leftover dropped vs Limit-leftover rests matches live `!is_limit()` reinsert rule; NO matcher call / NO trigger re-eval in replay; passive `MarkPriceUpdate` arm untouched; ≥5 round-trip scenarios genuinely red→green; C10 e2e green; full workspace + regression green; clippy/fmt clean; `Event` enum unchanged.
+
+---
+
 ## Spec ↔ Plan Coverage Matrix
 
 | Spec section | Task |
