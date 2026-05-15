@@ -30,6 +30,15 @@ pub struct MatchingEngine {
     interest_rate: Decimal128,
     /// Stage 2: last computed funding rate. ZERO until first ComputeFunding.
     last_funding_rate: Decimal128,
+    /// Replay-only (Task 9): order ids observed during the current WAL replay
+    /// (via OrderAccepted or triggered-conditional promotion). Lets the
+    /// OrderFilled resolver distinguish a legitimate terminal duplicate taker
+    /// leg of a multi-fill sweep (constant FINAL remaining_qty — id was live
+    /// earlier this replay, now removed: benign no-op) from a genuinely
+    /// corrupt WAL referencing a never-accepted id (must still fail-fast →
+    /// boot abort). NOT engine state: untouched by process_command, excluded
+    /// from snapshots, transient to a replay session.
+    replay_seen_order_ids: rustc_hash::FxHashSet<OrderId>,
 }
 
 impl MatchingEngine {
@@ -46,6 +55,7 @@ impl MatchingEngine {
             sequence: 0,
             interest_rate,
             last_funding_rate: Decimal128::ZERO,
+            replay_seen_order_ids: rustc_hash::FxHashSet::default(),
         }
     }
 
@@ -1092,6 +1102,14 @@ impl MatchingEngine {
     #[doc(hidden)]
     pub fn orderbook_mut(&mut self) -> &mut OrderBook {
         &mut self.orderbook
+    }
+
+    /// Replay-only (Task 9): mutable access to the set of order ids observed
+    /// so far during the current WAL replay. Used by `apply_event` to tell a
+    /// legitimate terminal duplicate taker leg from a corrupt orphan fill.
+    #[doc(hidden)]
+    pub fn replay_seen_order_ids_mut(&mut self) -> &mut rustc_hash::FxHashSet<OrderId> {
+        &mut self.replay_seen_order_ids
     }
 
     /// Mutable stop-orders access — replay-only.
