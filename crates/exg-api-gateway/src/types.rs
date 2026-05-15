@@ -21,7 +21,10 @@ pub struct PlaceOrderRequest {
 pub struct PlaceOrderResponse {
     /// Stringified u64 per Binance convention (avoids JS 53-bit precision loss).
     pub order_id: String,
-    pub client_order_id: Option<u64>,
+    /// Echoed back from the request (Binance-compatible). Stringified to keep
+    /// the wire shape symmetric with the request and avoid JS 53-bit precision
+    /// loss if a client submits a u64 near 2^53.
+    pub client_order_id: Option<String>,
     pub status: &'static str,
 }
 

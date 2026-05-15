@@ -141,7 +141,7 @@ pub async fn place_order(
 
     let resp = PlaceOrderResponse {
         order_id: order_id.value().to_string(),
-        client_order_id: None,
+        client_order_id: body.client_order_id.clone(),
         status: "ACCEPTED",
     };
     info!(

@@ -80,6 +80,12 @@ async fn register_login_order_happy(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["status"], "ACCEPTED");
+    assert_eq!(
+        body["clientOrderId"], "100001",
+        "submitted clientOrderId must be echoed back: {body}"
+    );
 
     handle.shutdown().await.unwrap();
 }
