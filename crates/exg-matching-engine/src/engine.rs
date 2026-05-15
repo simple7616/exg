@@ -26,10 +26,16 @@ pub struct MatchingEngine {
     trade_id_gen: SnowflakeGen,
     /// Sequence counter for WAL ordering.
     sequence: u64,
+    /// Stage 2: clamp interest rate for funding (from cfg.risk.interest_rate).
+    #[allow(dead_code)] // Task 2: stored; consumed in Task 3
+    interest_rate: Decimal128,
+    /// Stage 2: last computed funding rate. ZERO until first ComputeFunding.
+    #[allow(dead_code)] // Task 2: stored; consumed in Task 3
+    last_funding_rate: Decimal128,
 }
 
 impl MatchingEngine {
-    pub fn new(symbol_config: SymbolConfig, node_id: u16) -> Self {
+    pub fn new(symbol_config: SymbolConfig, node_id: u16, interest_rate: Decimal128) -> Self {
         let symbol = symbol_config.symbol;
         Self {
             orderbook: OrderBook::new(symbol),
@@ -40,6 +46,8 @@ impl MatchingEngine {
             expiry_heap: BinaryHeap::new(),
             trade_id_gen: SnowflakeGen::new(node_id),
             sequence: 0,
+            interest_rate,
+            last_funding_rate: Decimal128::ZERO,
         }
     }
 
@@ -998,8 +1006,9 @@ impl MatchingEngine {
         snapshot: EngineSnapshot,
         config: SymbolConfig,
         node_id: u16,
+        interest_rate: Decimal128,
     ) -> Self {
-        let mut engine = Self::new(config, node_id);
+        let mut engine = Self::new(config, node_id, interest_rate);
         engine.mark_price = snapshot.mark_price;
         engine.index_price = snapshot.index_price;
         engine.sequence = snapshot.sequence;
@@ -1193,7 +1202,7 @@ mod tests {
     // 18. NewOrder → OrderAccepted + fills
     #[test]
     fn test_new_order_accepted_with_fills() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Place a resting sell
         let sell = new_order_cmd(
@@ -1232,7 +1241,7 @@ mod tests {
     // 19. NewOrder rejected (invalid qty)
     #[test]
     fn test_new_order_rejected_invalid() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1251,7 +1260,7 @@ mod tests {
     // 20. CancelOrder → OrderCanceled
     #[test]
     fn test_cancel_order() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1277,7 +1286,7 @@ mod tests {
     // 21. CancelOrder on unknown order → rejected
     #[test]
     fn test_cancel_unknown_order() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cancel = Command::CancelOrder {
             order_id: OrderId::new(999),
             user_id: UserId::new(10),
@@ -1296,7 +1305,7 @@ mod tests {
     // 22. AmendOrder price change → cancel + re-insert
     #[test]
     fn test_amend_order_price_change() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1329,7 +1338,7 @@ mod tests {
     // 23. AmendOrder qty down → in-place modify
     #[test]
     fn test_amend_order_qty_down() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1363,7 +1372,7 @@ mod tests {
     // 24. CancelAllOrders → multiple cancels
     #[test]
     fn test_cancel_all_orders() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1409,7 +1418,7 @@ mod tests {
     // 25. Stop order: set stop, update mark price past trigger → order activated and matched
     #[test]
     fn test_stop_order_trigger() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Place a resting ask
         engine.process_command(&new_order_cmd(
@@ -1452,7 +1461,7 @@ mod tests {
     // 26. Trailing stop: update mark price → peak tracked, reversal triggers
     #[test]
     fn test_trailing_stop() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Set initial mark price
         engine.update_mark_price(dec("50000"), dec("50000"));
@@ -1503,7 +1512,7 @@ mod tests {
     // 27. GTD expiration
     #[test]
     fn test_gtd_expiration() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Create GTD order — expire_time is automatically set to timestamp + 24h
         let cmd = new_order_cmd(
@@ -1533,7 +1542,7 @@ mod tests {
     // 28. Snapshot take + restore
     #[test]
     fn test_snapshot_restore() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
 
         // Place some orders
         engine.process_command(&new_order_cmd(
@@ -1575,7 +1584,7 @@ mod tests {
         let snapshot = engine.take_snapshot();
 
         // Restore
-        let restored = MatchingEngine::restore_from_snapshot(snapshot, test_config(), 1);
+        let restored = MatchingEngine::restore_from_snapshot(snapshot, test_config(), 1, dec("0.0001"));
 
         assert_eq!(restored.orderbook().order_count(), 2);
         assert_eq!(restored.stop_order_count(), 1);
@@ -1587,7 +1596,7 @@ mod tests {
     // Snapshot serde roundtrip
     #[test]
     fn test_snapshot_serde_roundtrip() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1610,7 +1619,7 @@ mod tests {
     // Duplicate order rejection
     #[test]
     fn test_duplicate_order_rejected() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1642,7 +1651,7 @@ mod tests {
     // Post-only rejection via engine
     #[test]
     fn test_post_only_rejection_via_engine() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1674,7 +1683,7 @@ mod tests {
     // FOK rejection via engine
     #[test]
     fn test_fok_rejection_via_engine() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1708,7 +1717,7 @@ mod tests {
     // IOC partial fill with cancel via engine
     #[test]
     fn test_ioc_partial_fill_via_engine() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         engine.process_command(&new_order_cmd(
             1,
             10,
@@ -1745,7 +1754,7 @@ mod tests {
     // Market order with no depth
     #[test]
     fn test_market_order_no_depth() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let market = new_order_cmd(
             1,
             10,
@@ -1764,7 +1773,7 @@ mod tests {
     // Limit order with no price → rejected
     #[test]
     fn test_limit_order_no_price() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         let cmd = new_order_cmd(
             1,
             10,
@@ -1780,7 +1789,7 @@ mod tests {
 
     #[test]
     fn set_mark_price_updates_internal_state() {
-        let mut engine = MatchingEngine::new(test_config(), 1);
+        let mut engine = MatchingEngine::new(test_config(), 1, dec("0.0001"));
         assert_eq!(engine.mark_price(), Decimal128::ZERO);
         engine.set_mark_price(dec("60000"));
         assert_eq!(engine.mark_price(), dec("60000"));

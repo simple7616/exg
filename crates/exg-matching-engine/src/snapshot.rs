@@ -30,9 +30,10 @@ impl crate::engine::MatchingEngine {
         data: &[u8],
         config: exg_risk_engine::SymbolConfig,
         node_id: u16,
+        interest_rate: Decimal128,
     ) -> Self {
         let snapshot: EngineSnapshot =
             serde_json::from_slice(data).expect("snapshot deserialization failed");
-        Self::restore_from_snapshot(snapshot, config, node_id)
+        Self::restore_from_snapshot(snapshot, config, node_id, interest_rate)
     }
 }

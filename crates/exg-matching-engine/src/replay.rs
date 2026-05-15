@@ -192,7 +192,7 @@ mod tests {
                 maintenance_amount: dec("0"),
             }],
         };
-        MatchingEngine::new(cfg, 1)
+        MatchingEngine::new(cfg, 1, dec("0.0001"))
     }
 
     fn accept_event(order_id: u64, qty: &str, price: &str) -> Event {
