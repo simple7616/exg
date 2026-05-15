@@ -256,6 +256,20 @@ impl MatchingEngine {
                 symbol,
                 client_order_id,
                 timestamp,
+                side,
+                order_type,
+                time_in_force,
+                price: effective_price,
+                quantity,
+                stop_price,
+                reduce_only,
+                visible_quantity,
+                trailing_delta,
+                trailing_peak_price: if trailing_delta.is_some() {
+                    Some(self.mark_price)
+                } else {
+                    None
+                },
             });
             self.stop_orders.push(book_order);
             return events;
@@ -268,6 +282,20 @@ impl MatchingEngine {
             symbol,
             client_order_id,
             timestamp,
+            side,
+            order_type,
+            time_in_force,
+            price: effective_price,
+            quantity,
+            stop_price,
+            reduce_only,
+            visible_quantity,
+            trailing_delta,
+            trailing_peak_price: if trailing_delta.is_some() {
+                Some(self.mark_price)
+            } else {
+                None
+            },
         });
 
         // Match against the book
@@ -576,6 +604,16 @@ impl MatchingEngine {
                 symbol,
                 client_order_id: amended.client_order_id,
                 timestamp,
+                side: amended.side,
+                order_type: amended.order_type,
+                time_in_force: amended.time_in_force,
+                price: amended.price,
+                quantity: amended.original_qty,
+                stop_price: amended.stop_price,
+                reduce_only: amended.is_reduce_only,
+                visible_quantity: amended.visible_qty,
+                trailing_delta: amended.trailing_delta,
+                trailing_peak_price: amended.trailing_peak_price,
             });
 
             // Emit fill events
@@ -606,16 +644,26 @@ impl MatchingEngine {
             }
             self.orderbook.update_qty(order_id, new_q);
 
-            vec![Event::OrderAccepted {
-                order_id,
-                user_id,
-                symbol,
-                client_order_id: self
-                    .orderbook
-                    .get_order(order_id)
-                    .and_then(|o| o.client_order_id),
-                timestamp,
-            }]
+            {
+                let updated = self.orderbook.get_order(order_id).unwrap();
+                vec![Event::OrderAccepted {
+                    order_id,
+                    user_id,
+                    symbol,
+                    client_order_id: updated.client_order_id,
+                    timestamp,
+                    side: updated.side,
+                    order_type: updated.order_type,
+                    time_in_force: updated.time_in_force,
+                    price: updated.price,
+                    quantity: updated.original_qty,
+                    stop_price: updated.stop_price,
+                    reduce_only: updated.is_reduce_only,
+                    visible_quantity: updated.visible_qty,
+                    trailing_delta: updated.trailing_delta,
+                    trailing_peak_price: updated.trailing_peak_price,
+                }]
+            }
         } else {
             // No meaningful change
             vec![Event::OrderAccepted {
@@ -624,6 +672,16 @@ impl MatchingEngine {
                 symbol,
                 client_order_id: existing.client_order_id,
                 timestamp,
+                side: existing.side,
+                order_type: existing.order_type,
+                time_in_force: existing.time_in_force,
+                price: existing.price,
+                quantity: existing.original_qty,
+                stop_price: existing.stop_price,
+                reduce_only: existing.is_reduce_only,
+                visible_quantity: existing.visible_qty,
+                trailing_delta: existing.trailing_delta,
+                trailing_peak_price: existing.trailing_peak_price,
             }]
         }
     }
