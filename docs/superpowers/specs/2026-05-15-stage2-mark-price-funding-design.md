@@ -203,8 +203,8 @@ pub struct AdminConfig { pub admin_secret: String }
 ### 4.7 Admin module (exg-api-gateway/src/admin.rs)
 
 - `X-Admin-Secret` middleware: extract header, **constant-time compare** against `cfg.admin.admin_secret` (use the same constant-time discipline as Stage 1a login — avoid a timing oracle on the secret). Missing/mismatch → `ApiError::unauthorized` (401 / -1002).
-- `admin_mark_price(state, body: AdminMarkPriceRequest)`: parse `markPrice` / `indexPrice` as `Decimal128`; reject `indexPrice <= 0` with 400 / -1100 (prevents div-by-zero in `compute_funding`); build `Command::UpdateMarkPrice`; push to `state.producer`; 200 `{status:"ACCEPTED"}`.
-- `admin_funding_tick(state)`: no body; symbol = `cfg.trading.symbols[0].id`; build `Command::ComputeFunding`; push; 200.
+- `admin_mark_price(state, body: AdminMarkPriceRequest)`: parse `markPrice` / `indexPrice` as `Decimal128`; reject `indexPrice <= 0` AND `markPrice <= 0` with 400 / -1100 (indexPrice guard prevents `compute_funding` div-by-zero; markPrice guard — CEO review C5 — prevents a negative mark price mass-triggering every positive-stop sell order); build `Command::UpdateMarkPrice`; push to `state.producer`; emit a `tracing::info!(target: "admin", mark_price, index_price, "mark price injected")` audit line (CEO review C6); 200 `{status:"ACCEPTED"}`.
+- `admin_funding_tick(state)`: no body; symbol = `cfg.trading.symbols[0].id`; build `Command::ComputeFunding`; emit a `tracing::info!(target: "admin", "funding tick")` audit line (CEO review C6); push; 200.
 - `AdminMarkPriceRequest { mark_price: String, index_price: String }` (camelCase serde rename, stringified decimals — consistent with Stage 1a request shapes).
 
 ### 4.8 Boot lifecycle (exg-server/src/lib.rs)
@@ -222,6 +222,7 @@ POST /admin/mark-price
   ├─ X-Admin-Secret missing/wrong ──► 401  ERR_UNAUTHORIZED (-1002)
   ├─ markPrice/indexPrice not Decimal128 ──► 400  ERR_INVALID_PARAMETER (-1100)
   ├─ indexPrice <= 0 ──► 400  ERR_INVALID_PARAMETER (-1100)  (funding div-by-zero guard)
+  ├─ markPrice <= 0 ──► 400  ERR_INVALID_PARAMETER (-1100)  (mass stop-trigger guard, C5)
   ├─ ring buffer full ──► 429  ERR_TOO_MANY_REQUESTS (-1015)
   └─ ok ──► 200 {status:"ACCEPTED"}
 
@@ -260,6 +261,8 @@ New in Stage 2:
 - **#26** Admin endpoints reject missing/wrong `X-Admin-Secret` (constant-time compare) before producing any `Command`.
 - **#27** `apply_event(MarkPriceUpdate)` is passive-only during replay — it never re-triggers stop/take-profit/trailing orders nor invokes the matcher. The triggered fills are independent WAL `OrderFilled` events.
 - **#28** `compute_funding` never divides by zero — `index_price == 0` yields `premium = ZERO` (the live admin path also rejects `indexPrice <= 0` at 400 before the command is produced; #28 is the defense-in-depth engine-level guard).
+- **#29** (CEO review C5) The admin mark-price endpoint rejects `markPrice <= 0` at 400 before producing a `Command::UpdateMarkPrice`. A non-positive mark price would make `mark <= stop_price` true for every positive-stop sell order, mass-triggering them. Symmetric with the `indexPrice <= 0` guard.
+- **#30** (CEO review C6) Every accepted admin command emits a `tracing::info!(target: "admin", ...)` audit line before enqueue, so operators can reconstruct who moved the mark price / triggered funding and when, without `wal-dump`.
 
 ## 7. Testing
 
@@ -276,6 +279,7 @@ New in Stage 2:
 9. `snapshot_round_trips_last_funding_rate`
 10. `replay_round_trip_with_mark_price_and_funding` — live engine (place stop, update mark to trigger, compute funding) vs replayed engine from the emitted event stream → identical orderbook + last_funding_rate
 11. `apply_event_liquidation_order_still_unexpected_variant` — Stage 3 boundary intact
+12. (CEO review C8) `apply_event_mark_price_replay_preserves_trailing_peak` — accept a TrailingStop with a known `trailing_peak_price`, replay a sequence of `MarkPriceUpdate` events that advance the peak, assert the replayed order's `trailing_peak_price` equals the live engine's after the same `update_mark_price` sequence. Guards the Stage 1b B5/B6 silent-corruption-on-replay class for trailing peaks.
 
 ### 7.2 Integration (exg-server/tests/stage2_e2e.rs, `#[sqlx::test]`)
 
@@ -288,7 +292,8 @@ New in Stage 2:
 7. `user_route_not_on_admin_port` — `POST :9090/api/v1/order` → 404
 8. `admin_mark_price_bad_decimal_returns_400`
 9. `admin_mark_price_zero_index_returns_400`
-10. `replay_mark_price_trigger_survives_reboot` — inject mark that triggers a stop → kill → reboot → WAL replay → orderbook state correct (stop consumed once, not double-triggered), `last_funding_rate` restored
+10. `replay_mark_price_trigger_survives_reboot` — inject mark that triggers a stop → kill → reboot → WAL replay. **Observable assertion (CEO review C10)**: record boot-1 WAL record count; after reboot (no new injects), scan the WAL and assert (a) the triggered stop's `OrderFilled` appears within the boot-1 record range, and (b) no NEW `OrderFilled` for that order_id was appended during boot-2 — proving replay did NOT re-trigger the stop. Not just "boot 2 didn't panic" (the weak proxy Stage 1b A4 rejected).
+11. (CEO review C5) `admin_mark_price_negative_or_zero_mark_returns_400` — `markPrice: "0"` and `markPrice: "-1"` each → 400 / -1100; no `Command::UpdateMarkPrice` produced.
 
 ### 7.3 Boot panics (exg-server/tests/boot_panics.rs)
 
@@ -310,9 +315,20 @@ PR passes when:
 2. `cargo clippy --workspace -- -D warnings` clean
 3. `cargo fmt --check` clean
 4. `cargo test --workspace` all green
-5. New: stage2_e2e 10/10, engine/replay Stage 2 unit ~11/11
+5. New: stage2_e2e 11/11, engine/replay Stage 2 unit 12/12 (CEO review C5 added 1 e2e, C8 added 1 unit)
 6. Regression: stage0_e2e 7/7, stage1a_e2e 12/12, stage1b_e2e 16/16, boot_panics 9/9 (was 7, +2)
 7. New `scripts/demo-stage2.sh`: docker-compose postgres → migrate reset → boot → register/login → place stop order → admin inject mark price crossing stop → wal-dump shows OrderFilled → admin funding-tick → wal-dump shows FundingRateUpdate → ^C → reboot → server logs `WAL replay complete` with the mark-price + funding events counted → health check 200.
+
+## 8.5 Rollback to Stage 1b (CEO review C3)
+
+Rolling back Stage 2 is asymmetric with reading old WAL forward. Stage 2's `Event` enum is unchanged, so a Stage 2 binary replays a Stage 1b-era WAL fine. The reverse does NOT hold: Stage 1b's `apply_event` rejects `MarkPriceUpdate` / `FundingRateUpdate` with `ApplyError::UnexpectedVariant` → boot panic. So once Stage 2 has written any `MarkPriceUpdate` or `FundingRateUpdate` event to the WAL, reverting to Stage 1b code requires:
+
+1. Stop the Stage 2 server (clean shutdown — both HTTP servers drain, matching thread joins).
+2. `git revert <merge-commit>` to put Stage 1b code back.
+3. `rm -rf data/wal` — Stage 1b cannot replay Stage 2 events. **All open orders are lost**; acceptable in dev (no production data).
+4. Restart.
+
+Symmetric to Stage 1b spec §9.6. A production-grade rollback (forward-compatible `apply_event` that skips unknown variants for one major version) is out of scope until Stage 5+; tracked in the forward pointers below.
 
 ## 9. Forward pointers (Stage 3+)
 
@@ -322,6 +338,8 @@ PR passes when:
 - **TWAP + impact-depth premium index**: `cfg.risk.impact_notional`-based impact-bid/ask premium replacing instantaneous `(mark-index)/index`.
 - **Multi-symbol mark price**: per-symbol price feeds when the single-symbol invariant (Stage 0 #1) is lifted.
 - **Admin auth hardening**: shared-secret → mTLS / signed requests / per-operator audit log when admin surface grows.
+- **Mark-price-triggered stop cascade is unbounded** (CEO review C2): one admin mark-price inject that crosses N resting stop orders triggers O(N) stop matches synchronously on the matching thread, all WAL-appended in one batch. Negligible at Stage 2 dev scale (few stops); a flash-crash-magnitude inject at production scale needs a circuit breaker / batched-trigger throttle. The single-symbol, admin-only, loopback constraints keep this benign until external feeds + multi-symbol land.
+- **Forward-compatible replay for rollback** (CEO review C3): an `apply_event` that skips (rather than panics on) unknown event variants for one major version would make Stage N→N-1 rollback not require a WAL wipe. Defer until production traffic makes WAL preservation across rollback mandatory.
 
 ---
 

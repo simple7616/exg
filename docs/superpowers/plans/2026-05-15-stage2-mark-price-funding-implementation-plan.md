@@ -65,7 +65,7 @@ Workspace total target: current ~468 + ~23 ≈ ~491.
 | 5 | replay.rs apply_event MarkPriceUpdate + FundingRateUpdate | replay.rs | ~4 unit |
 | 6 | admin module (middleware + handlers + build_admin_app) | admin.rs (NEW), types.rs, api-gateway lib.rs, Cargo.toml, workspace Cargo.toml | 0 new (covered in T8) |
 | 7 | server: invariants 24/25 + interest_rate threading + 2nd HttpServer + dual shutdown | server lib.rs | 0 new (covered in T8) |
-| 8 | stage2_e2e (10) + boot_panics (2) + demo + final acceptance | stage2_e2e.rs (NEW), boot_panics.rs, demo-stage2.sh (NEW) | 10 e2e + 2 boot |
+| 8 | stage2_e2e (11) + boot_panics (2) + demo + final acceptance | stage2_e2e.rs (NEW), boot_panics.rs, demo-stage2.sh (NEW) | 11 e2e + 2 boot |
 
 Strict execution order — each task depends on the previous. T1→T2 (config/command before engine), T2→T3 (signature cascade green before logic), T3→T4→T5 (engine logic before snapshot/replay), T6 independent of T2-5 but T7 depends on T1+T3+T6, T8 last.
 
@@ -866,6 +866,74 @@ In the replay.rs `#[cfg(test)] mod tests`, add:
     }
 
     #[test]
+    fn apply_event_mark_price_replay_preserves_trailing_peak() {
+        // CEO review C8: guards the Stage 1b B5/B6 silent-corruption-on-replay
+        // class for trailing peaks. A trailing-stop's peak must end up
+        // identical whether the engine processed the mark sequence live
+        // (update_mark_price) or replayed it (apply_event passive half).
+        //
+        // Use a STRICTLY ASCENDING mark sequence so neither engine triggers
+        // the trailing stop (a trailing-sell triggers only on a downward
+        // reversal past peak - delta). This isolates the peak-fidelity
+        // property; the non-trigger-on-replay property is already covered by
+        // apply_event_mark_price_update_passive_only.
+
+        // accept_event_full(order_id, type, tif, qty, price, visible,
+        //                    trailing_delta, trailing_peak_price, stop_price)
+        let accepted = accept_event_full(
+            9,
+            OrderType::TrailingStop,
+            TimeInForce::Gtc,
+            "1.0",
+            "60000",
+            None,
+            Some(dec("100")),    // trailing_delta
+            Some(dec("60000")),  // initial trailing_peak_price (= mark at accept)
+            Some(dec("59900")),  // stop_price
+        );
+        let ascending = ["60500", "61000", "61500"];
+
+        // LIVE engine: full update_mark_price path advances the peak each step.
+        let mut live = test_engine();
+        live.apply_event(&accepted).unwrap();
+        for px in ascending {
+            let _ = live.update_mark_price(SymbolId::new(1), dec(px), dec(px), ts());
+        }
+        assert_eq!(
+            live.stop_orders_mut().len(),
+            1,
+            "ascending marks must not trigger a trailing sell"
+        );
+        let live_peak = live.stop_orders_mut()[0].trailing_peak_price;
+
+        // REPLAYED engine: same OrderAccepted, same marks as MarkPriceUpdate
+        // events through the passive replay half.
+        let mut replayed = test_engine();
+        replayed.apply_event(&accepted).unwrap();
+        for px in ascending {
+            replayed
+                .apply_event(&Event::MarkPriceUpdate {
+                    symbol: SymbolId::new(1),
+                    mark_price: dec(px),
+                    index_price: dec(px),
+                    timestamp: ts(),
+                })
+                .unwrap();
+        }
+        let replayed_peak = replayed.stop_orders_mut()[0].trailing_peak_price;
+
+        assert_eq!(
+            live_peak,
+            Some(dec("61500")),
+            "live peak should track the 61500 high"
+        );
+        assert_eq!(
+            replayed_peak, live_peak,
+            "replayed trailing_peak_price must equal live — no silent drift"
+        );
+    }
+
+    #[test]
     fn apply_event_liquidation_order_still_unexpected_variant() {
         let mut engine = test_engine();
         let err = engine
@@ -1020,7 +1088,7 @@ Leave the `Event::LiquidationOrder { .. } => Err(ApplyError::UnexpectedVariant {
 cargo test -p exg-matching-engine --lib 2>&1 | tail -10
 ```
 
-Expected: the 4 new tests pass; Stage 1b replay 19 + all engine tests still green. Unit count for replay module: 19 (Stage 1b) + 4 (Stage 2) = 23.
+Expected: the 5 new tests pass (4 + `apply_event_mark_price_replay_preserves_trailing_peak` per CEO review C8); Stage 1b replay 19 + all engine tests still green. Unit count for replay module: 19 (Stage 1b) + 5 (Stage 2) = 24.
 
 - [ ] **Step 5: Commit**
 
@@ -1144,8 +1212,22 @@ pub async fn admin_mark_price(
     if index_price <= exg_common::Decimal128::ZERO {
         return Err(ApiError::bad_request("indexPrice must be positive"));
     }
+    // CEO review C5: a non-positive mark price makes `mark <= stop_price`
+    // true for every positive-stop sell order → mass-trigger cascade.
+    // Symmetric with the indexPrice guard above. Invariant 29.
+    if mark_price <= exg_common::Decimal128::ZERO {
+        return Err(ApiError::bad_request("markPrice must be positive"));
+    }
 
     let symbol = exg_common::SymbolId::new(state.cfg.trading.symbols[0].id);
+    // CEO review C6: audit line for the high-privilege market-impacting
+    // action before enqueue. Invariant 30.
+    tracing::info!(
+        target: "admin",
+        mark_price = %mark_price,
+        index_price = %index_price,
+        "mark price injected"
+    );
     let cmd = Command::UpdateMarkPrice {
         symbol,
         mark_price,
@@ -1162,6 +1244,8 @@ pub async fn admin_funding_tick(
 ) -> Result<HttpResponse, ApiError> {
     check_admin_secret(&req, &state.cfg.admin.admin_secret)?;
     let symbol = exg_common::SymbolId::new(state.cfg.trading.symbols[0].id);
+    // CEO review C6: audit line before enqueue (invariant 30).
+    tracing::info!(target: "admin", "funding tick");
     let cmd = Command::ComputeFunding {
         symbol,
         timestamp: UnixMicros::now(),
@@ -1740,21 +1824,108 @@ async fn replay_mark_price_trigger_survives_reboot(pool: PgPool) {
         handle.shutdown().await.unwrap();
     }
 
-    // Boot 2: replay must apply MarkPriceUpdate (passive) + the triggered
-    // OrderFilled (its own WAL event) + FundingRateUpdate WITHOUT double
-    // triggering. Boot succeeding + health green is the pass signal.
+    // CEO review C10: observable assertion, NOT the weak "boot 2 didn't
+    // panic" proxy (Stage 1b A4 rejected that). Count boot-1 WAL records,
+    // then after reboot (NO new injects) assert: (a) the triggered stop's
+    // OrderFilled appears within the boot-1 record range, and (b) NO new
+    // OrderFilled for that order_id was appended during boot-2 — proving
+    // replay applied the historical fill but did NOT re-trigger the stop.
+    let wal_dir = std::path::PathBuf::from(
+        // base_cfg sets cfg.wal.dir = tmp.path(); reuse it.
+        cfg.wal.dir.clone(),
+    );
+    let mut reader = WalReader::open(&wal_dir).unwrap();
+    let mut boot1_records: u64 = 0;
+    let mut filled_order_ids_boot1: Vec<u64> = Vec::new();
+    reader
+        .read_from(0, |_seq, payload| {
+            boot1_records += 1;
+            let owned: Vec<u8> = payload.to_vec();
+            let e: Event = rkyv::from_bytes::<Event, rkyv::rancor::Error>(&owned).unwrap();
+            if let Event::OrderFilled { order_id, .. } = e {
+                filled_order_ids_boot1.push(order_id.value());
+            }
+            true
+        })
+        .unwrap();
+    assert!(
+        !filled_order_ids_boot1.is_empty(),
+        "boot 1 must have recorded at least one OrderFilled (triggered stop)"
+    );
+
+    // Boot 2: replay applies MarkPriceUpdate (passive) + the historical
+    // OrderFilled (its own WAL event) + FundingRateUpdate. Health green.
     let (handle2, base2, _admin2) = boot(cfg, pool).await;
     let client = Client::new();
     let resp = client.get(format!("{base2}/api/v1/health")).send().await.unwrap();
     assert!(resp.status().is_success());
     handle2.shutdown().await.unwrap();
+
+    // Re-scan: assert NO new OrderFilled was appended during boot-2 (replay
+    // is passive — the MarkPriceUpdate must not re-trigger the stop and
+    // produce a duplicate fill).
+    let mut reader2 = WalReader::open(&wal_dir).unwrap();
+    let mut total_records: u64 = 0;
+    let mut filled_after_boot1 = 0u64;
+    reader2
+        .read_from(0, |_seq, payload| {
+            total_records += 1;
+            if total_records > boot1_records {
+                let owned: Vec<u8> = payload.to_vec();
+                let e: Event =
+                    rkyv::from_bytes::<Event, rkyv::rancor::Error>(&owned).unwrap();
+                if matches!(e, Event::OrderFilled { .. }) {
+                    filled_after_boot1 += 1;
+                }
+            }
+            true
+        })
+        .unwrap();
+    assert_eq!(
+        filled_after_boot1, 0,
+        "replay must NOT re-trigger the stop — no new OrderFilled after boot 1 \
+         (would be a double-fill silent corruption)"
+    );
 }
 ```
 
 Implementer notes:
+- `replay_mark_price_trigger_survives_reboot` needs `use exg_wal::WalReader;` + `use exg_protocol::Event;` + `rkyv` at the top of `stage2_e2e.rs` (Stage 1b's stage1b_e2e.rs already uses this exact WAL-scan pattern — copy its imports + the `payload.to_vec()` alignment workaround).
+- `cfg.wal.dir` is set by `base_cfg` to `tmp.path()`; the WalReader scans it after both servers have shut down (safe — no concurrent writer).
 - Confirm the order request JSON field for stop price is `stopPrice` (camelCase) — `grep -n "stop_price\|stopPrice" crates/exg-api-gateway/src/types.rs`. Match the actual `PlaceOrderRequest` field rename.
 - `STOP_MARKET` string → `OrderType::StopMarket` per `conversion.rs::string_to_order_type` (verified in Stage 1b review). If the e2e stop order is rejected for a missing required field (e.g. price for stop-limit), use STOP_MARKET (no price needed) as written.
 - If `admin_mark_price_inject_triggers_stop_order` doesn't see the fill: the triggered stop becomes a market order needing a resting counterparty — the test rests a buy limit at 59000 first. Verify the matcher fills a market sell against a resting bid. If timing-flaky, bump the 300ms sleep.
+
+- [ ] **Step 1b: Add the `admin_mark_price_negative_or_zero_mark_returns_400` e2e (CEO review C5)**
+
+Append to `stage2_e2e.rs`:
+
+```rust
+#[sqlx::test(migrations = "../../migrations")]
+async fn admin_mark_price_negative_or_zero_mark_returns_400(pool: PgPool) {
+    let tmp = TempDir::new().unwrap();
+    let cfg = base_cfg(tmp.path());
+    let (handle, _base, admin) = boot(cfg, pool).await;
+    let client = Client::new();
+    for bad in ["0", "-1"] {
+        let resp = client
+            .post(format!("{admin}/api/v1/admin/mark-price"))
+            .header("X-Admin-Secret", ADMIN_SECRET)
+            .json(&serde_json::json!({"markPrice": bad, "indexPrice": "60000"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status().as_u16(),
+            400,
+            "markPrice {bad} must be rejected (mass stop-trigger guard)"
+        );
+    }
+    handle.shutdown().await.unwrap();
+}
+```
+
+stage2_e2e count: 10 → 11 (C5).
 
 - [ ] **Step 2: Add 2 boot_panics tests**
 
@@ -1904,12 +2075,14 @@ scripts/demo-stage2.sh
 ```
 
 Expected:
-- workspace all green (~491 tests)
-- stage2_e2e 10/10
+- workspace all green (~493 tests)
+- stage2_e2e 11/11 (10 base + 1 new `admin_mark_price_negative_or_zero_mark_returns_400` per CEO C5; C10 strengthened the existing `replay_mark_price_trigger_survives_reboot` assertions without changing the count)
 - stage1b_e2e 16/16, stage1a_e2e 12/12, stage0_e2e 7/7 (regression baselines)
 - boot_panics 11/11 (9 + 2 new)
-- exg-matching-engine --lib: existing 61 + Stage 1b replay 19 + Stage 2 (~6 engine + 1 snapshot + 4 replay) ≈ 91
+- exg-matching-engine --lib: existing 61 + Stage 1b replay 19 + Stage 2 (~6 engine + 1 snapshot + 5 replay incl. CEO C8 trailing-peak) ≈ 92
 - demo: clean exit, wal-dump shows MarkPriceUpdate + OrderFilled + FundingRateUpdate, boot 2 replays + health green
+
+**Rollback note (CEO review C3):** spec §8.5 documents the Stage 2 → Stage 1b rollback (Stage 1b's `apply_event` rejects `MarkPriceUpdate`/`FundingRateUpdate` → `rm -rf data/wal` required). No code in this task — the procedure lives in the spec; this line is the plan-side pointer so the implementer knows the rollback section exists and must stay in sync if the events change.
 
 If `cargo fmt --check` flags issues: `cargo fmt`, stage modified `.rs`, separate `style: cargo fmt` commit BEFORE the e2e commit.
 
@@ -1960,11 +2133,13 @@ If `cargo fmt` needed changes during Step 4, commit them first as `style: cargo 
 | §4.7 admin module | Task 6 |
 | §4.8 boot lifecycle | Task 7 |
 | §5 data flow / error handling | Task 6 (handler errors) + Task 7 (boot panics) |
-| §6 invariants 24-28 | Task 1 (24/25 cfg), Task 7 (24/25 boot), Task 3 (28 engine), Task 5 (27 replay) |
-| §7.1 unit tests | Task 3 + Task 4 + Task 5 |
-| §7.2 integration tests | Task 8 |
+| §6 invariants 24-30 | Task 1 (24/25 cfg), Task 7 (24/25 boot), Task 3 (28 engine), Task 5 (27 replay), Task 6 (29 markPrice guard + 30 audit log — CEO C5/C6) |
+| §7.1 unit tests | Task 3 + Task 4 + Task 5 (incl. CEO C8 trailing-peak) |
+| §7.2 integration tests | Task 8 (incl. CEO C5 negative-mark e2e + C10 observable replay) |
 | §7.3 boot panics | Task 8 |
 | §7.4 regression baselines | Task 2 + Task 7 (cascade fixes) + Task 8 (verify) |
 | §8 acceptance | Task 8 |
+| §8.5 rollback to Stage 1b (CEO C3) | Spec doc; Task 8 plan-side pointer |
+| §9 forward pointers (incl. CEO C2 stop-cascade, C3 fwd-compat replay) | Spec doc |
 
-All spec sections covered.
+All spec sections covered. CEO review C2–C10 (6 findings) applied: C2/C3 → spec §8.5+§9, C5 → invariant 29 + Task 6 guard + Task 8 e2e, C6 → invariant 30 + Task 6 audit lines, C8 → Task 5 unit, C10 → Task 8 observable assertion.
