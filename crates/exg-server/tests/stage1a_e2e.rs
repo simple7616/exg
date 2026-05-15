@@ -338,3 +338,31 @@ async fn malformed_token_returns_401(pool: PgPool) {
     assert_eq!(resp.status().as_u16(), 401);
     handle.shutdown().await.unwrap();
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn client_order_id_exceeding_i64_max_returns_400(pool: PgPool) {
+    let tmp = TempDir::new().unwrap();
+    let cfg = base_cfg(tmp.path());
+    let (handle, base) = boot_server(cfg, pool).await;
+    let client = Client::new();
+    let token = register_and_login(&client, &base, "coid-bound@e.com", "hunter2hunter2").await;
+
+    // u64::MAX is 18446744073709551615 — wraps to -1 if cast to i64. Without
+    // the boundary guard the row would silently insert with client_order_id=-1
+    // and collide with future coid=0 submissions.
+    let resp = client
+        .post(format!("{base}/api/v1/order"))
+        .header("Authorization", format!("Bearer {token}"))
+        .json(&serde_json::json!({
+            "symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT",
+            "timeInForce":"GTC","quantity":"0.001","price":"59000",
+            "clientOrderId":"18446744073709551615"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["code"], -1100);
+    handle.shutdown().await.unwrap();
+}

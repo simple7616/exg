@@ -106,6 +106,14 @@ pub async fn place_order(
         let coid: u64 = coid_str
             .parse()
             .map_err(|_| ApiError::bad_request("clientOrderId must be numeric"))?;
+        // PG BIGINT is signed i64. Reject values that would wrap into the
+        // negative half of i64 — without this guard, two distinct u64 inputs
+        // would collide on the unique constraint and silently defeat dedup.
+        if coid > i64::MAX as u64 {
+            return Err(ApiError::bad_request(
+                "clientOrderId must fit in signed 64-bit (max 9223372036854775807)",
+            ));
+        }
         let now_micros = UnixMicros::now().as_micros() as i64;
         let inserted = sqlx::query(
             "INSERT INTO user_client_order_ids (user_id, client_order_id, created_at)
