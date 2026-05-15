@@ -280,7 +280,16 @@ EOF
 
 ### Why this is one task
 
-`MatchingEngine::new(symbol_config, node_id)` gains a 3rd param `interest_rate: Decimal128`. Rust will not compile until **every** call site is updated in the same change: the production caller (exg-server boot — done in Task 7, but the signature must be consistent), `restore_from_snapshot` (which calls `Self::new`), and every `MatchingEngine::new(test_config(), 1)` in engine.rs unit tests + replay.rs `test_engine()`. Splitting this across tasks leaves the workspace red. Task 2 does ONLY the mechanical cascade + stores the field; Task 3 uses it.
+`MatchingEngine::new(symbol_config, node_id)` gains a 3rd param `interest_rate: Decimal128`. Rust will not compile until **every** call site is updated in the same change. The complete, workspace-wide call-site set (grep-verified, Eng review E2/E3) is:
+
+1. **Production caller** — `crates/exg-server/src/lib.rs:219` (2-arg today; fixed in Task 7, but the signature must be consistent).
+2. **`restore_from_snapshot`** (`engine.rs:995`) — calls `Self::new`; gains a 4th param.
+3. **`deserialize_snapshot`** (`crates/exg-matching-engine/src/snapshot.rs:29-37`) — a `pub`, **non-test**, in-crate wrapper that calls `Self::restore_from_snapshot(snapshot, config, node_id)` (3 args). Eng review E3: this is `restore_from_snapshot`'s non-test in-crate caller (the "test-only" wording was incomplete) — it must also gain + forward an `interest_rate` param or it will not compile.
+4. **engine.rs unit tests** — 19 `MatchingEngine::new(test_config(), 1)` sites + 1 `restore_from_snapshot(snapshot, test_config(), 1)` site (engine.rs:1576).
+5. **replay.rs** — `test_engine()` (replay.rs:195) + any other `MatchingEngine::new(` in that file.
+6. **`crates/exg-matching-engine/benches/matching.rs:53, 73, 125`** — 3 `MatchingEngine::new(test_config(), 1)` sites. Eng review E2: `cargo check/test/clippy --workspace` do **not** compile benches (need `--all-targets`/`--benches`), so omitting these passes Task 8 acceptance green while `scripts/bench.sh` / `cargo bench` / `scripts/test.sh --all` are broken — the exact undocumented-downstream-callsite class Stage 1b's eng review caught. The bench file does **not** import a `dec` helper; use `"0.0001".parse().unwrap()` inline (its `Decimal128` is already in scope via `test_config`).
+
+Splitting this across tasks leaves the workspace red. Task 2 does ONLY the mechanical cascade + stores the field; Task 3 uses it.
 
 - [ ] **Step 1: Add the struct field**
 
@@ -357,7 +366,40 @@ Find `pub fn restore_from_snapshot(snapshot, config, node_id) -> Self` (around l
         // `interest_rate` argument. Task 4 adds one more line here.
 ```
 
-(The snapshot does NOT carry `interest_rate` — it is config, not engine state. The caller supplies it. `restore_from_snapshot` is test-only at runtime since snapshot is unused per Stage 1b.)
+(The snapshot does NOT carry `interest_rate` — it is config, not engine state. The caller supplies it. `restore_from_snapshot` is test-only at runtime since snapshot is unused per Stage 1b — *but* it has one non-test in-crate caller, `deserialize_snapshot`, fixed in the next step.)
+
+- [ ] **Step 3b: Thread `interest_rate` through `deserialize_snapshot` (Eng review E3)**
+
+In `crates/exg-matching-engine/src/snapshot.rs`, `deserialize_snapshot` (lines 29-37) currently is:
+
+```rust
+    pub fn deserialize_snapshot(
+        data: &[u8],
+        config: exg_risk_engine::SymbolConfig,
+        node_id: u16,
+    ) -> Self {
+        let snapshot: EngineSnapshot =
+            serde_json::from_slice(data).expect("snapshot deserialization failed");
+        Self::restore_from_snapshot(snapshot, config, node_id)
+    }
+```
+
+Change to:
+
+```rust
+    pub fn deserialize_snapshot(
+        data: &[u8],
+        config: exg_risk_engine::SymbolConfig,
+        node_id: u16,
+        interest_rate: Decimal128,
+    ) -> Self {
+        let snapshot: EngineSnapshot =
+            serde_json::from_slice(data).expect("snapshot deserialization failed");
+        Self::restore_from_snapshot(snapshot, config, node_id, interest_rate)
+    }
+```
+
+`Decimal128` is already imported in snapshot.rs (`EngineSnapshot.mark_price` etc.). Grep `deserialize_snapshot(` workspace-wide — there are **zero external callers** (verified: only the definition), so no further cascade beyond this signature; this fix is purely to keep the crate compiling.
 
 - [ ] **Step 4: Update every test call site in engine.rs**
 
@@ -377,13 +419,21 @@ Also any other `MatchingEngine::new(` in replay.rs (e.g. `replay_then_take_snaps
 grep -n "MatchingEngine::new(" crates/exg-matching-engine/src/replay.rs
 ```
 
+- [ ] **Step 5b: Update `benches/matching.rs` (Eng review E2)**
+
+```bash
+grep -n "MatchingEngine::new(" crates/exg-matching-engine/benches/matching.rs
+```
+
+Three sites (53, 73, 125): `MatchingEngine::new(test_config(), 1)` → `MatchingEngine::new(test_config(), 1, "0.0001".parse().unwrap())`. The bench file has no `dec` helper; the inline `"0.0001".parse().unwrap()` yields `Decimal128` (already in scope via `test_config`). Benches are NOT built by `cargo check/test/clippy --workspace`, so this must be verified with `--all-targets` in Step 6.
+
 - [ ] **Step 6: Verify the cascade is complete**
 
 ```bash
-cargo check --workspace 2>&1 | tail -15
+cargo check --workspace --all-targets 2>&1 | tail -15
 ```
 
-Expected: the ONLY remaining error is in `crates/exg-server/src/lib.rs` (boot calls `MatchingEngine::new(symbol_config, node_id)` with 2 args) — that is fixed in Task 7. Note it and proceed. If errors appear anywhere ELSE, the cascade is incomplete — fix them now.
+`--all-targets` is mandatory here (Eng review E2) — it is the only invocation that compiles `benches/matching.rs`; a plain `cargo check --workspace` would hide a broken bench. Expected: the ONLY remaining error is in `crates/exg-server/src/lib.rs` (boot calls `MatchingEngine::new(symbol_config, node_id)` with 2 args) — that is fixed in Task 7. Note it and proceed. If errors appear anywhere ELSE (esp. `benches/matching.rs` or `snapshot.rs`), the cascade is incomplete — fix them now.
 
 ```bash
 cargo test -p exg-matching-engine --lib 2>&1 | tail -8
@@ -394,15 +444,19 @@ If exg-matching-engine compiles standalone (it does not depend on exg-server), i
 - [ ] **Step 7: Commit**
 
 ```bash
-git add crates/exg-matching-engine/src/engine.rs crates/exg-matching-engine/src/replay.rs
+git add crates/exg-matching-engine/src/engine.rs crates/exg-matching-engine/src/replay.rs \
+        crates/exg-matching-engine/src/snapshot.rs crates/exg-matching-engine/benches/matching.rs
 git commit -m "$(cat <<'EOF'
 refactor(matching-engine): thread interest_rate into MatchingEngine::new
 
 Stage 2 funding needs cfg.risk.interest_rate at the engine. Add it as a
 3rd MatchingEngine::new param + last_funding_rate field (both inert until
-Task 3). restore_from_snapshot gains a matching 4th param (snapshot does
+Task 3). restore_from_snapshot + deserialize_snapshot (its non-test
+in-crate caller, Eng review E3) gain a matching 4th param (snapshot does
 not carry interest_rate — it is config, caller supplies). All engine.rs +
-replay.rs test sites cascaded. exg-server boot caller fixed in Task 7.
+replay.rs + benches/matching.rs (Eng review E2) call sites cascaded;
+verified with cargo check --workspace --all-targets. exg-server boot
+caller fixed in Task 7.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -645,6 +699,7 @@ Notes for the implementer:
 - The old `update_mark_price` body's set+peaks prelude moves into `apply_mark_index_passive`; its trigger+match tail moves into `trigger_and_match_stops`. Verify the moved code matches the original (the snippet above mirrors engine.rs:736-784 — re-read and preserve any detail like the `match_result.rejected` check).
 - `apply_mark_index_passive` is `pub(crate)` so `replay.rs` (same crate, different module) can call it. `set_last_funding_rate` is `#[doc(hidden)] pub` like Stage 1b's `orderbook_mut`.
 - `exg_risk_engine::funding::calc_funding_rate` — confirm `exg-matching-engine/Cargo.toml` already depends on `exg-risk-engine` (it does — engine uses SymbolConfig from it). If the path differs, `grep -n "exg_risk_engine" crates/exg-matching-engine/src/engine.rs`.
+- **Eng review E4 (deliberate behavior delta):** the original `update_mark_price` body computed `let timestamp = UnixMicros::now();` *inside* the per-triggered-order loop (engine.rs:765). The refactor threads the caller's `timestamp` (the `Command::UpdateMarkPrice.timestamp`) into `trigger_and_match_stops` and uses it for `emit_fill_events`. This is intentional and *more* correct — WAL-deterministic, replay-aligned — and replay never runs the active half so it cannot diverge. Preserve this on purpose; do not "restore" a fresh `UnixMicros::now()` per order.
 
 - [ ] **Step 5: Replace the Task 1 placeholder dispatch with real dispatch**
 
@@ -671,13 +726,50 @@ with:
 
 `Command` is already imported in engine.rs.
 
+- [ ] **Step 5b: Fix the existing `update_mark_price` test call sites (Eng review E1)**
+
+The signature change from `update_mark_price(mark, index)` to `update_mark_price(symbol, mark, index, timestamp)` **plus** the unconditional `MarkPriceUpdate` prepend breaks the existing engine.rs tests both mechanically (arg count) and semantically (event-vec shape). This step is mandatory — without it the plan's "existing tests stay green" criterion is false.
+
+```bash
+grep -n "\.update_mark_price(dec(" crates/exg-matching-engine/src/engine.rs
+```
+
+Six call sites: **1441, 1456, 1486, 1490, 1494, 1571** (line numbers pre-edit; re-grep to confirm).
+
+**Mechanical (all 6):** `engine.update_mark_price(dec("X"), dec("X"))` → `engine.update_mark_price(SymbolId::new(1), dec("X"), dec("X"), sample_ts())`. (`sample_ts()` is the helper added in Step 2; `SymbolId` already imported.)
+
+**Semantic — `test_trailing_stop` (the test starting at engine.rs:1452):** it has two assertions that are now WRONG because `update_mark_price` always returns `vec![MarkPriceUpdate, ..]` (never empty):
+
+```rust
+        // Price goes up — peak should track
+        let events = engine.update_mark_price(dec("52000"), dec("52000"));
+        assert!(events.is_empty()); // no trigger yet               // ← NOW FALSE
+        // Price drops but not enough
+        let events = engine.update_mark_price(dec("51500"), dec("51500"));
+        assert!(events.is_empty());                                  // ← NOW FALSE
+```
+
+Replace each `assert!(events.is_empty());` with an assertion on the *fill* property, not the empty property:
+
+```rust
+        let events = engine.update_mark_price(SymbolId::new(1), dec("52000"), dec("52000"), sample_ts());
+        assert!(!events.iter().any(is_filled), "peak tracking only, no trigger yet");
+```
+
+```rust
+        let events = engine.update_mark_price(SymbolId::new(1), dec("51500"), dec("51500"), sample_ts());
+        assert!(!events.iter().any(is_filled), "still above trigger, no fill");
+```
+
+The final `update_mark_price(dec("51000"), ...)` in that test already asserts via `let fills: Vec<_> = events.iter().filter(|e| is_filled(e)).collect(); assert!(!fills.is_empty());` — that survives the prepend unchanged (only the arg-count mechanical fix applies). `is_filled` already exists in the engine.rs test module (used by the surrounding stop tests). The stop-trigger test at ~1441 uses `assert!(!events.is_empty())` + `is_filled` filtering — only the mechanical 4-arg fix is needed there (a non-empty vec stays non-empty). The two snapshot tests (1571, and `test_snapshot_serde_roundtrip` ~1588) discard the return value — mechanical fix only.
+
 - [ ] **Step 6: Run tests — verify green**
 
 ```bash
 cargo test -p exg-matching-engine --lib 2>&1 | tail -12
 ```
 
-Expected: all 6 new tests pass + the existing 61 + Stage 1b replay 19 still green. Note: `process_command` does `self.sequence += 1` at the top for every command including the 2 new — that is correct (each command is one WAL-sequenced action).
+Expected: all 6 new tests pass; `test_trailing_stop` + the stop/snapshot tests pass with the Step 5b fixes; Stage 1b replay 19 still green (replay.rs `MatchingEngine::new` was cascaded in Task 2; its `apply_event` arms are untouched until Task 5). Note: `process_command` does `self.sequence += 1` at the top for every command including the 2 new — that is correct (each command is one WAL-sequenced action).
 
 - [ ] **Step 7: Commit**
 
@@ -2062,6 +2154,9 @@ chmod +x scripts/demo-stage2.sh
 ```bash
 docker compose up -d postgres
 DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo check --workspace
+# Eng review E2: --all-targets compiles benches/matching.rs (the MatchingEngine::new
+# 3rd-param cascade site that plain --workspace silently skips).
+DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo check --workspace --all-targets
 DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo clippy --workspace -- -D warnings
 cargo fmt --check
 DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo test --workspace
@@ -2152,10 +2247,18 @@ All spec sections covered. CEO review C2–C10 (6 findings) applied: C2/C3 → s
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (PLAN) | mode: HOLD_SCOPE, 0 critical gaps, 6 findings all accepted (C2,C3,C5,C6,C8,C10) |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | FULL_REVIEW, 0 critical gaps, 3 findings applied (E1,E2,E3) + 1 observation noted (E4) |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | no UI scope |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
 **UNRESOLVED:** 0 across all reviews.
 
-**VERDICT:** CEO CLEARED — proceed to `/plan-eng-review` (architecture / tests / regression edges under HOLD SCOPE rigor; dual-server shutdown drain + interest_rate cascade are regression-sensitive). Eng review is the required shipping gate.
+**Eng Review findings (FULL_REVIEW, applied to plan):**
+- **E1 (High, applied)** — Task 3 Step 5b added: the `update_mark_price` 4-arg signature + unconditional `MarkPriceUpdate` prepend breaks the 6 existing engine.rs call sites mechanically AND inverts `test_trailing_stop`'s two `assert!(events.is_empty())` (now always non-empty). Step 5b enumerates the mechanical fixes + the `is_empty()`→`!any(is_filled)` semantic rewrite; Step 6 expectation corrected.
+- **E2 (High, applied)** — Task 2 cascade omitted `benches/matching.rs:53,73,125`; `cargo check/test/clippy --workspace` skip benches so acceptance would go green while `scripts/bench.sh`/`cargo bench` are broken (Stage 1b undocumented-downstream-callsite class). Added Step 5b (bench fix, inline `"0.0001".parse().unwrap()`) + `cargo check --workspace --all-targets` to Step 6 and Task 8 acceptance.
+- **E3 (Medium, applied)** — Task 2 cascade omitted `snapshot.rs:29-37 deserialize_snapshot` (`pub`, non-test, in-crate caller of `restore_from_snapshot`). Added Step 3b threading `interest_rate` through it; corrected the "test-only" wording.
+- **E4 (Low, noted)** — active-half timestamp now sourced from `Command.timestamp` instead of per-order `UnixMicros::now()` (engine.rs:765). Deliberate + more correct (WAL-deterministic; replay skips active half). Flagged in Task 3 Step 4 implementer notes so it is preserved on purpose.
+
+Non-findings (verified against codebase): dual-server shutdown ordering (plan's "BEFORE `self.actix_handle.stop(true).await`" matches `lib.rs:56` exactly — Stage 0 §9 drain preserved); passive/active body fidelity (plan snippet == `engine.rs:736-783`); `subtle` `ct_eq` idiom (CEO C4 standard); admin_secret `base_cfg` cascade enumerated in Task 7 Step 5; test matrix reconciles to spec §7 (12 unit, §7.1 #8 folded into the positive-premium test — property covered).
+
+**VERDICT:** ENG CLEARED — both required gates (CEO HOLD_SCOPE + Eng FULL_REVIEW) passed, all findings applied. Plan + Spec CLEAR. Proceed to `superpowers:subagent-driven-development` execution of the 8 tasks.
