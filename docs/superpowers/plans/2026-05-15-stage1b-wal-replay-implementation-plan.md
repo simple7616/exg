@@ -2509,10 +2509,28 @@ EOF
 | §4.7 JWT/kyc e2e                            | Task 6                   |
 | §6 Data flow                                | Task 3 (lifecycle)       |
 | §7.1 New boot panics                        | Task 3 (impl), Task 4 (tests) |
-| §8.1 Unit tests (10)                        | Task 2                   |
-| §8.2 Integration tests (16)                 | Task 6                   |
+| §8.1 Unit tests (12)                        | Task 2                   |
+| §8.2 Integration tests (17)                 | Task 6                   |
+| §9.5 Migration from Stage 1a                | Plan header (cutover)    |
+| §9.6 Rollback to Stage 1a                   | Plan header (rollback)   |
 | §8.3 Existing test deltas                   | Task 4 (boot_panics)     |
 | §9 Invariants 21–23                         | Task 3                   |
 | §10 Acceptance                              | Task 7                   |
 
 All spec sections covered.
+
+---
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (PLAN) | mode: HOLD_SCOPE, 0 critical gaps, 8 findings all accepted (A1–A8) |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | no UI scope |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+**UNRESOLVED:** 0 across all reviews.
+
+**VERDICT:** CEO CLEARED — proceed to `/plan-eng-review` (architecture / tests / edge cases under HOLD SCOPE rigor). Eng review is the required shipping gate.
