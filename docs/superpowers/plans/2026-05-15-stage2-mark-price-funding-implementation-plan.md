@@ -205,13 +205,18 @@ In `crates/exg-config/src/validation.rs` test module (or wherever config tests l
 ```rust
     #[test]
     fn admin_secret_placeholder_rejected() {
-        let cfg = ExgConfig::default_config();
-        // default_config uses the placeholder → validate must reject.
+        // Eng review: must advance past the JWT check first — default_config
+        // has BOTH placeholders and jwt_secret is validated first, so a
+        // `|| jwt_secret` disjunction would short-circuit and never exercise
+        // invariant 25. Set a valid jwt_secret, then assert ONLY the admin
+        // message so the test genuinely fails if #25 is absent.
+        let mut cfg = ExgConfig::default_config();
+        cfg.auth.jwt_secret = "a".repeat(32);
         let err = cfg.validate().unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("admin.admin_secret") || msg.contains("jwt_secret"),
-            "expected admin or jwt secret rejection, got: {msg}"
+            msg.contains("admin.admin_secret"),
+            "expected admin secret placeholder rejection, got: {msg}"
         );
     }
 
