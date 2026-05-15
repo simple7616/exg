@@ -59,7 +59,7 @@ Out of scope (forward pointers for Stage 2+):
 │  Step 3.7 init_dummy_argon2_hash (existing)                        │
 │                                                                    │
 │  Step 3.8 ★ NEW — invariant 21 check                               │
-│              assert engine.next_seq() == wal_writer.next_seq()     │
+│              assert replayed_count == wal_writer.current_seq()     │
 │                                                                    │
 │  Step 4   build AppState (engine carries replayed state)           │
 │  Step 5   spawn matching thread (engine moves into thread)         │
@@ -282,7 +282,7 @@ After Step 6 the flow is identical to Stage 1a: HTTP → handlers → ring buffe
 | Step 3.6 (replay) | WAL sequence gap (`seq != expected_seq`)   | `WAL replay failed: sequence gap at expected={expected}, got={seq}`                  |
 | Step 3.6 (replay) | rkyv decode failure                        | `WAL replay failed: rkyv decode at sequence {seq}: {err}`                            |
 | Step 3.6 (replay) | `apply_event` returns `Err`                | `WAL replay failed at sequence {seq}: {apply_err}`                                   |
-| Step 3.8 | Invariant 21 violation                     | `invariant 21 violated: engine.next_seq={e}, wal_writer.next_seq={w}`                |
+| Step 3.8 | Invariant 21 violation                     | `invariant 21 violated: replayed_count={c}, wal_writer.current_seq={w}`              |
 
 Note on ordering: `WalWriter::open` already calls `recover_state` (Stage 0 implementation) which scans existing segments, truncates incomplete tail records, and returns `WalError::Corrupt` on any mid-stream CRC mismatch. This means CRC failures surface at Step 1, before replay even begins — operators see a writer-open panic, not a replay panic. Stage 1b leaves that behavior intact and only adds the replay-step panics (sequence gap, decode, apply_event errors).
 
@@ -374,7 +374,7 @@ Numbering continues from Stage 1a's #20.
 
 ### New in Stage 1b
 
-- **#21** Post-replay sequence consistency: `engine.next_sequence_to_emit() == wal_writer.current_sequence()` immediately after Step 3.6 and before Step 5.
+- **#21** Post-replay sequence consistency: the number of events applied during Step 3.6 equals `wal_writer.current_sequence()` (the next WAL sequence to assign). This catches reader/writer disagreement about how many records exist on disk. NOTE: `MatchingEngine.sequence` is a per-command counter and is **not** comparable to WAL per-event sequences; do not conflate them.
 - **#22** WAL replay is fail-fast: any CRC mismatch, sequence gap, rkyv decode error, or `apply_event` error during boot is fatal.
 - **#23** Replay is single-threaded and synchronous: no other thread reads or writes the engine state during Step 3.6.
 
