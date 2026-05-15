@@ -97,11 +97,11 @@ impl MatchingEngine {
                 }
                 // GTD orders must also be tracked by the expiry heap so the GTD
                 // sweeper can find them after replay (matches engine.rs:414).
-                if *time_in_force == exg_common::TimeInForce::Gtd {
-                    if let Some(expire) = expire_time {
-                        self.expiry_heap_mut()
-                            .push(std::cmp::Reverse((expire, *order_id)));
-                    }
+                if *time_in_force == exg_common::TimeInForce::Gtd
+                    && let Some(expire) = expire_time
+                {
+                    self.expiry_heap_mut()
+                        .push(std::cmp::Reverse((expire, *order_id)));
                 }
                 Ok(())
             }
