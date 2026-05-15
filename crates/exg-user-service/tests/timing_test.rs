@@ -31,12 +31,14 @@ async fn login_time_constant_regardless_of_email_existence(pool: PgPool) {
     let mut known_times = Vec::with_capacity(SAMPLES);
     let mut unknown_times = Vec::with_capacity(SAMPLES);
 
+    // Interleave known and unknown samples so CPU warm-up, OS scheduler, and
+    // cache effects cancel out. Sequential batching produces a systematic bias
+    // because the second batch always runs after the first has warmed the CPU.
     for _ in 0..SAMPLES {
         let t = Instant::now();
         let _ = login_user(&pool, &cfg, "real@example.com", "wrong-password").await;
         known_times.push(t.elapsed().as_micros());
-    }
-    for _ in 0..SAMPLES {
+
         let t = Instant::now();
         let _ = login_user(&pool, &cfg, "ghost@example.com", "wrong-password").await;
         unknown_times.push(t.elapsed().as_micros());
