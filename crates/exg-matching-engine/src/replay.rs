@@ -565,6 +565,32 @@ mod tests {
             .expect("terminal duplicate taker leg is a state-preserving no-op");
         assert_eq!(engine.orderbook().order_count(), 0);
         assert_eq!(engine.stop_order_count(), 0);
+
+        // A further duplicate leg for the same seen id carrying a NON-ZERO
+        // remaining_qty is ALSO a benign no-op (NOT an error). This locks the
+        // intentional Path-3 design: a legitimate multi-maker-insufficient-
+        // liquidity taker sweep emits every leg with the same constant
+        // NON-ZERO final remaining (the dropped Market leftover), so Path 3
+        // MUST accept non-zero-remaining duplicate legs for seen ids. A future
+        // `remaining_qty.is_zero()` tightening would regress recoverability by
+        // false-aborting that legitimate WAL (see
+        // replay_equiv_stop_market_multi_maker_insufficient_liquidity_nonzero_leftover).
+        engine
+            .apply_event(&Event::OrderFilled {
+                order_id: OrderId::new(7),
+                trade_id: TradeId::new(102),
+                user_id: UserId::new(42),
+                symbol: SymbolId::new(1),
+                side: Side::Buy,
+                fill_price: dec("50000"),
+                fill_qty: dec("0"),
+                is_maker: false,
+                remaining_qty: dec("3"),
+                timestamp: ts(),
+            })
+            .expect("non-zero-remaining duplicate taker leg for a seen id is also a benign no-op");
+        assert_eq!(engine.orderbook().order_count(), 0);
+        assert_eq!(engine.stop_order_count(), 0);
     }
 
     #[test]
@@ -1236,6 +1262,65 @@ mod tests {
             // Drops but not enough (still above 52000-1000=51000).
             mark("51500"),
             // Drops to trigger -> fills against the resting bid.
+            mark("51000"),
+        ];
+        assert_live_replay_equivalent(&cmds);
+    }
+
+    // Scenario 6 (regression lock — eng review): a triggered StopMarket that
+    // sweeps >=2 resting makers whose TOTAL liquidity is LESS than the stop
+    // quantity. Live emit_fill_events emits one taker OrderFilled per fill,
+    // each carrying taker.remaining_qty measured AFTER the full match — i.e.
+    // the same constant NON-ZERO final remaining (the unfilled Market leftover,
+    // which live drops because a converted Market never rests). On replay:
+    // leg 1 hits Path 2 (order in stop_orders) -> converted to Market, leftover
+    // NOT reinserted (is_limit() false) -> order gone; leg 2 (and any further
+    // legs) hit Path 3 with a NON-ZERO remaining_qty for an already-seen id and
+    // MUST be benign no-ops, so replay state == live state (order gone).
+    //
+    // This guards against a future UNSAFE tightening of the Path-3
+    // discriminator with a `remaining_qty.is_zero()` gate: legitimate
+    // multi-maker-insufficient-liquidity sweeps emit a constant NON-ZERO taker
+    // remaining on every leg, so a zero-only gate would make leg 2 return
+    // Err(UnknownOrder) and false-abort boot on a perfectly legitimate WAL
+    // (recoverability regression). The current discriminator (seen => no-op,
+    // regardless of remaining) is the correct design and is locked here.
+    #[test]
+    fn replay_equiv_stop_market_multi_maker_insufficient_liquidity_nonzero_leftover() {
+        let cmds = vec![
+            // Two resting asks: 3 @ 51000 and 4 @ 51500 (total 7).
+            new_order(
+                1,
+                Side::Sell,
+                OrderType::Limit,
+                Some("51000"),
+                "3",
+                None,
+                None,
+            ),
+            new_order(
+                2,
+                Side::Sell,
+                OrderType::Limit,
+                Some("51500"),
+                "4",
+                None,
+                None,
+            ),
+            // Stop-market buy 10 spans both resting asks (3 + 4 = 7 filled),
+            // 3 unfilled -> Market leftover dropped (order gone, never rests).
+            // This emits >=2 taker OrderFilled legs all carrying the same
+            // constant NON-ZERO (3) final remaining: leg 1 -> Path 2,
+            // leg 2+ -> Path 3 with non-zero remaining (the case under test).
+            new_order(
+                3,
+                Side::Buy,
+                OrderType::StopMarket,
+                None,
+                "10",
+                Some("51000"),
+                None,
+            ),
             mark("51000"),
         ];
         assert_live_replay_equivalent(&cmds);
