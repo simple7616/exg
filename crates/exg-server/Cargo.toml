@@ -36,3 +36,8 @@ rkyv = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
+crc32fast = { workspace = true }
+exg-wal = { workspace = true }
+exg-protocol = { workspace = true }
+exg-common = { workspace = true }
+rkyv = { workspace = true }

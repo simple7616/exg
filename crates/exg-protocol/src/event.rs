@@ -1,4 +1,6 @@
-use exg_common::{Decimal128, OrderId, Side, SymbolId, TradeId, UnixMicros, UserId};
+use exg_common::{
+    Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, TradeId, UnixMicros, UserId,
+};
 use serde::{Deserialize, Serialize};
 
 /// Rejection reasons for orders.
@@ -49,6 +51,26 @@ pub enum Event {
         symbol: SymbolId,
         client_order_id: Option<u64>,
         timestamp: UnixMicros,
+        // Stage 1b: fields needed to rebuild a BookOrder during WAL replay.
+        side: Side,
+        order_type: OrderType,
+        time_in_force: TimeInForce,
+        /// Effective price recorded at accept time. For limit-like orders this is the
+        /// submitted price; for market-like orders it is the sentinel (Decimal128::MAX for
+        /// buy, Decimal128::ZERO for sell — same as `BookOrder.price`).
+        price: Decimal128,
+        /// Original submitted quantity.
+        quantity: Decimal128,
+        stop_price: Option<Decimal128>,
+        reduce_only: bool,
+        /// Iceberg visible slice size. `None` for non-iceberg orders.
+        visible_quantity: Option<Decimal128>,
+        /// Trailing-stop offset. `None` for non-trailing orders.
+        trailing_delta: Option<Decimal128>,
+        /// Trailing-stop reference price at accept time (= engine.mark_price at the time).
+        /// `None` for non-trailing orders. Cannot be reconstructed at replay time because
+        /// mark_price may have moved.
+        trailing_peak_price: Option<Decimal128>,
     },
     OrderRejected {
         order_id: OrderId,

@@ -54,6 +54,7 @@ impl OrderService {
                 symbol,
                 client_order_id,
                 timestamp,
+                ..
             } => {
                 self.handle_order_accepted(
                     *order_id,
@@ -612,6 +613,16 @@ mod tests {
             symbol: SymbolId::new(1),
             client_order_id: None,
             timestamp: ts(2_000_000),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            price: dec("50000"),
+            quantity: dec("1.5"),
+            stop_price: None,
+            reduce_only: false,
+            visible_quantity: None,
+            trailing_delta: None,
+            trailing_peak_price: None,
         };
         svc.apply_event(&event);
 
@@ -650,6 +661,16 @@ mod tests {
             symbol: SymbolId::new(1),
             client_order_id: None,
             timestamp: ts(2_000_000),
+            side: Side::Buy,
+            order_type: OrderType::StopLimit,
+            time_in_force: TimeInForce::Gtc,
+            price: dec("49000"),
+            quantity: dec("2"),
+            stop_price: Some(dec("49500")),
+            reduce_only: false,
+            visible_quantity: None,
+            trailing_delta: None,
+            trailing_peak_price: None,
         };
         svc.apply_event(&event);
 

@@ -1,4 +1,4 @@
-use exg_common::{OrderId, SymbolId, UnixMicros, UserId};
+use exg_common::{Decimal128, OrderId, OrderType, Side, SymbolId, TimeInForce, UnixMicros, UserId};
 use exg_protocol::{Event, RejectReason};
 use exg_wal::{WalConfig, WalWriter};
 use exg_wal_dump::dump;
@@ -40,6 +40,16 @@ fn happy_dump_three_events() {
             symbol: SymbolId::new(1),
             client_order_id: None,
             timestamp: ts(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            price: "50000".parse().unwrap(),
+            quantity: "1.0".parse().unwrap(),
+            stop_price: None,
+            reduce_only: false,
+            visible_quantity: None,
+            trailing_delta: None,
+            trailing_peak_price: None,
         },
         Event::OrderRejected {
             order_id: OrderId::new(2),
@@ -91,6 +101,16 @@ fn from_seq_filters_earlier_events() {
             symbol: SymbolId::new(1),
             client_order_id: None,
             timestamp: ts(),
+            side: Side::Buy,
+            order_type: OrderType::Limit,
+            time_in_force: TimeInForce::Gtc,
+            price: "50000".parse().unwrap(),
+            quantity: "1.0".parse().unwrap(),
+            stop_price: None,
+            reduce_only: false,
+            visible_quantity: None,
+            trailing_delta: None,
+            trailing_peak_price: None,
         })
         .collect();
     write_events(tmp.path(), &events);
@@ -113,6 +133,16 @@ fn corrupted_wal_returns_error() {
         symbol: SymbolId::new(1),
         client_order_id: None,
         timestamp: ts(),
+        side: Side::Buy,
+        order_type: OrderType::Limit,
+        time_in_force: TimeInForce::Gtc,
+        price: "50000".parse().unwrap(),
+        quantity: "1.0".parse().unwrap(),
+        stop_price: None,
+        reduce_only: false,
+        visible_quantity: None,
+        trailing_delta: None,
+        trailing_peak_price: None,
     };
     write_events(tmp.path(), &[event]);
 
