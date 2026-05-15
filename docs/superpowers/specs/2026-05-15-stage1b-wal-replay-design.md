@@ -321,9 +321,9 @@ Twelve tests (spec originally said ten; landed on twelve after self-review to ke
 
 ### 8.2 Integration tests (`crates/exg-server/tests/stage1b_e2e.rs`)
 
-Sixteen tests, each `#[sqlx::test(migrations = "../../migrations")]`:
+Seventeen tests, each `#[sqlx::test(migrations = "../../migrations")]`:
 
-Replay correctness (9):
+Replay correctness (10):
 - `boot_replays_empty_wal_succeeds`
 - `boot_replays_single_order_restores_orderbook`
 - `boot_replays_place_cancel_restores_empty_orderbook`
@@ -333,6 +333,7 @@ Replay correctness (9):
 - `boot_panics_on_sequence_gap`
 - `boot_panics_on_unknown_order_filled`
 - `place_then_kill_then_place_continues_sequence`
+- **`replay_survived_order_matches_post_reboot_taker`** (CEO review A4): boot 1 places maker bid; kill; boot 2 places aggressive taker at maker price; second WAL contains an `OrderFilled` event referencing the maker `order_id` from boot 1 — proves replay restored the order to the matchable book, not just to "boot didn't panic."
 
 Polish (7):
 - `cancel_order_rate_limit`
@@ -382,6 +383,36 @@ Numbering continues from Stage 1a's #20.
 - **#22** WAL replay is fail-fast: any CRC mismatch, sequence gap, rkyv decode error, or `apply_event` error during boot is fatal.
 - **#23** Replay is single-threaded and synchronous: no other thread reads or writes the engine state during Step 3.6.
 
+## 9.5 Migration from Stage 1a (CEO review A7)
+
+Stage 1b's `OrderAccepted` schema change is **not rkyv-forward-compatible**. WAL files written by any Stage 0 or Stage 1a binary cannot be decoded by Stage 1b. Pre-upgrade actions for any environment that ran Stage 1a:
+
+```bash
+# stop the Stage 1a server (clean shutdown)
+docker compose stop exg-server   # or kill -INT <pid>
+
+# wipe the WAL (no production data exists; dev/CI loses all open orders)
+rm -rf data/wal
+
+# OR — if forensic access is desired — rename rather than delete
+mv data/wal data/wal-stage1a-archive
+```
+
+CI environments must clear their WAL caches once on the Stage 1b boot. The demo script (`scripts/demo-stage1b.sh`) uses `mktemp -d` so the demo path is unaffected.
+
+After the cleanup, Stage 1b boot encounters an empty WAL, replays zero events, and proceeds normally. From that point on, every WAL record uses the new schema and replay is fully functional.
+
+## 9.6 Rollback to Stage 1a (CEO review A8)
+
+Stage 1b is dev-only — no production users are affected by a rollback. Procedure if Stage 1b ships and immediately breaks:
+
+1. Stop the Stage 1b server (clean shutdown — `kill -INT <pid>` lets the matching thread drain).
+2. `git revert <merge-commit>` to put Stage 1a code back.
+3. `rm -rf data/wal` — Stage 1a's invariant 3 ("WAL must be empty") will otherwise reject boot. **All Stage 1b orders are lost**; this is acceptable in dev.
+4. Restart.
+
+A production-grade rollback (one that preserves orders across schema changes) is out of scope until Stage 5+. See forward pointer "Production rollback strategy."
+
 ## 10. Acceptance
 
 PR passes when:
@@ -390,7 +421,7 @@ PR passes when:
 2. `cargo clippy --workspace -- -D warnings` clean.
 3. `cargo fmt --check` clean.
 4. `cargo test --workspace` all green (≥390 tests).
-5. New tests: replay unit 10/10, stage1b_e2e 16/16.
+5. New tests: replay unit 12/12, stage1b_e2e 17/17 (one extra "replay survived matching" e2e added per CEO review A4).
 6. Existing tests: stage0_e2e 7/7, stage1a_e2e 12/12, boot_panics 6/6 (was 7, one removed), user-service 30/30.
 7. New script `scripts/demo-stage1b.sh` walks: docker-compose up → migrate reset → boot → place order → ^C → boot again → GET /me/orders shows order persists (or equivalent — use take_snapshot inspection if no orders endpoint yet) → ^C → wal-dump shows event count > 0.
 
@@ -404,6 +435,9 @@ PR passes when:
 - **Liquidation engine**: adds `Event::LiquidationOrder` writes — same `apply_event` extension.
 - **Funding rate service**: same pattern.
 - **WAL replay performance**: Stage 1b is single-threaded byte-by-byte. If 100k+ events become routine, consider parallel decode (`apply_event` itself must stay serial, but rkyv decode can pipeline).
+- **WAL volume-loss sentinel** (CEO review A1): an empty WAL directory is currently indistinguishable from "fresh install" vs "volume not mounted / WAL deleted." When Stage 2 lands persistent metadata in PG, record a `wal_existed_at_seq` row on each non-empty boot. If a subsequent boot sees `wal_existed_at_seq > 0` in PG but the WAL dir is empty, panic with "WAL volume missing — refuse to boot with empty engine." Until then, operators must verify the WAL mount manually before each restart.
+- **Replay observability** (CEO review A5): expose `wal_replay_duration_seconds` and `wal_replay_events_total` as Prometheus metrics. Replay corruption emits `wal_replay_corruption_total{reason="crc|gap|decode|apply|invariant_21"}` for alerting. Wire up alongside the Stage 5+ metrics stack rollout; for now the single `info!` line at boot is enough for dev visibility.
+- **Production rollback strategy** (CEO review A8): schema versioning + reversible migrations. When event schemas change between stages, the new code must accept previous-stage events for one major version, and rollback must not require WAL deletion. Out of scope until Stage 5+ when production traffic exists.
 
 ---
 

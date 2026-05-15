@@ -39,12 +39,12 @@
 ### Test surface
 
 - **Unit (in `replay.rs`):** 12 tests covering each dispatch arm + error paths + a round-trip golden test.
-- **Integration (`stage1b_e2e.rs`):** 16 tests — 9 replay correctness + 7 polish.
+- **Integration (`stage1b_e2e.rs`):** 17 tests — 10 replay correctness + 7 polish (the 10th replay test is `replay_survived_order_matches_post_reboot_taker`, added per CEO review A4).
 - **Existing test deltas:** `boot_panics.rs` net +1 (removes 1 obsolete test, adds 2 new corruption tests). `stage0_e2e.rs` + `stage1a_e2e.rs` source unchanged (rest-pattern matches forward-compat with `OrderAccepted` field additions).
 
 Target counts:
-- Workspace tests rise by `12 + 16 + (2 - 1) = +29`
-- `cargo test --workspace` total grows from ~390 to ~419
+- Workspace tests rise by `12 + 17 + (2 - 1) = +30`
+- `cargo test --workspace` total grows from ~390 to ~420
 
 ---
 
@@ -56,11 +56,27 @@ Target counts:
 | 2 | `apply_event` + `ApplyError` + 12 unit tests | replay.rs (NEW), matching-engine lib.rs | 12 unit |
 | 3 | Boot lifecycle: remove invariant 3, add Step 3.6 + 3.8 | server lib.rs | 0 (existing test removal in Task 4) |
 | 4 | Boot panic test update + new corrupt/gap tests | boot_panics.rs | net +2 |
-| 5 | Handler polish (cancel/amend bucket + login double-consume + invariant 3 spec rename) | api-gateway handlers.rs | 0 new (covered in Task 6) |
-| 6 | Stage 1b e2e suite | stage1b_e2e.rs (NEW) | 16 integration |
-| 7 | Demo script + final acceptance | scripts/demo-stage1b.sh (NEW) | — |
+| 5 | Handler polish (cancel/amend bucket via `consume_user_bucket` helper + login double-consume) | api-gateway handlers.rs | 0 new (covered in Task 6) |
+| 6 | Stage 1b e2e suite (17 cases: 10 replay + 7 polish) | stage1b_e2e.rs (NEW) | 17 integration |
+| 7 | Demo script + WAL-replay-failed runbook + final acceptance | scripts/demo-stage1b.sh (NEW), docs/runbooks/wal-replay-failed.md (NEW) | — |
 
 Total LOC delta (excluding tests): ~250 prod + ~600 test. Plan execution order is strict — each task depends on the previous.
+
+### Stage 1a → Stage 1b cutover (CEO review A7)
+
+The `OrderAccepted` schema change in Task 1 is **not rkyv-forward-compatible**. Any environment that ran Stage 1a has WAL files Stage 1b cannot decode. Before running any Stage 1b test that hits a pre-existing `data/wal` directory:
+
+```bash
+rm -rf data/wal           # destroys all open orders — acceptable, no production data
+# OR, to keep forensics:
+mv data/wal data/wal-stage1a-archive
+```
+
+CI environments must clear `data/wal` once on the Stage 1b boot. The `#[sqlx::test]` and `TempDir`-based test paths are immune (fresh dir per test).
+
+### Rollback path (CEO review A8)
+
+If Stage 1b merges and breaks production: `git revert <merge>` → `rm -rf data/wal` (Stage 1a invariant 3 rejects non-empty WAL) → restart. All in-flight orders lost. Acceptable because Stage 1b ships into a dev-only environment. Spec §9.6 documents the full procedure.
 
 ---
 
@@ -851,9 +867,9 @@ cargo check -p exg-server 2>&1 | tail -5
 
 Expected: clean. The `PathBuf` import may become unused — leave it for now (used elsewhere in the file).
 
-- [ ] **Step 3: Add Step 3.6 (WAL replay) inside `run_with_config_with_pool`**
+- [ ] **Step 3: Add Step 3.6 (WAL replay) inside `run_with_config_with_pool` (CEO review A3 — single `ReplayError` enum)**
 
-In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing Step 3.7 (`init_dummy_argon2_hash`). Insert Step 3.6 immediately before it:
+In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing Step 3.7 (`init_dummy_argon2_hash`). Insert Step 3.6 immediately before it, using a single `Option<ReplayError>` for error propagation instead of three separate option captures:
 
 ```rust
     // ── Step 3.6 (Stage 1b): WAL replay ───────────────────────────────────
@@ -866,18 +882,44 @@ In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing 
     {
         use exg_wal::WalReader;
 
+        // Local error enum keeps the closure body single-exit and the post-loop
+        // check single-branch. Variants map 1:1 to the failure modes documented
+        // in the spec §7.1 boot-panic table.
+        enum ReplayError {
+            SequenceGap { expected: u64, got: u64 },
+            Decode { seq: u64, msg: String },
+            Apply { seq: u64, msg: String },
+        }
+        impl std::fmt::Display for ReplayError {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    ReplayError::SequenceGap { expected, got } => write!(
+                        f,
+                        "WAL replay failed: sequence gap at expected={expected}, got={got}"
+                    ),
+                    ReplayError::Decode { seq, msg } => {
+                        write!(f, "WAL replay failed: rkyv decode at sequence {seq}: {msg}")
+                    }
+                    ReplayError::Apply { seq, msg } => {
+                        write!(f, "WAL replay failed at sequence {seq}: {msg}")
+                    }
+                }
+            }
+        }
+
         let wal_dir = PathBuf::from(&cfg.wal.dir);
         let mut reader = WalReader::open(&wal_dir).context("WAL reader open")?;
         let mut expected_seq: u64 = 0;
         let mut replayed_count: u64 = 0;
-        let mut gap_seq: Option<(u64, u64)> = None;
-        let mut decode_err: Option<(u64, String)> = None;
-        let mut apply_err: Option<(u64, String)> = None;
+        let mut replay_err: Option<ReplayError> = None;
 
         reader
             .read_from(0, |seq, payload| {
                 if seq != expected_seq {
-                    gap_seq = Some((expected_seq, seq));
+                    replay_err = Some(ReplayError::SequenceGap {
+                        expected: expected_seq,
+                        got: seq,
+                    });
                     return false;
                 }
                 let event = match rkyv::from_bytes::<exg_protocol::Event, rkyv::rancor::Error>(
@@ -885,12 +927,18 @@ In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing 
                 ) {
                     Ok(e) => e,
                     Err(e) => {
-                        decode_err = Some((seq, format!("{e}")));
+                        replay_err = Some(ReplayError::Decode {
+                            seq,
+                            msg: format!("{e}"),
+                        });
                         return false;
                     }
                 };
                 if let Err(e) = engine.apply_event(&event) {
-                    apply_err = Some((seq, format!("{e}")));
+                    replay_err = Some(ReplayError::Apply {
+                        seq,
+                        msg: format!("{e}"),
+                    });
                     return false;
                 }
                 expected_seq = seq + 1;
@@ -899,16 +947,8 @@ In `crates/exg-server/src/lib.rs::run_with_config_with_pool`, find the existing 
             })
             .map_err(|e| anyhow::anyhow!("WAL replay failed: {e}"))?;
 
-        if let Some((expected, got)) = gap_seq {
-            anyhow::bail!(
-                "WAL replay failed: sequence gap at expected={expected}, got={got}"
-            );
-        }
-        if let Some((seq, err)) = decode_err {
-            anyhow::bail!("WAL replay failed: rkyv decode at sequence {seq}: {err}");
-        }
-        if let Some((seq, err)) = apply_err {
-            anyhow::bail!("WAL replay failed at sequence {seq}: {err}");
+        if let Some(err) = replay_err {
+            anyhow::bail!("{err}");
         }
 
         // ── Step 3.8 (Stage 1b): invariant 21 ─────────────────────────────
@@ -1148,32 +1188,60 @@ EOF
 
 ---
 
-## Task 5: Handler polish — cancel/amend bucket + login double-consume
+## Task 5: Handler polish — `consume_user_bucket` helper + cancel/amend + login double-consume
 
 **Files:**
 - Modify: `crates/exg-api-gateway/src/handlers.rs`
 
-### Step 1: Add per-user rate-limit gate to `cancel_order`
+### Step 1: Extract `consume_user_bucket` helper (CEO review A2)
 
-In `crates/exg-api-gateway/src/handlers.rs::cancel_order`, immediately after `let user_id = extract_user_id_from_jwt(&req, ...)?;` (around line 162) and before the `let symbol = ...` line, insert:
+The rate-limit consumption pattern would appear 3 times (place + cancel + amend) without a helper. Extract once. In `crates/exg-api-gateway/src/handlers.rs`, near the existing helper `extract_user_id_from_jwt`, add:
 
 ```rust
-    // Per-user rate limit gate (shared bucket with place_order + amend_order).
-    {
-        let now_ts = UnixMicros::now();
-        let key = format!("user:{}", user_id.value());
-        let mut limiter = state.rate_limiter.lock();
-        if !limiter.consume(&key, now_ts) {
-            return Err(ApiError::user_rate_limited("rate limit exceeded for user"));
-        }
+/// Charge one token from the per-user rate limit bucket (`user:{id}` key).
+/// Shared by place / cancel / amend. Returns 429 + ERR_RATE_LIMITED_USER on miss.
+fn consume_user_bucket(state: &AppState, user_id: UserId) -> Result<(), ApiError> {
+    let now_ts = UnixMicros::now();
+    let key = format!("user:{}", user_id.value());
+    let mut limiter = state.rate_limiter.lock();
+    if !limiter.consume(&key, now_ts) {
+        return Err(ApiError::user_rate_limited("rate limit exceeded for user"));
     }
+    Ok(())
+}
 ```
 
-- [ ] **Step 2: Add the same gate to `amend_order`**
+`UserId` is already imported at the top of handlers.rs.
 
-In `amend_order` (around line 189), same position (after `extract_user_id_from_jwt`, before `let symbol = ...`), insert the **identical block** as Step 1. Yes, the code is duplicated; extraction into a helper is a future polish — keeping it inline here matches Stage 1a's pattern and avoids touching the helper structure.
+- [ ] **Step 2: Migrate `place_order` to use the helper**
 
-- [ ] **Step 3: Fix login `||` short-circuit**
+Find the existing in-line rate-limit block in `place_order` (the one Stage 1a added). Replace the inline block with:
+
+```rust
+    consume_user_bucket(&state, user_id)?;
+```
+
+This removes ~7 lines from `place_order`.
+
+- [ ] **Step 3: Add the helper call to `cancel_order`**
+
+In `cancel_order`, immediately after `let user_id = extract_user_id_from_jwt(&req, ...)?;` and before `let symbol = ...`, insert:
+
+```rust
+    consume_user_bucket(&state, user_id)?;
+```
+
+- [ ] **Step 4: Add the helper call to `amend_order`**
+
+In `amend_order`, same position (after `extract_user_id_from_jwt`, before `let symbol = ...`), insert:
+
+```rust
+    consume_user_bucket(&state, user_id)?;
+```
+
+All three handlers now share one bucket via one call site. Future endpoints (`cancel_all`, etc.) reuse the same helper.
+
+- [ ] **Step 5: Fix login `||` short-circuit**
 
 In `handlers.rs::login`, find the existing block (around line 246):
 
@@ -1206,7 +1274,7 @@ Replace with:
     }
 ```
 
-- [ ] **Step 4: Run handler tests (lib tests)**
+- [ ] **Step 6: Run handler tests (lib tests)**
 
 ```bash
 cargo test -p exg-api-gateway --lib 2>&1 | tail -5
@@ -1214,16 +1282,16 @@ cargo test -p exg-api-gateway --lib 2>&1 | tail -5
 
 Expected: 29/29 still passing (handler unit tests do not assert rate-limit on cancel/amend; e2e tests in Task 6 cover the new behavior).
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add crates/exg-api-gateway/src/handlers.rs
 git commit -m "$(cat <<'EOF'
 fix(api-gateway): close Stage 1a rate-limit gaps
 
-- cancel_order + amend_order now consume the same per-user "user:N"
-  token bucket as place_order. Attacker cannot escape the cap by
-  spamming amend instead of place.
+- New helper consume_user_bucket(&state, user_id) shared by place /
+  cancel / amend (DRY; CEO review A2). All three handlers route
+  through one call site with key "user:{N}".
 - login: stop short-circuiting the IP bucket consume when the email
   bucket has already been exhausted. Both buckets charged on every
   attempt; rotating emails from one IP still depletes the IP bucket.
@@ -1737,9 +1805,106 @@ async fn boot_with_only_rejected_events_succeeds(pool: PgPool) {
     let (handle, _) = boot_server(cfg, pool).await;
     handle.shutdown().await.unwrap();
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn replay_survived_order_matches_post_reboot_taker(pool: PgPool) {
+    // CEO review A4 — strongest replay correctness test. Without this, the
+    // other replay e2e tests only prove "boot did not panic", not "the order
+    // that was on the book before kill is on the book after replay and can
+    // be matched." This test routes the verification through the matching
+    // engine itself: if the maker order survived replay correctly, the
+    // taker's aggressive order will match it and the new WAL records will
+    // contain an OrderFilled referencing the maker order_id from boot 1.
+    let tmp = TempDir::new().unwrap();
+    let wal_dir = std::path::PathBuf::from(tmp.path());
+    let cfg = base_cfg(tmp.path());
+
+    // ── Boot 1: place a resting maker bid, shut down cleanly. ────────────
+    let maker_order_id: u64 = {
+        let (handle, base) = boot_server(cfg.clone(), pool.clone()).await;
+        let client = Client::new();
+        let maker_token =
+            register_and_login(&client, &base, "maker-survives@e.com", "hunter2hunter2").await;
+        let resp: serde_json::Value = client
+            .post(format!("{base}/api/v1/order"))
+            .header("Authorization", format!("Bearer {maker_token}"))
+            .json(&serde_json::json!({
+                "symbol":"BTCUSDT","side":"BUY","orderType":"LIMIT",
+                "timeInForce":"GTC","quantity":"0.001","price":"61000"
+            }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let oid: u64 = resp["orderId"].as_str().unwrap().parse().unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await; // WAL flush
+        handle.shutdown().await.unwrap();
+        oid
+    };
+
+    // Snapshot the WAL record count from boot 1 so we can identify NEW
+    // records appended during boot 2.
+    let mut reader = WalReader::open(&wal_dir).unwrap();
+    let mut boot1_record_count: u64 = 0;
+    reader
+        .read_from(0, |_seq, _payload| {
+            boot1_record_count += 1;
+            true
+        })
+        .unwrap();
+
+    // ── Boot 2: replay (Step 3.6 fires on the maker's OrderAccepted),
+    // then a taker hits the maker at the maker's price. ──────────────────
+    {
+        let (handle2, base2) = reboot(cfg, pool).await;
+        let client = Client::new();
+        let taker_token =
+            register_and_login(&client, &base2, "taker-hits-maker@e.com", "hunter2hunter2").await;
+        let resp = client
+            .post(format!("{base2}/api/v1/order"))
+            .header("Authorization", format!("Bearer {taker_token}"))
+            .json(&serde_json::json!({
+                "symbol":"BTCUSDT","side":"SELL","orderType":"LIMIT",
+                "timeInForce":"GTC","quantity":"0.001","price":"61000"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.status().is_success(), "taker place failed: {resp:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        handle2.shutdown().await.unwrap();
+    }
+
+    // ── Verify: boot 2's NEW WAL records contain an OrderFilled
+    // referencing the maker_order_id from boot 1. ────────────────────────
+    let mut reader = WalReader::open(&wal_dir).unwrap();
+    let mut filled_for_maker = false;
+    let mut seen: u64 = 0;
+    reader
+        .read_from(0, |_seq, payload| {
+            seen += 1;
+            if seen <= boot1_record_count {
+                return true; // skip boot 1 records
+            }
+            let e: Event = rkyv::from_bytes::<Event, rkyv::rancor::Error>(payload).unwrap();
+            if let Event::OrderFilled { order_id, .. } = e {
+                if order_id.value() == maker_order_id {
+                    filled_for_maker = true;
+                }
+            }
+            true
+        })
+        .unwrap();
+    assert!(
+        filled_for_maker,
+        "post-reboot taker did not match the replayed maker order — replay regression"
+    );
+}
 ```
 
-Now stage1b_e2e.rs has 9 replay tests.
+Now stage1b_e2e.rs has **10 replay tests**.
 
 - [ ] **Step 4: Write polish e2e tests (7 tests)**
 
@@ -1995,7 +2160,7 @@ DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg \
   cargo test -p exg-server --test stage1b_e2e 2>&1 | tail -25
 ```
 
-Expected: **16 passed** (9 replay + 7 polish).
+Expected: **17 passed** (10 replay + 7 polish).
 
 Common failure modes to debug if not green:
 - `boot_replays_three_orders_inspectable_via_wal` count mismatch: the matching engine emits OrderAccepted both for the conditional-order path and the regular path; verify only one OrderAccepted per submitted order.
@@ -2027,9 +2192,9 @@ If the IP-bucket test is flaky, replace its logic with:
 ```bash
 git add crates/exg-server/tests/stage1b_e2e.rs crates/exg-server/Cargo.toml
 git commit -m "$(cat <<'EOF'
-test(server): add Stage 1b e2e suite (16 cases)
+test(server): add Stage 1b e2e suite (17 cases)
 
-Replay correctness (9):
+Replay correctness (10):
 - boot on empty WAL succeeds
 - boot replays single order
 - boot replays place+cancel
@@ -2039,6 +2204,7 @@ Replay correctness (9):
 - boot replays N orders inspectable via wal-dump count
 - replay engine state matches live engine for same command stream
 - boot with OrderRejected-only WAL succeeds (no-op arm)
+- replay-survived order matches post-reboot taker (CEO review A4)
 
 Polish (7):
 - cancel_order per-user rate limit
@@ -2056,10 +2222,80 @@ EOF
 
 ---
 
-## Task 7: Demo script + final acceptance
+## Task 7: Demo script + WAL-replay-failed runbook + final acceptance
 
 **Files:**
 - Create: `scripts/demo-stage1b.sh`
+- Create: `docs/runbooks/wal-replay-failed.md`
+
+### Step 0: Write `docs/runbooks/wal-replay-failed.md` (CEO review A6)
+
+Operators need a one-page guide for the boot panics introduced in Step 3.6/3.8. Create `docs/runbooks/wal-replay-failed.md`:
+
+```markdown
+# Runbook: `WAL replay failed` at boot
+
+A boot panic with message starting `WAL replay failed:` or `invariant 21
+violated:` means Stage 1b's replay step (server lib.rs Step 3.6 / 3.8)
+rejected the on-disk WAL. The server refuses to start to prevent silent
+state divergence.
+
+## Identify the failure mode
+
+Grep the boot stderr for the exact panic line. Five variants:
+
+| Panic message prefix                          | Root cause                                     |
+| --------------------------------------------- | ---------------------------------------------- |
+| `WAL writer open failed: corrupt at sequence` | CRC mismatch in mid-stream segment (writer-open level — see spec §7.1). |
+| `WAL replay failed: sequence gap at expected` | A WAL record is missing between two existing records. |
+| `WAL replay failed: rkyv decode at sequence`  | An event's bytes do not match the current rkyv layout. Usually a schema change without WAL clear. |
+| `WAL replay failed at sequence`               | `apply_event` returned an `ApplyError` (UnknownOrder / DuplicateOrder / OverFill / UnexpectedVariant). |
+| `invariant 21 violated`                       | Reader's replayed event count ≠ writer's recorded next sequence. WAL state internally inconsistent. |
+
+## Recovery actions
+
+**Dev / CI environment (Stage 1b ships into this).** The contract is:
+no production data exists. Reset:
+
+```bash
+# Stop the failed server (it's already exited).
+rm -rf data/wal
+
+# (Optional) preserve the broken WAL for forensics:
+mv data/wal data/wal-broken-$(date +%s)
+mkdir data/wal
+
+# Restart.
+EXG_CONFIG=config/default.toml RUST_LOG=info ./target/release/exg-server
+```
+
+The server boots with an empty WAL, replays zero events, and proceeds
+normally. All previously open orders are lost.
+
+**Production environment (future, not Stage 1b).** Do not run the dev
+recovery. Page on-call SRE. Steps will live in a separate Stage 5+
+runbook covering snapshot fallback, partial-truncate repair, and
+multi-replica reconciliation. The Stage 1b runbook is intentionally
+narrow.
+
+## Most common cause in dev: schema drift
+
+After pulling a Stage 1b commit that bumped an event schema (the
+Stage 1a → 1b cutover is the classic case), any WAL written by the
+older binary is unreadable. The fix is always `rm -rf data/wal`.
+See spec §9.5 "Migration from Stage 1a."
+
+## What NOT to do
+
+- Don't delete only "some" segments — the writer's `recover_state` will
+  surface a CRC or sequence-gap panic.
+- Don't manually edit a segment file — the CRC trailer makes byte edits
+  detectable, but a coincidental CRC-valid edit (vanishingly rare) would
+  produce a silently wrong replay.
+- Don't disable invariant 21 to "see what happens" — it exists because
+  reader/writer disagreement is a real-world symptom of a bug somewhere.
+  File an issue instead.
+```
 
 ### Step 1: Write the demo script
 
@@ -2205,7 +2441,7 @@ scripts/demo-stage1b.sh
 
 Expected pass counts:
 - `cargo test --workspace`: all green (~415 tests)
-- `stage1b_e2e`: 16/16
+- `stage1b_e2e`: 17/17
 - `stage1a_e2e`: 12/12
 - `stage0_e2e`: 7/7
 - `boot_panics`: 8/8
@@ -2214,16 +2450,21 @@ Expected pass counts:
 
 If `cargo fmt --check` flags issues, run `cargo fmt`, stage the modified `.rs` files, commit as a separate `style: cargo fmt` commit.
 
-- [ ] **Step 4: Commit the demo script**
+- [ ] **Step 4: Commit the demo script + runbook**
 
 ```bash
-git add scripts/demo-stage1b.sh
+git add scripts/demo-stage1b.sh docs/runbooks/wal-replay-failed.md
 git commit -m "$(cat <<'EOF'
-feat(scripts): add stage 1b cold-boot demo script
+feat(scripts): add stage 1b cold-boot demo + replay-failed runbook
 
-Boots the server, places one order via the JWT flow, kills the server,
-boots it a second time (replays the WAL), and dumps WAL contents before
-and after to make the replay path observable.
+Demo boots the server, places one order via the JWT flow, kills the
+server, boots a second time (replays the WAL), and dumps WAL contents
+before and after to make the replay path observable.
+
+Runbook docs/runbooks/wal-replay-failed.md catalogs the five replay
+boot panics and the dev recovery path (rm -rf data/wal). Per CEO
+review A6 — operators need to see the recovery action, not just the
+panic message.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
