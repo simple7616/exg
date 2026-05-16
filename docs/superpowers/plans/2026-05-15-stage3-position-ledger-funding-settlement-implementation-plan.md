@@ -1324,10 +1324,14 @@ Add to `impl PostTradeProcessor`:
                 self.mark_price = *mark_price;
             }
             Event::FundingRateUpdate { .. } => {
-                // Settlement NO-OP on replay (invariant 36). Keep the
-                // period counter aligned so a post-replay live tick uses
-                // the next id.
-                self.funding_period_id += 1;
+                // Settlement NO-OP on replay (invariant 36). Do NOT bump
+                // funding_period_id here (final-review fix 166e938): live
+                // only bumps it inside settle_funding's success path — the
+                // CEO-C3 zero-mark guard skips the bump — so incrementing
+                // per FundingRateUpdate event would drift ahead of live for
+                // skipped ticks. The FundingSettled arm's
+                // `max(self, fact.funding_period_id)` is the SOLE replay
+                // updater and restores it byte-identically to live.
             }
             Event::AdminCredited { user_id, amount, idempotency_key, timestamp } => {
                 self.ledger.get_or_create_account(*user_id);
