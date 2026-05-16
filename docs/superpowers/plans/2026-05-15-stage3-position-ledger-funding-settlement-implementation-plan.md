@@ -1351,12 +1351,17 @@ Add to `impl PostTradeProcessor`:
                 let _ = self.ledger.settle_realized_pnl_capped(*user_id, *amount, &key, *timestamp);
             }
             Event::FundingSettled { user_id, symbol, funding_period_id, amount, timestamp } => {
-                // `amount` is the already-moved capped value; re-apply via
-                // the same capped primitive + same key as the live funding
-                // path (funding_{period}_{user}_{symbol}).
+                // T4 SHIPPED REALITY — sign bridge: `FundingSettled.amount`
+                // is in the funding convention (positive = user PAID), but
+                // `settle_realized_pnl_capped` uses the PnL convention
+                // (positive = CREDIT user). The live funding path passes
+                // `-payment` and records `fact_amount = -moved`. Replay must
+                // mirror EXACTLY: pass `-amount` so a user who paid is
+                // re-debited (not credited). Same key as live
+                // (funding_{period}_{user}_{symbol}); idempotent.
                 self.ledger.get_or_create_account(*user_id);
                 let key = format!("funding_{}_{}_{}", funding_period_id, user_id.value(), symbol.value());
-                let _ = self.ledger.settle_realized_pnl_capped(*user_id, *amount, &key, *timestamp);
+                let _ = self.ledger.settle_realized_pnl_capped(*user_id, -*amount, &key, *timestamp);
                 if *funding_period_id > self.funding_period_id {
                     self.funding_period_id = *funding_period_id;
                 }
