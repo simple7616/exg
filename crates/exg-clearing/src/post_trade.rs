@@ -326,10 +326,15 @@ impl PostTradeProcessor {
                 self.mark_price = *mark_price;
             }
             Event::FundingRateUpdate { .. } => {
-                // Settlement NO-OP on replay (invariant 36). Keep the
-                // period counter aligned so a post-replay live tick uses
-                // the next id.
-                self.funding_period_id += 1;
+                // Settlement NO-OP on replay (invariant 36). Do NOT touch
+                // funding_period_id here: live only bumps it inside
+                // settle_funding's success path (the CEO-C3 zero-mark guard
+                // skips the bump), so incrementing per FundingRateUpdate
+                // event would drift ahead of live for skipped ticks. The
+                // FundingSettled replay arm reconciles funding_period_id via
+                // `max(self, fact.funding_period_id)`, which restores it
+                // EXACTLY to the live value (each settled tick recorded its
+                // period in the fact). No-op is correct and byte-identical.
             }
             Event::AdminCredited {
                 user_id,
@@ -1104,6 +1109,58 @@ mod tests {
         assert_eq!(
             before, after,
             "FundingRateUpdate replay must not settle (invariant 36)"
+        );
+    }
+
+    #[test]
+    fn rt_zero_mark_tick_then_valid_tick_funding_period_id_aligned() {
+        let mut live = PostTradeProcessor::new();
+        let mut all = Vec::new();
+        all.extend(live.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts()));
+        all.extend(live.handle_admin_credit(UserId::new(2), dec("100000"), "c2", ts()));
+        // open long+short BEFORE any MarkPriceUpdate → next funding tick is
+        // a C3 zero-mark skip (mark_price still ZERO).
+        live_step(&mut live, &[filled(1, Side::Buy, "1", "60000")], &mut all);
+        live_step(&mut live, &[filled(2, Side::Sell, "1", "60000")], &mut all);
+        // zero-mark funding tick → C3 skip: no FundingSettled, period NOT bumped
+        live_step(
+            &mut live,
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        // now set mark, then a valid funding tick
+        live_step(
+            &mut live,
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        live_step(
+            &mut live,
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        let replayed = replay_all(&all);
+        assert_equivalent(&live, &replayed, &[1, 2]);
+        // the load-bearing extra assertion: funding_period_id reconstructs
+        // EXACTLY (direct field access — same-file child module). Without
+        // the fix replay would be 2 (one bump per FundingRateUpdate event)
+        // vs live 1 (the zero-mark tick C3-skipped its bump).
+        assert_eq!(
+            live.funding_period_id, replayed.funding_period_id,
+            "funding_period_id must be byte-identical after a zero-mark-skip + valid tick"
         );
     }
 
