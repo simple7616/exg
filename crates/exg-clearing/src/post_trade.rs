@@ -20,10 +20,12 @@ pub struct PostTradeProcessor {
     #[expect(dead_code, reason = "consumed by funding settlement in Task 4")]
     funding_period_id: u64,
     /// Monotonic per-emitted-RealizedPnl discriminator. Used to build a
-    /// stable idempotency key `pnl_{seq}_{user}_{symbol}`. Replay (Task 5)
+    /// stable idempotency key `pnl_{seq}_{user}_{symbol}`. Advanced **iff**
+    /// a `RealizedPnl` fact is actually emitted (an underfunded zero-move
+    /// loss advances neither this nor emits an event). Replay (Task 5)
     /// re-applies `RealizedPnl` facts in WAL order and MUST increment this
     /// in the exact same order so keys match — this determinism is
-    /// load-bearing.
+    /// load-bearing (spec invariant 31).
     pnl_seq: u64,
 }
 
@@ -36,14 +38,6 @@ impl PostTradeProcessor {
             funding_period_id: 0,
             pnl_seq: 0,
         }
-    }
-
-    /// Next monotonic realized-PnL sequence. Live `consume` and replay
-    /// `apply_event` (Task 5) MUST call this in the same order so the
-    /// derived idempotency keys match across live↔replay (load-bearing).
-    fn next_pnl_seq(&mut self) -> u64 {
-        self.pnl_seq += 1;
-        self.pnl_seq
     }
 
     /// Read-only accessors for tests / boot invariant checks.
@@ -81,12 +75,22 @@ impl PostTradeProcessor {
                 let pnl =
                     self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
                 if !pnl.is_zero() {
-                    let seq = self.next_pnl_seq();
+                    // Invariant 31: `pnl_seq` MUST advance in lockstep with
+                    // emitted `RealizedPnl` facts so live↔replay idempotency
+                    // keys match. We settle with the PROVISIONAL next seq but
+                    // only COMMIT (increment) the counter when the move is
+                    // non-zero and a fact is actually pushed. An underfunded
+                    // loss with 0 available caps `moved` to 0 → no event AND
+                    // no seq advance, exactly mirroring Task 5 replay (which
+                    // increments once per replayed RealizedPnl fact).
+                    let next_seq = self.pnl_seq + 1;
                     // CEO C1/C1b: record the ACTUALLY-MOVED signed amount
                     // (capped at the user's available for a loss), not the
                     // notional pnl — replay applies this fact directly.
-                    let moved = self.settle_realized_pnl(*user_id, *symbol, pnl, seq, ts_param);
+                    let moved =
+                        self.settle_realized_pnl(*user_id, *symbol, pnl, next_seq, ts_param);
                     if !moved.is_zero() {
+                        self.pnl_seq = next_seq;
                         out.push(Event::RealizedPnl {
                             user_id: *user_id,
                             symbol: *symbol,
@@ -141,6 +145,28 @@ impl PostTradeProcessor {
     ) -> Decimal128 {
         if pnl.is_zero() {
             return Decimal128::ZERO;
+        }
+        // Invariant 31 (live↔replay key lockstep): a loss the user cannot
+        // cover at all (`Funding.available == 0`) moves 0 — `cover =
+        // min(owed, 0) = 0`. We MUST NOT call `settle_realized_pnl_capped`
+        // for it: that op records `key` into the ledger's idempotency set
+        // UNCONDITIONALLY (operations.rs check_idempotency inserts on first
+        // call), poisoning the key even though nothing moved and no fact is
+        // emitted. Replay (Task 5) has NO RealizedPnl fact for this fill so
+        // it never settles and never consumes the key → live would diverge
+        // from replay (same seq reused later hits the poisoned key → real
+        // settlement silently no-ops). Short-circuit read-only BEFORE
+        // building the key or touching the ledger: no key consumed, no seq
+        // advance, no event — exactly mirroring replay.
+        if pnl.is_negative() {
+            let available = self
+                .ledger
+                .get_balance(user_id, exg_ledger::WalletType::Funding)
+                .map(|b| b.available)
+                .unwrap_or(Decimal128::ZERO);
+            if available.is_zero() {
+                return Decimal128::ZERO;
+            }
         }
         let key = format!("pnl_{seq_tag}_{}_{}", user_id.value(), symbol.value());
         self.ledger.get_or_create_account(user_id);
@@ -368,6 +394,54 @@ mod tests {
             .get_balance(UserId::new(42), exg_ledger::WalletType::Funding)
             .unwrap();
         assert_eq!(bal.available, dec("9000"));
+        pt.ledger().verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn zero_move_loss_does_not_advance_pnl_seq() {
+        let mut pt = PostTradeProcessor::new();
+        // User 7 has NO admin credit → 0 Funding available. Open long
+        // 1 @60000, close 1 @59000 → pnl -1000 but available 0 → capped
+        // moved == 0 → NO RealizedPnl event and pnl_seq must NOT advance
+        // (Stage 3 allows zero-balance opens, so this path is reachable).
+        let out1 = pt.consume(
+            &[
+                filled(7, Side::Buy, "1", "60000"),
+                filled(7, Side::Sell, "1", "59000"),
+            ],
+            ts(),
+        );
+        assert!(
+            !out1.iter().any(|e| matches!(e, Event::RealizedPnl { .. })),
+            "underfunded loss with 0 available emits no RealizedPnl"
+        );
+        pt.ledger().verify_all_invariants().unwrap();
+
+        // Now fund + a profitable round trip → exactly one RealizedPnl.
+        // Because the zero-move loss did NOT advance pnl_seq, this is the
+        // FIRST emitted fact (idempotency key pnl_1_7_1).
+        pt.handle_admin_credit(UserId::new(7), dec("10000"), "k", ts());
+        let out2 = pt.consume(
+            &[
+                filled(7, Side::Buy, "1", "60000"),
+                filled(7, Side::Sell, "1", "61000"),
+            ],
+            ts(),
+        );
+        let realized: Vec<Decimal128> = out2
+            .iter()
+            .filter_map(|e| match e {
+                Event::RealizedPnl { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(realized.len(), 1, "exactly one RealizedPnl emitted");
+        assert_eq!(realized[0], dec("1000"), "profit settles correctly");
+        let bal = pt
+            .ledger()
+            .get_balance(UserId::new(7), exg_ledger::WalletType::Funding)
+            .unwrap();
+        assert_eq!(bal.available, dec("11000")); // 10000 credit + 1000 profit
         pt.ledger().verify_all_invariants().unwrap();
     }
 
