@@ -19,6 +19,12 @@ pub struct PostTradeProcessor {
     mark_price: Decimal128,
     #[expect(dead_code, reason = "consumed by funding settlement in Task 4")]
     funding_period_id: u64,
+    /// Monotonic per-emitted-RealizedPnl discriminator. Used to build a
+    /// stable idempotency key `pnl_{seq}_{user}_{symbol}`. Replay (Task 5)
+    /// re-applies `RealizedPnl` facts in WAL order and MUST increment this
+    /// in the exact same order so keys match — this determinism is
+    /// load-bearing.
+    pnl_seq: u64,
 }
 
 impl PostTradeProcessor {
@@ -28,7 +34,16 @@ impl PostTradeProcessor {
             ledger: Ledger::new(),
             mark_price: Decimal128::ZERO,
             funding_period_id: 0,
+            pnl_seq: 0,
         }
+    }
+
+    /// Next monotonic realized-PnL sequence. Live `consume` and replay
+    /// `apply_event` (Task 5) MUST call this in the same order so the
+    /// derived idempotency keys match across live↔replay (load-bearing).
+    fn next_pnl_seq(&mut self) -> u64 {
+        self.pnl_seq += 1;
+        self.pnl_seq
     }
 
     /// Read-only accessors for tests / boot invariant checks.
@@ -51,8 +66,8 @@ impl PostTradeProcessor {
     /// ONLY (money in Tasks 3-4). Positions project from `OrderFilled`
     /// ONLY — `TradeExecuted` describes the same trade and would
     /// double-count (spec invariant 34).
-    pub fn consume(&mut self, events: &[Event], _ts_param: UnixMicros) -> Vec<Event> {
-        let out = Vec::new();
+    pub fn consume(&mut self, events: &[Event], ts_param: UnixMicros) -> Vec<Event> {
+        let mut out = Vec::new();
         for e in events {
             if let Event::OrderFilled {
                 user_id,
@@ -63,11 +78,91 @@ impl PostTradeProcessor {
                 ..
             } = e
             {
-                self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
-                // RealizedPnl emission added in Task 3.
+                let pnl =
+                    self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
+                if !pnl.is_zero() {
+                    let seq = self.next_pnl_seq();
+                    // CEO C1/C1b: record the ACTUALLY-MOVED signed amount
+                    // (capped at the user's available for a loss), not the
+                    // notional pnl — replay applies this fact directly.
+                    let moved = self.settle_realized_pnl(*user_id, *symbol, pnl, seq, ts_param);
+                    if !moved.is_zero() {
+                        out.push(Event::RealizedPnl {
+                            user_id: *user_id,
+                            symbol: *symbol,
+                            amount: moved,
+                            timestamp: ts_param,
+                        });
+                    }
+                }
             }
         }
         out
+    }
+
+    /// Admin-credit a user's Funding wallet (ledger journals SYSTEM→user;
+    /// idempotent on `idempotency_key`). Emits the AdminCredited fact.
+    pub fn handle_admin_credit(
+        &mut self,
+        user_id: UserId,
+        amount: Decimal128,
+        idempotency_key: &str,
+        ts: UnixMicros,
+    ) -> Vec<Event> {
+        self.ledger.get_or_create_account(user_id);
+        self.ledger
+            .deposit(user_id, amount, idempotency_key, ts)
+            .expect("admin credit deposit (amount > 0 enforced at handler)");
+        vec![Event::AdminCredited {
+            user_id,
+            amount,
+            idempotency_key: idempotency_key.to_owned(),
+            timestamp: ts,
+        }]
+    }
+
+    /// Settle a signed realized PnL vs the system Funding pool, returning
+    /// the **actually-moved** signed amount (the value recorded in the
+    /// RealizedPnl fact event). CEO review C1/C1b: a loss the user cannot
+    /// cover MUST NOT panic the single-threaded exchange and MUST NOT
+    /// drive `verify_account_invariant` (forbids negative user available)
+    /// to fail. Uses the new capped-debit ledger primitive
+    /// `settle_realized_pnl_capped`: profit → SYSTEM→user; loss →
+    /// move only `min(loss, user.Funding.available)` (user floored at 0),
+    /// uncollected remainder = implicit bad debt absorbed by the SYSTEM
+    /// Funding pool (allowed negative). Returns the signed moved amount.
+    fn settle_realized_pnl(
+        &mut self,
+        user_id: UserId,
+        symbol: SymbolId,
+        pnl: Decimal128,
+        seq_tag: u64,
+        ts: UnixMicros,
+    ) -> Decimal128 {
+        if pnl.is_zero() {
+            return Decimal128::ZERO;
+        }
+        let key = format!("pnl_{seq_tag}_{}_{}", user_id.value(), symbol.value());
+        self.ledger.get_or_create_account(user_id);
+        // settle_realized_pnl_capped: signed pnl; never errors on
+        // insufficiency, never drives user available negative; returns the
+        // signed amount actually moved (== pnl for profit or covered loss,
+        // == -(available) for an underfunded loss). Idempotent on `key`.
+        let moved = self
+            .ledger
+            .settle_realized_pnl_capped(user_id, pnl, &key, ts)
+            .expect("settle_realized_pnl_capped is infallible for a known account");
+        // CEO review C4: realized-PnL audit line (spec invariant 39).
+        if !moved.is_zero() {
+            tracing::info!(
+                target: "post_trade",
+                user_id = user_id.value(),
+                symbol = symbol.value(),
+                %moved,
+                "realized pnl"
+            );
+        }
+        moved
     }
 
     /// Position-keeping: a fill in the position's direction (or no
@@ -205,6 +300,75 @@ mod tests {
             .get_position(UserId::new(42), SymbolId::new(1))
             .unwrap();
         assert_eq!(pos.size, dec("2"));
+    }
+
+    #[test]
+    fn admin_credit_deposits_funding_wallet() {
+        let mut pt = PostTradeProcessor::new();
+        let out = pt.handle_admin_credit(UserId::new(42), dec("5000"), "ac_1", ts());
+        assert!(matches!(out[0], Event::AdminCredited { .. }));
+        let bal = pt
+            .ledger()
+            .get_balance(UserId::new(42), exg_ledger::WalletType::Funding)
+            .unwrap();
+        assert_eq!(bal.available, dec("5000"));
+        pt.ledger().verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn realized_profit_credits_user() {
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(42), dec("10000"), "ac_2", ts());
+        // open long 1 @60000, close 1 @61000 → +1000 profit
+        let out = pt.consume(
+            &[
+                filled(42, Side::Buy, "1", "60000"),
+                filled(42, Side::Sell, "1", "61000"),
+            ],
+            ts(),
+        );
+        let pnl = out
+            .iter()
+            .find_map(|e| match e {
+                Event::RealizedPnl { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .expect("RealizedPnl emitted");
+        assert_eq!(pnl, dec("1000"));
+        let bal = pt
+            .ledger()
+            .get_balance(UserId::new(42), exg_ledger::WalletType::Funding)
+            .unwrap();
+        assert_eq!(bal.available, dec("11000")); // 10000 + 1000 profit
+        pt.ledger().verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn realized_loss_debits_user() {
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(42), dec("10000"), "ac_3", ts());
+        // long 1 @60000, close 1 @59000 → -1000 loss
+        let out = pt.consume(
+            &[
+                filled(42, Side::Buy, "1", "60000"),
+                filled(42, Side::Sell, "1", "59000"),
+            ],
+            ts(),
+        );
+        let pnl = out
+            .iter()
+            .find_map(|e| match e {
+                Event::RealizedPnl { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pnl, dec("-1000"));
+        let bal = pt
+            .ledger()
+            .get_balance(UserId::new(42), exg_ledger::WalletType::Funding)
+            .unwrap();
+        assert_eq!(bal.available, dec("9000"));
+        pt.ledger().verify_all_invariants().unwrap();
     }
 
     #[test]

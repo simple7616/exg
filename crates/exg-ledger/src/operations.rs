@@ -1027,6 +1027,106 @@ impl Ledger {
     pub fn journal(&self) -> &[JournalEntry] {
         &self.journal
     }
+
+    /// Stage 3 (CEO review C1/C1b): settle a SIGNED realized-PnL/funding
+    /// amount vs the SYSTEM Funding pool, capping a debit at the user's
+    /// available so the user is never driven negative and the call never
+    /// errors on insufficiency. Returns the signed amount actually moved.
+    ///
+    /// `signed > 0` (credit / user receives): user Funding available +=
+    /// signed; balanced journal SYSTEM→user (RealizedPnl entry_type).
+    /// `signed < 0` (debit / user pays): moved = min(|signed|, available);
+    /// user available -= moved; balanced journal user→SYSTEM for `moved`.
+    /// The uncollected `|signed| - moved` is implicit bad debt — NOT
+    /// journaled (only balanced transfers stay on the books, preserving
+    /// verify_global_invariant); it surfaces as the SYSTEM Funding pool
+    /// going more negative than user credits, which verify_all_invariants
+    /// explicitly permits (Funding ∉ NON_NEGATIVE_SYSTEM_WALLETS).
+    /// Idempotent on `idempotency_key`. Never returns Err for a known
+    /// account; `AccountNotFound` only if the user account is absent.
+    pub fn settle_realized_pnl_capped(
+        &mut self,
+        user_id: UserId,
+        signed: Decimal128,
+        idempotency_key: &str,
+        timestamp: UnixMicros,
+    ) -> ExgResult<Decimal128> {
+        if signed.is_zero() {
+            return Ok(Decimal128::ZERO);
+        }
+        if self.check_idempotency(idempotency_key) {
+            return Ok(Decimal128::ZERO); // already applied (replay no-op)
+        }
+        let account = self
+            .accounts
+            .get_mut(&user_id)
+            .ok_or(ExgError::AccountNotFound(user_id))?;
+        let bal = account.wallet_mut(WalletType::Funding);
+        let moved: Decimal128;
+        if signed.is_positive() {
+            bal.available = bal.available + signed;
+            // Eng review E1: double-entry — system delta = -(user delta).
+            // A credit to the user DECREASES the SYSTEM Funding pool.
+            // (Mirrors real settle_funding's user-receives branch, which
+            // passes a NEGATIVE payment to add_system_balance.) Using the
+            // wrong sign (+signed) makes user_total+system_total drift by
+            // 2*signed → verify_global_invariant fails → panic.
+            self.add_system_balance(WalletType::Funding, -signed);
+            moved = signed;
+            let id = self.next_id();
+            self.append_journal(JournalEntry {
+                id,
+                debit_user: SYSTEM_USER_ID,
+                debit_wallet: WalletType::Funding,
+                debit_field: BalanceField::Available,
+                credit_user: user_id,
+                credit_wallet: WalletType::Funding,
+                credit_field: BalanceField::Available,
+                amount: signed,
+                entry_type: JournalEntryType::FundingPayment,
+                idempotency_key: idempotency_key.to_owned(),
+                timestamp,
+            });
+        } else {
+            let owed = signed.abs();
+            let cover = owed.min(bal.available);
+            bal.available = bal.available - cover;
+            // Eng review E1: system delta = -(user delta). The user PAYS
+            // `cover`, so the SYSTEM Funding pool RECEIVES it → +cover.
+            // (Mirrors real settle_funding's user-pays branch:
+            // add_system_balance(Funding, +payment).) `moved` is the
+            // SIGNED user delta (negative for a debit) — that is what the
+            // RealizedPnl/FundingSettled fact records.
+            self.add_system_balance(WalletType::Funding, cover);
+            moved = -cover;
+            if cover.is_positive() {
+                let id = self.next_id();
+                self.append_journal(JournalEntry {
+                    id,
+                    debit_user: user_id,
+                    debit_wallet: WalletType::Funding,
+                    debit_field: BalanceField::Available,
+                    credit_user: SYSTEM_USER_ID,
+                    credit_wallet: WalletType::Funding,
+                    credit_field: BalanceField::Available,
+                    amount: cover,
+                    entry_type: JournalEntryType::FundingPayment,
+                    idempotency_key: idempotency_key.to_owned(),
+                    timestamp,
+                });
+            }
+            // owed - cover = implicit bad debt: intentionally NOT journaled
+            // and NOT added anywhere (keeps user_total+system_total
+            // unchanged → verify_global_invariant balanced). The shortfall
+            // surfaces because the winning side got a full credit
+            // (system -win) while this losing side only paid `cover`
+            // (system +cover), so the SYSTEM Funding pool nets negative by
+            // exactly the uncollected amount — which verify_all_invariants
+            // permits (Funding ∉ NON_NEGATIVE_SYSTEM_WALLETS). Stage 4 adds
+            // explicit bad-debt accounting.
+        }
+        Ok(moved)
+    }
 }
 
 impl Default for Ledger {
@@ -1670,5 +1770,100 @@ mod tests {
         assert_eq!(bal.margin, dec("90")); // 100 - 10
 
         ledger.verify_all_invariants().unwrap();
+    }
+
+    // ── settle_realized_pnl_capped (Stage 3, Eng review E2) ─────────────
+
+    #[test]
+    fn srpc_profit_credits_user_debits_pool_invariants_hold() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        let moved = l
+            .settle_realized_pnl_capped(uid(1), dec("500"), "k1", ts(1))
+            .unwrap();
+        assert_eq!(moved, dec("500"));
+        assert_eq!(
+            l.get_balance(uid(1), WalletType::Funding)
+                .unwrap()
+                .available,
+            dec("500")
+        );
+        // system Funding pool decreased by the credit (E1 sign).
+        assert_eq!(l.system_balance(WalletType::Funding), dec("-500"));
+        l.verify_all_invariants().unwrap(); // user_total+system_total == net_external (0)
+    }
+
+    #[test]
+    fn srpc_covered_loss_debits_user_credits_pool() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        l.settle_realized_pnl_capped(uid(1), dec("1000"), "fund", ts(1))
+            .unwrap(); // fund first
+        let moved = l
+            .settle_realized_pnl_capped(uid(1), dec("-300"), "k2", ts(2))
+            .unwrap();
+        assert_eq!(moved, dec("-300"));
+        assert_eq!(
+            l.get_balance(uid(1), WalletType::Funding)
+                .unwrap()
+                .available,
+            dec("700")
+        );
+        l.verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn srpc_underfunded_loss_caps_at_zero_pool_goes_negative_no_err() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        l.settle_realized_pnl_capped(uid(1), dec("100"), "fund", ts(1))
+            .unwrap();
+        // owe 500, only 100 available → cover 100, user→0, never Err.
+        let moved = l
+            .settle_realized_pnl_capped(uid(1), dec("-500"), "k3", ts(2))
+            .unwrap();
+        assert_eq!(moved, dec("-100"));
+        assert_eq!(
+            l.get_balance(uid(1), WalletType::Funding)
+                .unwrap()
+                .available,
+            dec("0")
+        );
+        // implicit bad debt: pool net negative by the uncollected amount.
+        // (pool: -100 from the fund credit, +100 from the covered debit = 0;
+        //  the bad debt surfaces vs a winner credit in a real trade — here
+        //  with no winner, assert the user is floored and invariants hold.)
+        l.verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn srpc_idempotent_on_key() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        l.settle_realized_pnl_capped(uid(1), dec("200"), "dup", ts(1))
+            .unwrap();
+        let again = l
+            .settle_realized_pnl_capped(uid(1), dec("200"), "dup", ts(2))
+            .unwrap();
+        assert_eq!(again, dec("0"), "duplicate key is a no-op");
+        assert_eq!(
+            l.get_balance(uid(1), WalletType::Funding)
+                .unwrap()
+                .available,
+            dec("200")
+        );
+        l.verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn srpc_zero_is_noop() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        assert_eq!(
+            l.settle_realized_pnl_capped(uid(1), Decimal128::ZERO, "z", ts(1))
+                .unwrap(),
+            Decimal128::ZERO
+        );
+        l.verify_all_invariants().unwrap();
     }
 }
