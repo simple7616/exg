@@ -159,10 +159,15 @@ impl WalWriter {
 
     /// Scan all segments to find the next valid sequence and detect partial writes.
     ///
-    /// Only the LAST segment's trailing corrupt/incomplete records are truncated.
-    /// CRC errors in any non-trailing position indicate confirmed data loss and
-    /// return `WalError::Corrupt`.
-    fn recover_state(
+    /// Only an `Incomplete` trailing record in the LAST segment is truncated
+    /// (a genuine torn tail-write — an append that died before a durable
+    /// commit). A `CrcMismatch` is ALWAYS `WalError::Corrupt`, regardless of
+    /// segment position: a fully-framed record whose content is wrong is
+    /// confirmed data loss, never a safe torn-tail (the WAL is the source of
+    /// truth — fail-fast so the strict boot replay never silently drops
+    /// persisted history). An `Incomplete` record in a non-trailing segment is
+    /// also `Corrupt` (a short record with valid data after it = data loss).
+    pub(crate) fn recover_state(
         segments: &[(u64, PathBuf)],
     ) -> Result<(u64, Option<(PathBuf, usize)>), WalError> {
         let mut next_sequence: u64 = 0;
@@ -190,20 +195,31 @@ impl WalWriter {
                         next_sequence = seq + 1;
                         offset += consumed;
                     }
-                    Err(DecodeError::Incomplete | DecodeError::CrcMismatch { .. }) => {
+                    Err(DecodeError::Incomplete) => {
                         if is_last_segment {
-                            // Trailing partial/corrupt record in last segment — safe to truncate
+                            // Genuine torn tail-write (append died before a
+                            // durable commit) — safe to truncate at offset.
                             return Ok((next_sequence, Some((path.clone(), offset))));
                         }
-                        // CRC error in non-last segment = confirmed data loss
-                        let sequence = match decode_record(&data, offset) {
-                            Err(DecodeError::CrcMismatch { sequence }) => sequence,
-                            _ => next_sequence,
-                        };
+                        // A short record with valid data after it = data loss.
+                        return Err(WalError::Corrupt {
+                            sequence: next_sequence,
+                            reason: format!(
+                                "incomplete record in non-trailing segment {}",
+                                path.display()
+                            ),
+                        });
+                    }
+                    Err(DecodeError::CrcMismatch { sequence }) => {
+                        // A fully-framed record whose CONTENT is corrupt is
+                        // confirmed data loss — NOT a torn tail-write — even
+                        // in the last/only segment. Fail-fast so the strict
+                        // boot replay never silently drops persisted history
+                        // (WAL is the source of truth; invariant 32).
                         return Err(WalError::Corrupt {
                             sequence,
                             reason: format!(
-                                "corrupt record in non-trailing segment {}",
+                                "CRC mismatch in segment {} (confirmed data loss)",
                                 path.display()
                             ),
                         });
