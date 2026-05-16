@@ -1311,15 +1311,14 @@ Add to `impl PostTradeProcessor`:
     pub fn apply_event(&mut self, e: &Event) -> exg_common::ExgResult<()> {
         match e {
             Event::OrderFilled { user_id, symbol, side, fill_qty, fill_price, .. } => {
-                // Re-project position ONLY. Discard the recomputed PnL —
-                // the recorded RealizedPnl fact drives the ledger. But we
-                // MUST advance pnl_seq identically to live so the recorded
-                // RealizedPnl's idempotency key matches: live incremented
-                // pnl_seq exactly when a reduction produced non-zero PnL.
-                let pnl = self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
-                if !pnl.is_zero() {
-                    let _ = self.next_pnl_seq(); // keep key sequence aligned with live
-                }
+                // Re-project position ONLY. Do NOT touch pnl_seq here.
+                // (T3 SHIPPED REALITY: live advances pnl_seq ONLY when a
+                // RealizedPnl event is actually emitted — `next_pnl_seq()`
+                // was removed; the uncoverable-loss case short-circuits
+                // with no seq/key/event. So on replay the seq advances
+                // ONLY in the RealizedPnl fact arm below, once per fact —
+                // mirroring live exactly. Discard the recomputed PnL.)
+                let _ = self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
             }
             Event::MarkPriceUpdate { mark_price, .. } => {
                 self.mark_price = *mark_price;
@@ -1339,10 +1338,14 @@ Add to `impl PostTradeProcessor`:
             Event::RealizedPnl { user_id, symbol, amount, timestamp } => {
                 // CEO C1/C1b: `amount` is the ALREADY-MOVED (capped) signed
                 // value — re-apply it directly via the same capped
-                // primitive + same key. No re-cap (it was already capped
-                // live; the primitive is idempotent on the key anyway).
-                // pnl_seq advanced identically to live to keep keys aligned.
-                let seq = self.next_pnl_seq();
+                // primitive + same key. No re-cap (already capped live;
+                // the primitive is idempotent on the key anyway).
+                // T3 SHIPPED REALITY: live advances pnl_seq exactly once
+                // per EMITTED RealizedPnl (inside its `!moved.is_zero()`
+                // guard; `next_pnl_seq()` removed). Replay mirrors that:
+                // advance once per replayed RealizedPnl fact, here only.
+                self.pnl_seq += 1;
+                let seq = self.pnl_seq;
                 let key = format!("pnl_{seq}_{}_{}", user_id.value(), symbol.value());
                 self.ledger.get_or_create_account(*user_id);
                 let _ = self.ledger.settle_realized_pnl_capped(*user_id, *amount, &key, *timestamp);
