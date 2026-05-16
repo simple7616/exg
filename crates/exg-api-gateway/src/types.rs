@@ -225,6 +225,14 @@ pub struct AdminMarkPriceRequest {
     pub index_price: String,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminCreditRequest {
+    pub user_id: u64,
+    /// Decimal string, must be > 0.
+    pub amount: String,
+}
+
 #[cfg(test)]
 mod password_redaction_tests {
     use super::*;
