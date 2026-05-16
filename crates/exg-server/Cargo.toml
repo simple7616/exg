@@ -18,6 +18,7 @@ exg-ringbuffer = { workspace = true }
 exg-wal = { workspace = true }
 exg-matching-engine = { workspace = true }
 exg-risk-engine = { workspace = true }
+exg-clearing = { workspace = true }
 exg-api-gateway = { workspace = true }
 exg-user-service = { workspace = true }
 sqlx = { workspace = true }

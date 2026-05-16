@@ -10,6 +10,7 @@ exg-risk-engine = { workspace = true }
 exg-ledger = { workspace = true }
 serde = { workspace = true }
 rustc-hash = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

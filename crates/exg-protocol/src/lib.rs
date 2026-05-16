@@ -151,6 +151,12 @@ mod tests {
                 symbol: SymbolId::new(1),
                 timestamp: sample_timestamp(),
             },
+            Command::AdminCredit {
+                user_id: UserId::new(42),
+                amount: dec("1000"),
+                idempotency_key: "ac_test_1".into(),
+                timestamp: sample_timestamp(),
+            },
         ]
     }
 
@@ -270,6 +276,25 @@ mod tests {
                 symbol: SymbolId::new(1),
                 side: Side::Sell,
                 quantity: dec("5.0"),
+                timestamp: sample_timestamp(),
+            },
+            Event::AdminCredited {
+                user_id: UserId::new(42),
+                amount: dec("1000"),
+                idempotency_key: "ac_test_1".into(),
+                timestamp: sample_timestamp(),
+            },
+            Event::RealizedPnl {
+                user_id: UserId::new(42),
+                symbol: SymbolId::new(1),
+                amount: dec("-25"),
+                timestamp: sample_timestamp(),
+            },
+            Event::FundingSettled {
+                user_id: UserId::new(42),
+                symbol: SymbolId::new(1),
+                funding_period_id: 1,
+                amount: dec("5"),
                 timestamp: sample_timestamp(),
             },
         ]

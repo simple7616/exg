@@ -128,4 +128,30 @@ pub enum Event {
         quantity: Decimal128,
         timestamp: UnixMicros,
     },
+    /// Stage 3: admin balance credit applied to the ledger (fact).
+    /// Carries `idempotency_key` so replay re-applies with the exact
+    /// original key (self-describing fact — like RealizedPnl/FundingSettled).
+    AdminCredited {
+        user_id: UserId,
+        amount: Decimal128,
+        idempotency_key: String,
+        timestamp: UnixMicros,
+    },
+    /// Stage 3: realized PnL on a position reduce/close (fact).
+    /// `amount` is signed: positive = profit (credit), negative = loss.
+    RealizedPnl {
+        user_id: UserId,
+        symbol: SymbolId,
+        amount: Decimal128,
+        timestamp: UnixMicros,
+    },
+    /// Stage 3: funding payment settled for one position (fact).
+    /// `amount` is signed: positive = user paid, negative = user received.
+    FundingSettled {
+        user_id: UserId,
+        symbol: SymbolId,
+        funding_period_id: u64,
+        amount: Decimal128,
+        timestamp: UnixMicros,
+    },
 }

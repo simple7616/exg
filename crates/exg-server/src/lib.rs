@@ -21,6 +21,7 @@ use actix_web::dev::ServerHandle as ActixServerHandle;
 use anyhow::{Context, bail};
 use exg_api_gateway::app_factory::build_app;
 use exg_api_gateway::state::AppState;
+use exg_clearing::post_trade::PostTradeProcessor;
 use exg_common::{Decimal128, SnowflakeGen, SymbolId};
 use exg_config::ExgConfig;
 use exg_matching_engine::MatchingEngine;
@@ -269,6 +270,9 @@ pub async fn run_with_config_with_pool(
     // has already passed; Step 3.5 (PG ping) confirms DB connectivity;
     // replay runs on the boot thread before the matching thread is spawned,
     // so no locking is needed.
+    // ── Stage 3: post-trade processor (positions + ledger) ────────────────
+    let mut post_trade = PostTradeProcessor::new();
+
     let replayed_count: u64 = {
         use exg_wal::WalReader;
 
@@ -335,6 +339,13 @@ pub async fn run_with_config_with_pool(
                     });
                     return false;
                 }
+                if let Err(e) = post_trade.apply_event(&event) {
+                    replay_err = Some(ReplayError::Apply {
+                        seq,
+                        msg: format!("post_trade: {e}"),
+                    });
+                    return false;
+                }
                 expected_seq = seq + 1;
                 replayed_count += 1;
                 true
@@ -356,6 +367,12 @@ pub async fn run_with_config_with_pool(
 
         replayed_count
     };
+
+    // Stage 3 invariant 32: ledger consistent after replay.
+    post_trade
+        .ledger()
+        .verify_all_invariants()
+        .map_err(|e| anyhow::anyhow!("Stage 3: ledger invariants violated after replay: {e}"))?;
 
     // ── Step 3.7 (Stage 1a): DUMMY_ARGON2_HASH OnceCell init ─────────────
     // Pre-compute the timing-safe dummy hash used by login handlers to make
@@ -418,8 +435,32 @@ pub async fn run_with_config_with_pool(
                     Ok(c) => c,
                     Err(e) => panic!("matching thread: rkyv decode Command failed: {e}"),
                 };
-                let events: Vec<Event> = engine.process_command(&cmd);
-                for evt in &events {
+                let now = exg_common::UnixMicros::now();
+                let mut all_events: Vec<Event> = Vec::new();
+                match &cmd {
+                    Command::AdminCredit {
+                        user_id,
+                        amount,
+                        idempotency_key,
+                        timestamp,
+                    } => {
+                        all_events.extend(post_trade.handle_admin_credit(
+                            *user_id,
+                            *amount,
+                            idempotency_key,
+                            *timestamp,
+                        ));
+                    }
+                    _ => {
+                        let engine_events = engine.process_command(&cmd);
+                        all_events.extend(post_trade.consume(&engine_events, now));
+                        // engine events first, then post-trade facts — WAL order
+                        let mut ordered = engine_events;
+                        ordered.extend(all_events);
+                        all_events = ordered;
+                    }
+                }
+                for evt in &all_events {
                     let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(evt) {
                         Ok(b) => b,
                         Err(e) => panic!("matching thread: rkyv encode Event failed: {e}"),

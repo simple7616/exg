@@ -130,6 +130,10 @@ impl MatchingEngine {
             Command::ComputeFunding { symbol, timestamp } => {
                 self.compute_funding(*symbol, *timestamp)
             }
+            // Stage 3: clearing-domain command — the matching engine
+            // produces no events for it; PostTradeProcessor handles it
+            // (routed in the matching thread, later task).
+            Command::AdminCredit { .. } => Vec::new(),
         }
     }
 

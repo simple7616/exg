@@ -332,4 +332,82 @@ mod tests {
         assert_eq!(count, 10);
         assert_eq!(first_seq, Some(10));
     }
+
+    /// Task 9 (P1): a fully-framed record whose CRC is wrong (a bit-flip on a
+    /// flushed record) in the ONLY segment is confirmed data loss — it must
+    /// be `WalError::Corrupt`, NOT a silently-truncated "partial write".
+    /// Torn tail-writes manifest as `Incomplete` (tested separately below);
+    /// `CrcMismatch` requires the whole record bytes present (corruption),
+    /// not a short tail. `WalWriter::open` runs before the strict replay, so
+    /// truncating here would silently drop persisted post-trade history.
+    #[test]
+    fn recover_state_crc_mismatch_in_last_segment_is_corrupt_not_truncated() {
+        let tmp = TempDir::new().unwrap();
+
+        // Write 3 valid records via the real writer + flush.
+        {
+            let config = test_config(tmp.path());
+            let mut w = WalWriter::open(config).unwrap();
+            w.append(b"valid-record-0").unwrap();
+            w.append(b"valid-record-1").unwrap();
+            w.append(b"valid-record-2").unwrap();
+            w.flush().unwrap();
+        }
+
+        // Flip a byte INSIDE a known fully-written record's payload (record 1).
+        // Record layout: [seq u64 LE][payload_len u32 LE][payload][crc32 u32 LE].
+        // Record 0: 8 + 4 + 14 + 4 = 30 bytes. Record 1 payload starts at
+        // 30 + 12. Corrupting payload (not length) keeps framing intact, so
+        // decode_record yields CrcMismatch (a fully-framed, content-corrupt
+        // record), NOT Incomplete.
+        let segments = segment::list_segments(tmp.path()).unwrap();
+        assert_eq!(segments.len(), 1, "single/only segment");
+        let (_, seg_path) = &segments[0];
+        let mut data = fs::read(seg_path).unwrap();
+        let corrupt_offset = 30 + 12 + 2; // into record 1's payload
+        data[corrupt_offset] ^= 0xFF;
+        fs::write(seg_path, &data).unwrap();
+
+        let err = WalWriter::recover_state(&segments).unwrap_err();
+        assert!(
+            matches!(err, WalError::Corrupt { .. }),
+            "last/only-segment CRC mismatch must be WalError::Corrupt, got {err:?}"
+        );
+    }
+
+    /// Task 9 (P1): a genuinely torn tail-write (the byte stream ends
+    /// mid-record → `Incomplete`) in the last segment is STILL safely
+    /// truncated — legitimate WAL crash recovery; this behavior MUST be
+    /// preserved (guards against over-correcting the CRC fix).
+    #[test]
+    fn recover_state_incomplete_trailing_record_in_last_segment_truncates() {
+        let tmp = TempDir::new().unwrap();
+
+        // Write 5 valid records, then chop off the tail of the last record so
+        // the trailing record decodes as Incomplete (short read), not
+        // CrcMismatch.
+        {
+            let config = test_config(tmp.path());
+            let mut w = WalWriter::open(config).unwrap();
+            for i in 0..5u64 {
+                w.append(format!("record-{i}").as_bytes()).unwrap();
+            }
+            w.flush().unwrap();
+        }
+
+        let segments = segment::list_segments(tmp.path()).unwrap();
+        assert_eq!(segments.len(), 1, "single/only segment");
+        let (_, seg_path) = &segments[0];
+        let data = fs::read(seg_path).unwrap();
+        let truncated_len = data.len() - 5; // chop part of the last record
+        fs::write(seg_path, &data[..truncated_len]).unwrap();
+
+        let (next_seq, trunc) = WalWriter::recover_state(&segments).unwrap();
+        assert!(
+            trunc.is_some(),
+            "torn tail-write is truncated, not an error"
+        );
+        // 5 records written (0..=4); record 4 was torn → resume at seq 4.
+        assert_eq!(next_seq, 4, "valid records 0..=3 survive; 4 was partial");
+    }
 }

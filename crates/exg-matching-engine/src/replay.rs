@@ -253,6 +253,12 @@ impl MatchingEngine {
             Event::LiquidationOrder { .. } => Err(ApplyError::UnexpectedVariant {
                 variant: "LiquidationOrder",
             }),
+            // Stage 3: clearing-domain fact events — the matching engine
+            // ignores them (mirrors OrderRejected/TradeExecuted Ok no-ops).
+            // PostTradeProcessor::apply_event consumes them on replay (later task).
+            Event::AdminCredited { .. }
+            | Event::RealizedPnl { .. }
+            | Event::FundingSettled { .. } => Ok(()),
         }
     }
 }

@@ -4,7 +4,7 @@
 //! that shares `AppState` (same `Mutex<Producer>`) with the main server.
 
 use actix_web::{App, HttpRequest, HttpResponse, web};
-use exg_common::{Decimal128, SymbolId, UnixMicros};
+use exg_common::{Decimal128, SymbolId, UnixMicros, UserId};
 use exg_protocol::Command;
 use subtle::ConstantTimeEq;
 
@@ -92,6 +92,42 @@ pub async fn admin_funding_tick(
     Ok(HttpResponse::Ok().json(serde_json::json!({ "status": "ACCEPTED" })))
 }
 
+/// `POST /api/v1/admin/credit` — credit a user's available balance.
+pub async fn admin_credit(
+    state: web::Data<AppState>,
+    req: HttpRequest,
+    body: web::Json<crate::types::AdminCreditRequest>,
+) -> Result<HttpResponse, ApiError> {
+    check_admin_secret(&req, &state.cfg.admin.admin_secret)?;
+    let amount: Decimal128 = body
+        .amount
+        .parse()
+        .map_err(|_| ApiError::bad_request("amount must be a decimal"))?;
+    if !amount.is_positive() {
+        return Err(ApiError::bad_request("amount must be positive"));
+    }
+    let user_id = UserId::new(body.user_id);
+    let ts = UnixMicros::now();
+    // CEO review C2: a ts-only key collides when two same-user credits
+    // land in the same microsecond (e2e/demo issue rapid sequential
+    // credits) → second deposit silently no-ops → silently lost funds.
+    // Embed a process-unique monotonic counter so every accepted credit
+    // gets a distinct key. The command carries it; replay re-applies the
+    // recorded key (deterministic, still idempotent cross-machine).
+    static ADMIN_CREDIT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = ADMIN_CREDIT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let idempotency_key = format!("admincredit_{}_{}_{}", body.user_id, ts.as_micros(), n);
+    tracing::info!(target: "admin", user_id = body.user_id, amount = %amount, "admin credit");
+    let cmd = Command::AdminCredit {
+        user_id,
+        amount,
+        idempotency_key,
+        timestamp: ts,
+    };
+    enqueue_admin(&state, &cmd)?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({ "status": "ACCEPTED" })))
+}
+
 /// Push an admin-produced command into the shared ring buffer. Mirrors
 /// the order handlers' private `enqueue` (same `Mutex<Producer>`, same
 /// 429 backpressure mapping); kept local because `handlers::enqueue` is
@@ -133,4 +169,5 @@ pub fn build_admin_app(
             "/api/v1/admin/funding-tick",
             web::post().to(admin_funding_tick),
         )
+        .route("/api/v1/admin/credit", web::post().to(admin_credit))
 }
