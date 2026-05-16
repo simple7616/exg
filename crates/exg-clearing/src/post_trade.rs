@@ -13,11 +13,11 @@ use crate::position::PositionManager;
 pub struct PostTradeProcessor {
     positions: PositionManager,
     ledger: Ledger,
-    // Read in Task 4 (funding settlement); held now so the struct shape is
-    // stable across the Stage 3 task sequence.
-    #[expect(dead_code, reason = "consumed by funding settlement in Task 4")]
+    /// Latest mark price tracked from `MarkPriceUpdate`; the notional base
+    /// for funding settlement (Task 4).
     mark_price: Decimal128,
-    #[expect(dead_code, reason = "consumed by funding settlement in Task 4")]
+    /// Monotonic funding batch counter; advanced per settled funding tick.
+    /// Part of the deterministic idempotency key so live↔replay align.
     funding_period_id: u64,
     /// Monotonic per-emitted-RealizedPnl discriminator. Used to build a
     /// stable idempotency key `pnl_{seq}_{user}_{symbol}`. Advanced **iff**
@@ -63,44 +63,148 @@ impl PostTradeProcessor {
     pub fn consume(&mut self, events: &[Event], ts_param: UnixMicros) -> Vec<Event> {
         let mut out = Vec::new();
         for e in events {
-            if let Event::OrderFilled {
-                user_id,
-                symbol,
-                side,
-                fill_qty,
-                fill_price,
-                ..
-            } = e
-            {
-                let pnl =
-                    self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
-                if !pnl.is_zero() {
-                    // Invariant 31: `pnl_seq` MUST advance in lockstep with
-                    // emitted `RealizedPnl` facts so live↔replay idempotency
-                    // keys match. We settle with the PROVISIONAL next seq but
-                    // only COMMIT (increment) the counter when the move is
-                    // non-zero and a fact is actually pushed. An underfunded
-                    // loss with 0 available caps `moved` to 0 → no event AND
-                    // no seq advance, exactly mirroring Task 5 replay (which
-                    // increments once per replayed RealizedPnl fact).
-                    let next_seq = self.pnl_seq + 1;
-                    // CEO C1/C1b: record the ACTUALLY-MOVED signed amount
-                    // (capped at the user's available for a loss), not the
-                    // notional pnl — replay applies this fact directly.
-                    let moved =
-                        self.settle_realized_pnl(*user_id, *symbol, pnl, next_seq, ts_param);
-                    if !moved.is_zero() {
-                        self.pnl_seq = next_seq;
-                        out.push(Event::RealizedPnl {
-                            user_id: *user_id,
-                            symbol: *symbol,
-                            amount: moved,
-                            timestamp: ts_param,
-                        });
+            match e {
+                Event::OrderFilled {
+                    user_id,
+                    symbol,
+                    side,
+                    fill_qty,
+                    fill_price,
+                    ..
+                } => {
+                    let pnl = self.apply_fill_to_position(
+                        *user_id,
+                        *symbol,
+                        *side,
+                        *fill_qty,
+                        *fill_price,
+                    );
+                    if !pnl.is_zero() {
+                        // Invariant 31: `pnl_seq` MUST advance in lockstep with
+                        // emitted `RealizedPnl` facts so live↔replay idempotency
+                        // keys match. We settle with the PROVISIONAL next seq but
+                        // only COMMIT (increment) the counter when the move is
+                        // non-zero and a fact is actually pushed. An underfunded
+                        // loss with 0 available caps `moved` to 0 → no event AND
+                        // no seq advance, exactly mirroring Task 5 replay (which
+                        // increments once per replayed RealizedPnl fact).
+                        let next_seq = self.pnl_seq + 1;
+                        // CEO C1/C1b: record the ACTUALLY-MOVED signed amount
+                        // (capped at the user's available for a loss), not the
+                        // notional pnl — replay applies this fact directly.
+                        let moved =
+                            self.settle_realized_pnl(*user_id, *symbol, pnl, next_seq, ts_param);
+                        if !moved.is_zero() {
+                            self.pnl_seq = next_seq;
+                            out.push(Event::RealizedPnl {
+                                user_id: *user_id,
+                                symbol: *symbol,
+                                amount: moved,
+                                timestamp: ts_param,
+                            });
+                        }
                     }
                 }
+                Event::MarkPriceUpdate { mark_price, .. } => {
+                    self.mark_price = *mark_price;
+                }
+                Event::FundingRateUpdate { funding_rate, .. } => {
+                    out.extend(self.settle_funding(*funding_rate, ts_param));
+                }
+                _ => {}
             }
         }
+        out
+    }
+
+    /// Settle funding for every open position at the current mark.
+    /// `payment = size * mark_price * signed_rate` (>0 user pays, <0
+    /// receives); routed through the SAME capped-debit primitive as
+    /// realized PnL so a Long that cannot cover a payment never panics the
+    /// exchange. One atomic batch per tick (spec invariant 33);
+    /// `verify_all_invariants` after (spec invariant 32). Returns one
+    /// `FundingSettled` fact per position that actually moved money.
+    fn settle_funding(&mut self, rate: Decimal128, ts: UnixMicros) -> Vec<Event> {
+        // Snapshot (user,symbol,size,side) first — the capped primitive
+        // borrows the ledger mutably; avoid aliasing the positions iter.
+        let rows: Vec<(UserId, SymbolId, Decimal128, PositionSide)> = self
+            .positions
+            .all_positions()
+            .filter(|p| !p.size.is_zero())
+            .map(|p| (p.user_id, p.symbol, p.size, p.side))
+            .collect();
+        // CEO review C3: a funding tick with open positions but no mark
+        // price set would charge everyone 0 and look like success — a
+        // silent correctness failure. Warn + skip (no period bump, no
+        // events).
+        if !rows.is_empty() && self.mark_price.is_zero() {
+            tracing::warn!(
+                target: "post_trade",
+                open_positions = rows.len(),
+                "funding tick skipped: mark_price unset"
+            );
+            return Vec::new();
+        }
+        self.funding_period_id += 1;
+        let period = self.funding_period_id;
+        let mark = self.mark_price;
+        let mut out = Vec::new();
+        let mut settled_count = 0u64;
+        let mut total_abs = Decimal128::ZERO;
+        for (user_id, symbol, size, side) in rows {
+            // notional always positive (size is magnitude); a Short pays a
+            // sign-flipped amount so long/short directions net.
+            let notional = size * mark;
+            let signed_rate = match side {
+                PositionSide::Long | PositionSide::Both => rate,
+                PositionSide::Short => -rate,
+            };
+            let payment = notional * signed_rate; // >0 user pays, <0 receives
+            if payment.is_zero() {
+                continue;
+            }
+            // CEO C1/C1b: route funding through the SAME capped-debit
+            // primitive as realized PnL. A Long that cannot cover a
+            // funding payment must NOT panic the exchange; the moved
+            // amount (capped) is what the FundingSettled fact records.
+            // Deterministic idempotency key so live↔replay align.
+            //
+            // Sign bridge: `settle_realized_pnl_capped` uses the PnL
+            // convention (signed > 0 = CREDIT user / signed < 0 = DEBIT
+            // user, capped). Funding's `payment` is the opposite (> 0 =
+            // user PAYS). Pass `-payment` so a paying user is debited and
+            // a receiving user is credited; the returned `moved` is the
+            // signed USER delta in the PnL convention — negate it back to
+            // the FundingSettled convention (positive = user paid).
+            self.ledger.get_or_create_account(user_id);
+            let key = format!("funding_{period}_{}_{}", user_id.value(), symbol.value());
+            let moved = self
+                .ledger
+                .settle_realized_pnl_capped(user_id, -payment, &key, ts)
+                .expect("capped funding settle is infallible for a known account");
+            if moved.is_zero() {
+                continue;
+            }
+            let fact_amount = -moved; // back to: positive = user paid
+            settled_count += 1;
+            total_abs = total_abs + fact_amount.abs();
+            out.push(Event::FundingSettled {
+                user_id,
+                symbol,
+                funding_period_id: period,
+                amount: fact_amount,
+                timestamp: ts,
+            });
+        }
+        // CEO review C4: settlement audit line before the invariant gate.
+        tracing::info!(
+            target: "post_trade",
+            period, settled_count, %total_abs,
+            "funding batch"
+        );
+        self.ledger
+            .verify_all_invariants()
+            .expect("ledger invariants after funding batch (spec invariant 32)");
         out
     }
 
@@ -442,6 +546,244 @@ mod tests {
             .get_balance(UserId::new(7), exg_ledger::WalletType::Funding)
             .unwrap();
         assert_eq!(bal.available, dec("11000")); // 10000 credit + 1000 profit
+        pt.ledger().verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn mark_price_update_tracked_for_notional() {
+        let mut pt = PostTradeProcessor::new();
+        pt.consume(
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        // No position → funding tick is a no-op but mark must be stored.
+        let out = pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.0001"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, Event::FundingSettled { .. }))
+        );
+    }
+
+    #[test]
+    fn funding_long_pays_short_receives() {
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts());
+        pt.handle_admin_credit(UserId::new(2), dec("100000"), "c2", ts());
+        // user1 long 1 @60000, user2 short 1 @60000 (they cross)
+        pt.consume(&[filled(1, Side::Buy, "1", "60000")], ts());
+        pt.consume(&[filled(2, Side::Sell, "1", "60000")], ts());
+        pt.consume(
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        // rate 0.01 → long pays 60000*1*0.01 = 600 ; short receives 600
+        let out = pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        let settled: Vec<_> = out
+            .iter()
+            .filter_map(|e| match e {
+                Event::FundingSettled {
+                    user_id,
+                    amount,
+                    funding_period_id,
+                    ..
+                } => Some((user_id.value(), *amount, *funding_period_id)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(settled.len(), 2);
+        // long (user1) pays +600 ; short (user2) receives -600
+        assert!(
+            settled
+                .iter()
+                .any(|(u, a, p)| *u == 1 && *a == dec("600") && *p == 1)
+        );
+        assert!(
+            settled
+                .iter()
+                .any(|(u, a, p)| *u == 2 && *a == dec("-600") && *p == 1)
+        );
+        let b1 = pt
+            .ledger()
+            .get_balance(UserId::new(1), exg_ledger::WalletType::Funding)
+            .unwrap();
+        let b2 = pt
+            .ledger()
+            .get_balance(UserId::new(2), exg_ledger::WalletType::Funding)
+            .unwrap();
+        assert_eq!(b1.available, dec("99400")); // 100000 - 600
+        assert_eq!(b2.available, dec("100600")); // 100000 + 600
+        pt.ledger().verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn funding_period_id_increments_per_tick() {
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts());
+        pt.consume(&[filled(1, Side::Buy, "1", "60000")], ts());
+        pt.consume(
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        let o1 = pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.001"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        let o2 = pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.001"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        let p1 = o1
+            .iter()
+            .find_map(|e| {
+                if let Event::FundingSettled {
+                    funding_period_id, ..
+                } = e
+                {
+                    Some(*funding_period_id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        let p2 = o2
+            .iter()
+            .find_map(|e| {
+                if let Event::FundingSettled {
+                    funding_period_id, ..
+                } = e
+                {
+                    Some(*funding_period_id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_eq!((p1, p2), (1, 2));
+    }
+
+    #[test]
+    fn funding_imbalanced_book_invariants_hold() {
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts());
+        // only a long, no offsetting short → Funding pool nets negative,
+        // which verify_all_invariants explicitly permits.
+        pt.consume(&[filled(1, Side::Buy, "2", "60000")], ts());
+        pt.consume(
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        pt.ledger().verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn funding_tick_zero_mark_with_open_positions_warns_skips() {
+        // Spec C3: an open position present but mark_price never set must
+        // NOT silently charge 0 and look like success. The tick is skipped:
+        // no FundingSettled, no period bump.
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts());
+        pt.consume(&[filled(1, Side::Buy, "1", "60000")], ts());
+        // NOTE: no MarkPriceUpdate consumed → mark_price stays ZERO.
+        let out = pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        assert!(
+            !out.iter()
+                .any(|e| matches!(e, Event::FundingSettled { .. })),
+            "zero-mark funding tick with open positions emits no FundingSettled"
+        );
+        // funding_period_id must NOT have advanced: a subsequent valid tick
+        // (after a mark is set) must be period 1, proving the skipped tick
+        // did not bump the counter.
+        pt.consume(
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        let out2 = pt.consume(
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            ts(),
+        );
+        let period = out2
+            .iter()
+            .find_map(|e| {
+                if let Event::FundingSettled {
+                    funding_period_id, ..
+                } = e
+                {
+                    Some(*funding_period_id)
+                } else {
+                    None
+                }
+            })
+            .expect("FundingSettled emitted on the valid post-mark tick");
+        assert_eq!(
+            period, 1,
+            "skipped zero-mark tick did not advance funding_period_id"
+        );
         pt.ledger().verify_all_invariants().unwrap();
     }
 
