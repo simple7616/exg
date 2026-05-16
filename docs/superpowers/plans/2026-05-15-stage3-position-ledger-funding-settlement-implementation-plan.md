@@ -2017,6 +2017,129 @@ EOF
 
 ---
 
+## Task 9: Fix exg-wal `recover_state` CRC-vs-torn-tail conflation (Eng-execution P1)
+
+**Discovered by:** Task 8's `boot_panics_on_corrupt_post_trade_wal` (the Stage 2 C10 observable-assertion discipline working as designed). Pre-existing (Stage 1b-era) `exg-wal` defect, but Stage 3 spec invariant #32 + the boot-panic test depend on the fail-fast guarantee it breaks.
+
+**The bug:** `crates/exg-wal/src/writer.rs::recover_state` (~line 193) has one match arm `Err(DecodeError::Incomplete | DecodeError::CrcMismatch { .. }) => if is_last_segment { return Ok(truncate) }`. `WalWriter::open` (exg-server lib.rs:223) runs BEFORE the strict `WalReader` replay (lib.rs:305). So a genuine CRC bit-flip on a flushed record in the **last/only** segment is conflated with a torn tail-write and silently truncated → replay sees 0 records → boot succeeds clean over confirmed on-disk corruption → silent total post-trade-history (balance/position) loss. "WAL is source of truth" violated; zero-silent-failures violated.
+
+**Files:**
+- Modify: `crates/exg-wal/src/writer.rs` (`recover_state`)
+
+- [ ] **Step 1: Failing exg-wal unit test (TDD red)**
+
+In the `exg-wal` test module (`grep -n "mod tests\|fn .*recover\|WalConfig\|WalWriter::open\|encode_record" crates/exg-wal/src/writer.rs crates/exg-wal/src/segment.rs` — match the crate's existing test helpers / record layout `[seq u64 LE][payload_len u32 LE][payload][crc32 u32 LE]`):
+
+```rust
+    #[test]
+    fn recover_state_crc_mismatch_in_last_segment_is_corrupt_not_truncated() {
+        // A fully-framed record whose CRC is wrong (bit-flip on a flushed
+        // record) in the ONLY segment must be confirmed data loss, NOT a
+        // silently-truncated "partial write". (Torn tail-writes manifest as
+        // Incomplete, tested separately below.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Write one valid record via the real writer, flush, then flip a
+        // byte inside its payload/crc region on disk.
+        // ... (use the crate's real WalWriter/WalConfig + the documented
+        // record layout to build/corrupt; mirror boot_panics_on_corrupt_wal_crc's
+        // "target a known fully-written record" discipline)
+        let segments = /* discover the single segment path(s) */;
+        let err = WalWriter::recover_state(&segments).unwrap_err();
+        assert!(
+            matches!(err, WalError::Corrupt { .. }),
+            "last/only-segment CRC mismatch must be WalError::Corrupt, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn recover_state_incomplete_trailing_record_in_last_segment_truncates() {
+        // A genuinely torn tail-write (stream ends mid-record → Incomplete)
+        // in the last segment is still safely truncated — legitimate WAL
+        // crash recovery; this behavior MUST be preserved.
+        // ... build a valid record then append a truncated (short) record;
+        let (next_seq, trunc) = WalWriter::recover_state(&segments).unwrap();
+        assert!(trunc.is_some(), "torn tail-write is truncated, not an error");
+    }
+```
+
+(`recover_state` is currently private `fn`; make it `pub(crate)` if the test is in a child module, or add the test in `writer.rs`'s own `#[cfg(test)] mod tests`. Match the crate's existing test conventions exactly. The first test is RED against current code — it currently returns `Ok(truncate)`.)
+
+- [ ] **Step 2: Split the match arm (green)**
+
+In `recover_state`, replace the single `Err(DecodeError::Incomplete | DecodeError::CrcMismatch { .. }) => { ... }` arm with TWO arms:
+
+```rust
+                    Err(DecodeError::Incomplete) => {
+                        if is_last_segment {
+                            // Genuine torn tail-write (append died before a
+                            // durable commit) — safe to truncate at offset.
+                            return Ok((next_sequence, Some((path.clone(), offset))));
+                        }
+                        // A short record with valid data after it = data loss.
+                        return Err(WalError::Corrupt {
+                            sequence: next_sequence,
+                            reason: format!(
+                                "incomplete record in non-trailing segment {}",
+                                path.display()
+                            ),
+                        });
+                    }
+                    Err(DecodeError::CrcMismatch { sequence }) => {
+                        // A fully-framed record whose CONTENT is corrupt is
+                        // confirmed data loss — NOT a torn tail-write — even
+                        // in the last/only segment. Fail-fast so the strict
+                        // boot replay never silently drops persisted history
+                        // (WAL is the source of truth; invariant 32).
+                        return Err(WalError::Corrupt {
+                            sequence,
+                            reason: format!(
+                                "CRC mismatch in segment {} (confirmed data loss)",
+                                path.display()
+                            ),
+                        });
+                    }
+```
+
+Update the `recover_state` doc-comment accordingly (the current comment "Only the LAST segment's trailing corrupt/incomplete records are truncated" is now wrong — only **Incomplete** trailing records in the last segment are truncated; **CrcMismatch** is always Corrupt).
+
+- [ ] **Step 3: Verify (regression-critical)**
+
+```bash
+docker compose up -d postgres; sleep 3
+cargo test -p exg-wal 2>&1 | grep "test result" | tail
+cargo check --workspace --all-targets 2>&1 | tail -3
+cargo clippy --workspace -- -D warnings 2>&1 | tail -3
+cargo fmt --check 2>&1 | tail -2
+DATABASE_URL=postgres://exg:exg_dev_password@localhost:5433/exg cargo test -p exg-server --test boot_panics --test stage1b_e2e --test stage0_e2e --test stage1a_e2e --test stage2_e2e --test stage3_e2e 2>&1 | grep -E "test result|FAILED" | tail
+```
+Expected: exg-wal green incl. the 2 new tests + ALL existing exg-wal tests (any existing test that wrote a CRC-mismatch in the last segment expecting truncation encoded the BUG — if one exists, revise its spec in a separate explicit commit per CLAUDE.md §7.1, do NOT weaken the new guarantee); `boot_panics_on_corrupt_post_trade_wal` now PASSES (boot-2 over single-segment CRC corruption returns Err); `boot_panics_on_corrupt_wal_crc` (3-segment non-last) still passes; stage1b_e2e 16 / stage0 7 / stage1a 12 / stage2 11 / stage3_e2e 5 all green; workspace/all-targets/clippy/fmt clean.
+
+- [ ] **Step 4: Commit + then land Task 8 deliverables**
+
+```bash
+git add crates/exg-wal/src/writer.rs
+git commit -m "$(cat <<'EOF'
+fix(wal): CRC mismatch in last/only segment is Corrupt, not truncated
+
+Eng-execution P1 (caught by Stage 3 boot_panics_on_corrupt_post_trade_wal).
+recover_state conflated DecodeError::Incomplete (legit torn tail-write,
+safe to truncate) with CrcMismatch (a fully-framed record whose content
+is corrupt = confirmed data loss). WalWriter::open runs before the strict
+replay, so a single-segment CRC bit-flip was silently truncated and the
+exchange booted clean over confirmed corruption — silent total post-trade
+history loss. Split the arm: Incomplete-in-last-segment still truncates;
+CrcMismatch is always WalError::Corrupt (fail-fast — WAL is source of
+truth; Stage 3 invariant 32). Pre-existing Stage-1b-era defect; Stage 3's
+spec'd boot-panic guarantee depends on it.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+Then the Task 8 deliverables (already in the working tree from the Task 8 attempt: `stage3_e2e.rs` new, `boot_panics.rs` +1, `scripts/demo-stage3.sh` new) now pass — run the full Task 8 Step 4 acceptance block + `bash scripts/demo-stage3.sh`, then commit them with the Task 8 commit message (style: cargo fmt commit first if `cargo fmt --check` flags anything).
+
+---
+
 ## Spec ↔ Plan Coverage Matrix
 
 | Spec section | Task |

@@ -422,6 +422,7 @@ contiguously in WAL order (one tick = rate + settlement; Invariant 33).
 | `verify_all_invariants()` fails live | fail-fast abort (this is a real corruption/bug, not a user condition — the capped-debit primitive guarantees it cannot fire from an underfunded user) |
 | replay `apply_event` ledger error | `ReplayError::Apply` → boot panic |
 | replay end `verify_all_invariants()` fails | boot panic |
+| corrupt (CRC-mismatch) record in the WAL, incl. the single/last segment | boot abort — `WalWriter::recover_state` returns `WalError::Corrupt` (Task 9 fix: CRC mismatch ≠ torn tail-write; never silently truncated). A genuine torn tail-write (`Incomplete`) in the last segment is still safely truncated (legitimate crash recovery). This is what makes invariant #32 / the boot-panic guarantee real for a single-segment WAL — "WAL is the source of truth" (Eng-execution P1, caught by `boot_panics_on_corrupt_post_trade_wal`). |
 | duplicate idempotency key (replay re-apply) | ledger no-op `Ok` (by design — Invariant 31) |
 
 ### 5.5 Replay flow (boot)
