@@ -71,4 +71,13 @@ pub enum Command {
         symbol: SymbolId,
         timestamp: UnixMicros,
     },
+    /// Stage 3: admin-injected balance credit (bootstraps wallets for
+    /// settlement; produced by the admin HTTP server). Clearing-domain —
+    /// the matching engine ignores it.
+    AdminCredit {
+        user_id: UserId,
+        amount: Decimal128,
+        idempotency_key: String,
+        timestamp: UnixMicros,
+    },
 }
