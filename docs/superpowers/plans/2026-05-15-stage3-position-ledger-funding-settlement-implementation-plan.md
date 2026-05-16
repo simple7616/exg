@@ -691,7 +691,13 @@ test first — see this task's test step):
         let moved: Decimal128;
         if signed.is_positive() {
             bal.available = bal.available + signed;
-            self.add_system_balance(WalletType::Funding, signed); // pool -= credit
+            // Eng review E1: double-entry — system delta = -(user delta).
+            // A credit to the user DECREASES the SYSTEM Funding pool.
+            // (Mirrors real settle_funding's user-receives branch, which
+            // passes a NEGATIVE payment to add_system_balance.) Using the
+            // wrong sign (+signed) makes user_total+system_total drift by
+            // 2*signed → verify_global_invariant fails → panic.
+            self.add_system_balance(WalletType::Funding, -signed);
             moved = signed;
             let id = self.next_id();
             self.append_journal(JournalEntry {
@@ -711,8 +717,14 @@ test first — see this task's test step):
             let owed = signed.abs();
             let cover = owed.min(bal.available);
             bal.available = bal.available - cover;
-            self.add_system_balance(WalletType::Funding, Decimal128::ZERO - cover);
-            moved = Decimal128::ZERO - cover;
+            // Eng review E1: system delta = -(user delta). The user PAYS
+            // `cover`, so the SYSTEM Funding pool RECEIVES it → +cover.
+            // (Mirrors real settle_funding's user-pays branch:
+            // add_system_balance(Funding, +payment).) `moved` is the
+            // SIGNED user delta (negative for a debit) — that is what the
+            // RealizedPnl/FundingSettled fact records.
+            self.add_system_balance(WalletType::Funding, cover);
+            moved = -cover;
             if cover.is_positive() {
                 let id = self.next_id();
                 self.append_journal(JournalEntry {
@@ -730,22 +742,104 @@ test first — see this task's test step):
                 });
             }
             // owed - cover = implicit bad debt: intentionally NOT journaled
-            // (keeps verify_global_invariant balanced; SYSTEM Funding pool
-            // absorbs it via the `add_system_balance(-cover)` asymmetry vs
-            // the winner's credit. Stage 4 adds explicit bad-debt accounting).
+            // and NOT added anywhere (keeps user_total+system_total
+            // unchanged → verify_global_invariant balanced). The shortfall
+            // surfaces because the winning side got a full credit
+            // (system -win) while this losing side only paid `cover`
+            // (system +cover), so the SYSTEM Funding pool nets negative by
+            // exactly the uncollected amount — which verify_all_invariants
+            // permits (Funding ∉ NON_NEGATIVE_SYSTEM_WALLETS). Stage 4 adds
+            // explicit bad-debt accounting.
         }
         Ok(moved)
     }
 ```
 
-Verify the exact `JournalEntry` field set, `BalanceField`, `JournalEntryType`
-variants, `add_system_balance` signature, and `SYSTEM_USER_ID` const against
-the real `operations.rs`/`journal.rs` (the snippet mirrors `settle_funding`'s
-journal shape — re-read `settle_funding` and match field names exactly;
-`add_system_balance(WalletType::Funding, x)` adds `x` to the pool — confirm
-sign direction in the real fn and adjust `Decimal128::ZERO - cover` if the
-pool convention is inverted). `Decimal128` negation: use the real
-`Neg`/`Sub` (grep `impl Neg`/`Sub for Decimal128`).
+Eng-review-verified against real source (do not re-derive): `JournalEntry`
+fields = `{id, debit_user, debit_wallet, debit_field, credit_user,
+credit_wallet, credit_field, amount, entry_type, idempotency_key,
+timestamp}`; `BalanceField::{Available,Frozen,Margin}`;
+`JournalEntryType::FundingPayment` (audit-only here — `verify_global_invariant`
+only sums `Deposit`/`Withdrawal`); `add_system_balance(w, amount)` does
+`system_accounts[w] += amount` (NOT inverted); `SYSTEM_USER_ID =
+UserId(0)` (private const, in-crate — usable); `Decimal128` has `impl
+Neg` (use `-x`) + `ONE`/`ZERO`. **Eng review E1 (sign, load-bearing):**
+SYSTEM Funding-pool delta MUST be `-(user available delta)` — credit
+user → `add_system_balance(Funding, -signed)`; debit user →
+`add_system_balance(Funding, +cover)`. Wrong sign drifts
+`user_total+system_total` by 2× → `verify_global_invariant` panic.
+
+- [ ] **Step 0b (Eng review E2): dedicated `settle_realized_pnl_capped` ledger unit tests**
+
+In the `crates/exg-ledger/src/operations.rs` test module (TDD: write
+these RED before Step 0's impl; reuse the file's `dec`/`ts`/`uid`/
+`setup_futures_user` helpers — `grep -n "fn dec\|fn ts\|fn uid\|fn setup_futures_user" crates/exg-ledger/src/operations.rs`):
+
+```rust
+    #[test]
+    fn srpc_profit_credits_user_debits_pool_invariants_hold() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        let moved = l.settle_realized_pnl_capped(uid(1), dec("500"), "k1", ts(1)).unwrap();
+        assert_eq!(moved, dec("500"));
+        assert_eq!(l.get_balance(uid(1), WalletType::Funding).unwrap().available, dec("500"));
+        // system Funding pool decreased by the credit (E1 sign).
+        assert_eq!(l.system_balance(WalletType::Funding), dec("-500"));
+        l.verify_all_invariants().unwrap(); // user_total+system_total == net_external (0)
+    }
+
+    #[test]
+    fn srpc_covered_loss_debits_user_credits_pool() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        l.settle_realized_pnl_capped(uid(1), dec("1000"), "fund", ts(1)).unwrap(); // fund first
+        let moved = l.settle_realized_pnl_capped(uid(1), dec("-300"), "k2", ts(2)).unwrap();
+        assert_eq!(moved, dec("-300"));
+        assert_eq!(l.get_balance(uid(1), WalletType::Funding).unwrap().available, dec("700"));
+        l.verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn srpc_underfunded_loss_caps_at_zero_pool_goes_negative_no_err() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        l.settle_realized_pnl_capped(uid(1), dec("100"), "fund", ts(1)).unwrap();
+        // owe 500, only 100 available → cover 100, user→0, never Err.
+        let moved = l.settle_realized_pnl_capped(uid(1), dec("-500"), "k3", ts(2)).unwrap();
+        assert_eq!(moved, dec("-100"));
+        assert_eq!(l.get_balance(uid(1), WalletType::Funding).unwrap().available, dec("0"));
+        // implicit bad debt: pool net negative by the uncollected amount.
+        // (pool: -100 from the fund credit, +100 from the covered debit = 0;
+        //  the bad debt surfaces vs a winner credit in a real trade — here
+        //  with no winner, assert the user is floored and invariants hold.)
+        l.verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn srpc_idempotent_on_key() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        l.settle_realized_pnl_capped(uid(1), dec("200"), "dup", ts(1)).unwrap();
+        let again = l.settle_realized_pnl_capped(uid(1), dec("200"), "dup", ts(2)).unwrap();
+        assert_eq!(again, dec("0"), "duplicate key is a no-op");
+        assert_eq!(l.get_balance(uid(1), WalletType::Funding).unwrap().available, dec("200"));
+        l.verify_all_invariants().unwrap();
+    }
+
+    #[test]
+    fn srpc_zero_is_noop() {
+        let mut l = Ledger::new();
+        l.get_or_create_account(uid(1));
+        assert_eq!(l.settle_realized_pnl_capped(uid(1), Decimal128::ZERO, "z", ts(1)).unwrap(), Decimal128::ZERO);
+        l.verify_all_invariants().unwrap();
+    }
+```
+
+Adjust `WalletType`/`get_balance`/`system_balance`/helper names to the
+real `operations.rs` test conventions (verified APIs:
+`system_balance(WalletType) -> Decimal128`,
+`get_balance(UserId, WalletType) -> Option<&WalletBalance>` with
+`.available`). These five are the direct E1 regression guard.
 ```
 
 Then thread PnL through `consume`. Replace the `consume` `OrderFilled` branch body with:
@@ -1953,7 +2047,7 @@ All spec sections covered.
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 1 | CLEAR (PLAN) | mode: HOLD_SCOPE, 1 CRITICAL + 3 medium/low, 0 critical gaps unresolved, all 4 applied (C1/C1b, C2, C3, C4) |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 | — | — |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 0 | — | — |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | CLEAR (PLAN) | FULL_REVIEW, 2 findings applied (E1 P1, E2 P2), 0 critical gaps, scope proceed-as-is |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | SKIPPED | no UI scope |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
@@ -1965,4 +2059,10 @@ All spec sections covered.
 
 Non-findings (verified): architecture brainstorm-locked + sound (same-thread, single-WAL, bounded contexts); DRY/TDD structure; `settle_funding` O(positions) negligible at single-symbol scale; rollback §8.5 symmetric with Stage 2; substrate reversible + Stage-4-reusable. Outside voice skipped (user, consistent with Stage 0-2). Section 11 Design SKIPPED (no UI).
 
-**UNRESOLVED:** 0. **VERDICT:** CEO CLEARED (HOLD_SCOPE) — proceed to `/plan-eng-review` (required gate; it will grep real call sites — `OrderFilled`/`TradeExecuted` field sets, `JournalEntry`/`BalanceField`/`add_system_balance` shapes for the new `settle_realized_pnl_capped`, `Decimal128` `ONE`/`Neg`, matching-thread `post_trade` move/borrow, e2e user-id resolution, boot_panics WAL-tamper — same rigor that caught Stage 2's cascade/P1) → subagent-driven execution with two-stage review per task → final cross-task review → PR → merge.
+**Eng Review findings (FULL_REVIEW, source-grounded, applied to plan + spec):**
+- **E1 [P1] (conf 9/10, applied)** — `settle_realized_pnl_capped`'s `add_system_balance` sign was inverted in BOTH branches (plan pseudocode). Verified vs real `add_system_balance` (`pool += amount`) + `verify_global_invariant` (`user_total+system_total == net_external`, only Deposit/Withdrawal feed net_external) + real `settle_funding`: rule is **system delta = −(user available delta)**. Wrong sign drifts the total by 2× → `verify_global_invariant` fails → `verify_all_invariants().expect()` panics the exchange on every profitable close / funding receipt / covered loss. Fixed plan Task 3 Step 0 (`-signed` credit / `+cover` debit, via `impl Neg`) + spec §4.5 sign rule + bad-debt comment.
+- **E2 [P2] (conf 8/10, applied)** — the new highest-risk primitive (E1 lived here) had no dedicated `exg-ledger`-level unit test (only indirect `post_trade` coverage). Added Task 3 Step 0b: 5 RED-first ledger unit tests (profit sign, covered-loss sign, underfunded cap-at-0, idempotent, zero no-op) — the direct E1 regression guard.
+
+Source-verified, no finding: `OrderFilled`/`TradeExecuted` fields exactly match plan assumptions; `JournalEntry`/`BalanceField`/`JournalEntryType`/`SYSTEM_USER_ID`/`Decimal128 ONE/Neg/ZERO` all confirmed; `verify_global_invariant` ignores FundingPayment (bad-debt-not-journaled is invariant-safe); matching-thread `post_trade` borrow-then-move is correct + noted; Stage 0 §9 drain preserved; append-at-end rkyv compat holds. Performance: O(open positions)/tick negligible at single-symbol scale. Outside voice skipped (user, consistent with Stage 0-2 + Stage 3 CEO). Step 0 complexity gate (14 files) → proceed-as-is (CEO HOLD_SCOPE already adjudicated; user declined SCOPE_REDUCTION).
+
+**UNRESOLVED:** 0. **VERDICT:** CEO + ENG CLEARED — both required gates passed, all findings applied. Plan + Spec CLEAR. Proceed to `superpowers:subagent-driven-development` execution of the 8 tasks (each TDD red-green-commit + two-stage review spec→quality) → final cross-task review → PR → merge.

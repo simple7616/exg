@@ -214,7 +214,14 @@ pub struct PostTradeProcessor {
     primitive caps-at-available: `withdraw`/`settle_funding` both error on
     insufficiency; `transfer` is same-user). It journals user↔`SYSTEM_USER_ID`
     `WalletType::Funding`, never drives the user `available` negative, and
-    never returns `InsufficientBalance`.
+    never returns `InsufficientBalance`. **Double-entry sign (Eng review
+    E1, verified vs real `settle_funding`):** the SYSTEM Funding-pool
+    delta MUST equal `-(user available delta)` — a user credit
+    *decreases* the pool, a user debit *increases* it. Getting this sign
+    wrong drifts `user_total + system_total` by 2× and fails
+    `verify_global_invariant`. The implicit bad debt is never added
+    anywhere; it surfaces only as the pool netting negative by the
+    uncollected amount (permitted — Funding ∉ `NON_NEGATIVE_SYSTEM_WALLETS`).
   - `MarkPriceUpdate { mark_price, .. }` → `self.mark_price = mark_price`
     (needed for funding notional). No money move.
   - `FundingRateUpdate { funding_rate, .. }` → **CEO review C3 guard:** if
