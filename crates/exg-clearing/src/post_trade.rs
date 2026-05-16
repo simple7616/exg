@@ -295,6 +295,111 @@ impl PostTradeProcessor {
         moved
     }
 
+    /// Replay path. Positions re-project from OrderFilled (pure additive,
+    /// no money). Money comes ONLY from recorded fact events, re-applied
+    /// with the SAME deterministic idempotency keys (ledger no-ops on a
+    /// duplicate key, so this is safe even if a prior partial run already
+    /// applied some). FundingRateUpdate is a settlement NO-OP on replay —
+    /// money state is reconstructed from recorded FundingSettled facts
+    /// (spec invariant 36 — the Stage 2 P1 regression guard).
+    pub fn apply_event(&mut self, e: &Event) -> exg_common::ExgResult<()> {
+        match e {
+            Event::OrderFilled {
+                user_id,
+                symbol,
+                side,
+                fill_qty,
+                fill_price,
+                ..
+            } => {
+                // Re-project position ONLY. Do NOT touch pnl_seq here.
+                // (T3 SHIPPED REALITY: live advances pnl_seq ONLY when a
+                // RealizedPnl event is actually emitted — `next_pnl_seq()`
+                // was removed; the uncoverable-loss case short-circuits
+                // with no seq/key/event. So on replay the seq advances
+                // ONLY in the RealizedPnl fact arm below, once per fact —
+                // mirroring live exactly. Discard the recomputed PnL.)
+                let _ =
+                    self.apply_fill_to_position(*user_id, *symbol, *side, *fill_qty, *fill_price);
+            }
+            Event::MarkPriceUpdate { mark_price, .. } => {
+                self.mark_price = *mark_price;
+            }
+            Event::FundingRateUpdate { .. } => {
+                // Settlement NO-OP on replay (invariant 36). Keep the
+                // period counter aligned so a post-replay live tick uses
+                // the next id.
+                self.funding_period_id += 1;
+            }
+            Event::AdminCredited {
+                user_id,
+                amount,
+                idempotency_key,
+                timestamp,
+            } => {
+                self.ledger.get_or_create_account(*user_id);
+                // Self-describing fact: re-apply with the exact recorded
+                // key; ledger no-ops a duplicate (idempotent).
+                let _ = self
+                    .ledger
+                    .deposit(*user_id, *amount, idempotency_key, *timestamp);
+            }
+            Event::RealizedPnl {
+                user_id,
+                symbol,
+                amount,
+                timestamp,
+            } => {
+                // CEO C1/C1b: `amount` is the ALREADY-MOVED (capped) signed
+                // value — re-apply it directly via the same capped
+                // primitive + same key. No re-cap (already capped live;
+                // the primitive is idempotent on the key anyway).
+                // T3 SHIPPED REALITY: live advances pnl_seq exactly once
+                // per EMITTED RealizedPnl (inside its `!moved.is_zero()`
+                // guard; `next_pnl_seq()` removed). Replay mirrors that:
+                // advance once per replayed RealizedPnl fact, here only.
+                self.pnl_seq += 1;
+                let seq = self.pnl_seq;
+                let key = format!("pnl_{seq}_{}_{}", user_id.value(), symbol.value());
+                self.ledger.get_or_create_account(*user_id);
+                let _ = self
+                    .ledger
+                    .settle_realized_pnl_capped(*user_id, *amount, &key, *timestamp);
+            }
+            Event::FundingSettled {
+                user_id,
+                symbol,
+                funding_period_id,
+                amount,
+                timestamp,
+            } => {
+                // T4 SHIPPED REALITY — sign bridge: `FundingSettled.amount`
+                // is in the funding convention (positive = user PAID), but
+                // `settle_realized_pnl_capped` uses the PnL convention
+                // (positive = CREDIT user). The live funding path passes
+                // `-payment` and records `fact_amount = -moved`. Replay must
+                // mirror EXACTLY: pass `-amount` so a user who paid is
+                // re-debited (not credited). Same key as live
+                // (funding_{period}_{user}_{symbol}); idempotent.
+                self.ledger.get_or_create_account(*user_id);
+                let key = format!(
+                    "funding_{}_{}_{}",
+                    funding_period_id,
+                    user_id.value(),
+                    symbol.value()
+                );
+                let _ = self
+                    .ledger
+                    .settle_realized_pnl_capped(*user_id, -*amount, &key, *timestamp);
+                if *funding_period_id > self.funding_period_id {
+                    self.funding_period_id = *funding_period_id;
+                }
+            }
+            _ => {} // engine-domain events ignored by post_trade
+        }
+        Ok(())
+    }
+
     /// Position-keeping: a fill in the position's direction (or no
     /// position) increases; an opposite fill reduces/closes (flipping if
     /// it exceeds current size). Returns the signed realized PnL produced
@@ -814,5 +919,229 @@ mod tests {
             .get_position(UserId::new(42), SymbolId::new(1))
             .unwrap();
         assert_eq!(pos.size, dec("2"), "TradeExecuted must not double-count");
+    }
+
+    // ---- Task 5: replay round-trip equivalence matrix (spec §7.2) ----
+
+    /// Assert live vs replayed PostTradeProcessor are byte-identical in
+    /// observable state: positions (size+entry+side per user/symbol),
+    /// every user Funding balance, system Funding pool, journal length.
+    fn assert_equivalent(live: &PostTradeProcessor, replayed: &PostTradeProcessor, users: &[u64]) {
+        for &u in users {
+            let lp = live
+                .positions()
+                .get_position(UserId::new(u), SymbolId::new(1));
+            let rp = replayed
+                .positions()
+                .get_position(UserId::new(u), SymbolId::new(1));
+            assert_eq!(
+                lp.map(|p| (p.size, p.entry_price, p.side)),
+                rp.map(|p| (p.size, p.entry_price, p.side)),
+                "position u{u}"
+            );
+            let lb = live
+                .ledger()
+                .get_balance(UserId::new(u), exg_ledger::WalletType::Funding)
+                .map(|b| b.available);
+            let rb = replayed
+                .ledger()
+                .get_balance(UserId::new(u), exg_ledger::WalletType::Funding)
+                .map(|b| b.available);
+            assert_eq!(lb, rb, "funding balance u{u}");
+        }
+        assert_eq!(
+            live.ledger()
+                .system_balance(exg_ledger::WalletType::Funding),
+            replayed
+                .ledger()
+                .system_balance(exg_ledger::WalletType::Funding),
+            "system Funding pool"
+        );
+        assert_eq!(
+            live.ledger().journal().len(),
+            replayed.ledger().journal().len(),
+            "journal len"
+        );
+    }
+
+    fn replay_all(events: &[Event]) -> PostTradeProcessor {
+        let mut pt = PostTradeProcessor::new();
+        for e in events {
+            pt.apply_event(e).expect("apply_event");
+        }
+        pt
+    }
+
+    /// Drive a live `consume` step and append the TRUE WAL slice it
+    /// produced: the engine input events first (these are the events the
+    /// matching engine itself appended to the WAL — `OrderFilled` /
+    /// `MarkPriceUpdate` / `FundingRateUpdate`), then the post-trade fact
+    /// events `consume` derived (`RealizedPnl` / `FundingSettled`), in
+    /// that order. `consume` returns ONLY the derived facts (shipped Task
+    /// 2 reality — it does NOT echo its inputs), so a test that collected
+    /// only its return value would feed replay an INCOMPLETE WAL missing
+    /// every `OrderFilled` → positions would never re-project. The replay
+    /// contract is: WAL = engine events ++ post-trade facts.
+    fn live_step(live: &mut PostTradeProcessor, input: &[Event], all: &mut Vec<Event>) {
+        let facts = live.consume(input, ts());
+        all.extend_from_slice(input);
+        all.extend(facts);
+    }
+
+    #[test]
+    fn rt_admin_credit_open_funding_tick() {
+        let mut live = PostTradeProcessor::new();
+        let mut all = Vec::new();
+        all.extend(live.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts()));
+        all.extend(live.handle_admin_credit(UserId::new(2), dec("100000"), "c2", ts()));
+        live_step(&mut live, &[filled(1, Side::Buy, "1", "60000")], &mut all);
+        live_step(&mut live, &[filled(2, Side::Sell, "1", "60000")], &mut all);
+        live_step(
+            &mut live,
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        live_step(
+            &mut live,
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        let replayed = replay_all(&all);
+        assert_equivalent(&live, &replayed, &[1, 2]);
+    }
+
+    #[test]
+    fn rt_partial_close_realized_pnl() {
+        let mut live = PostTradeProcessor::new();
+        let mut all = Vec::new();
+        all.extend(live.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts()));
+        live_step(&mut live, &[filled(1, Side::Buy, "3", "60000")], &mut all);
+        live_step(&mut live, &[filled(1, Side::Sell, "1", "61000")], &mut all); // +1000 realized
+        let replayed = replay_all(&all);
+        assert_equivalent(&live, &replayed, &[1]);
+    }
+
+    #[test]
+    fn rt_imbalanced_book_funding_net() {
+        let mut live = PostTradeProcessor::new();
+        let mut all = Vec::new();
+        all.extend(live.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts()));
+        live_step(&mut live, &[filled(1, Side::Buy, "2", "60000")], &mut all);
+        live_step(
+            &mut live,
+            &[Event::MarkPriceUpdate {
+                symbol: SymbolId::new(1),
+                mark_price: dec("60000"),
+                index_price: dec("60000"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        live_step(
+            &mut live,
+            &[Event::FundingRateUpdate {
+                symbol: SymbolId::new(1),
+                funding_rate: dec("0.01"),
+                timestamp: ts(),
+            }],
+            &mut all,
+        );
+        let replayed = replay_all(&all);
+        assert_equivalent(&live, &replayed, &[1]);
+    }
+
+    #[test]
+    fn rt_funding_rate_update_is_settlement_noop_on_replay() {
+        // Replaying ONLY a FundingRateUpdate (no recorded FundingSettled)
+        // must move NO funds — settlement state comes solely from facts.
+        let mut pt = PostTradeProcessor::new();
+        pt.handle_admin_credit(UserId::new(1), dec("100000"), "c1", ts());
+        pt.apply_event(&Event::OrderFilled {
+            order_id: exg_common::OrderId::new(1),
+            trade_id: exg_common::TradeId::new(1),
+            user_id: UserId::new(1),
+            symbol: SymbolId::new(1),
+            side: Side::Buy,
+            fill_price: dec("60000"),
+            fill_qty: dec("1"),
+            is_maker: false,
+            remaining_qty: Decimal128::ZERO,
+            timestamp: ts(),
+        })
+        .unwrap();
+        pt.apply_event(&Event::MarkPriceUpdate {
+            symbol: SymbolId::new(1),
+            mark_price: dec("60000"),
+            index_price: dec("60000"),
+            timestamp: ts(),
+        })
+        .unwrap();
+        let before = pt
+            .ledger()
+            .get_balance(UserId::new(1), exg_ledger::WalletType::Funding)
+            .unwrap()
+            .available;
+        pt.apply_event(&Event::FundingRateUpdate {
+            symbol: SymbolId::new(1),
+            funding_rate: dec("0.01"),
+            timestamp: ts(),
+        })
+        .unwrap();
+        let after = pt
+            .ledger()
+            .get_balance(UserId::new(1), exg_ledger::WalletType::Funding)
+            .unwrap()
+            .available;
+        assert_eq!(
+            before, after,
+            "FundingRateUpdate replay must not settle (invariant 36)"
+        );
+    }
+
+    // CEO review C1/C1b (spec §7.2 #5): underfunded loss replays
+    // equivalently. Live: fund small, open, close at a loss exceeding
+    // balance (capped at available). Reboot. Assert user available (==0),
+    // SYSTEM Funding pool, positions, journal length identical; the
+    // capped RealizedPnl.amount replays as a pure fact (no re-cap),
+    // verify_all_invariants holds.
+    #[test]
+    fn rt_underfunded_loss_equivalent() {
+        let mut live = PostTradeProcessor::new();
+        let mut all = Vec::new();
+        all.extend(live.handle_admin_credit(UserId::new(1), dec("100"), "c1", ts()));
+        live_step(&mut live, &[filled(1, Side::Buy, "1", "60000")], &mut all);
+        // close at 59000 → loss 1000 ≫ available 100 → capped to 100 moved
+        live_step(&mut live, &[filled(1, Side::Sell, "1", "59000")], &mut all);
+        let lb = live
+            .ledger()
+            .get_balance(UserId::new(1), exg_ledger::WalletType::Funding)
+            .unwrap()
+            .available;
+        assert_eq!(lb, dec("0"), "user floored at 0, never negative");
+        live.ledger().verify_all_invariants().unwrap();
+        let rp = all
+            .iter()
+            .find_map(|e| match e {
+                Event::RealizedPnl { amount, .. } => Some(*amount),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            rp,
+            dec("-100"),
+            "RealizedPnl records the MOVED (capped) amount"
+        );
+        let replayed = replay_all(&all);
+        assert_equivalent(&live, &replayed, &[1]);
+        replayed.ledger().verify_all_invariants().unwrap();
     }
 }
