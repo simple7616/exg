@@ -335,3 +335,92 @@ async fn boot_panics_on_placeholder_admin_secret() {
         "expected admin secret placeholder panic, got: {msg}"
     );
 }
+
+// ── Stage 3: post-trade WAL replay fail-fast ─────────────────────────────────
+
+/// Boot 1 produces a real Stage-3 WAL (an `AdminCredited` fact via the
+/// running admin server). After shutdown we byte-tamper the last segment.
+/// Boot 2 over the corrupted Stage-3 WAL must return `Err` — the post-trade
+/// replay path is fail-fast (no silent skip), same discipline as
+/// `boot_panics_on_corrupt_wal_crc`. Boot 1 needs a PG pool (the admin-credit
+/// path touches the DB), so this is an `#[sqlx::test]` reusing the e2e boot
+/// idiom — `exg-server` exposes no `test_pg_pool` helper.
+#[sqlx::test(migrations = "../../migrations")]
+async fn boot_panics_on_corrupt_post_trade_wal(pool: sqlx::PgPool) {
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let wal_dir = tmp.path().to_path_buf();
+
+    // Boot 1: produce a real WAL containing a post-trade fact event.
+    {
+        let cfg = base_cfg(tmp.path()); // boot_panics base_cfg: admin_secret = "a"*32
+        let handle = exg_server::run_with_config_with_pool(cfg, Some(pool.clone()))
+            .await
+            .expect("boot1");
+        let base = format!("http://127.0.0.1:{}", handle.bound_port);
+        let admin = format!("http://127.0.0.1:{}", handle.admin_bound_port);
+        let c = reqwest::Client::new();
+        // Wait for health on the main port, then admin-credit (produces an
+        // AdminCredited fact in the WAL).
+        for _ in 0..50 {
+            if c.get(format!("{base}/api/v1/health"))
+                .timeout(Duration::from_millis(100))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let r = c
+            .post(format!("{admin}/api/v1/admin/credit"))
+            .header("X-Admin-Secret", "a".repeat(32)) // == base_cfg admin_secret
+            .json(&serde_json::json!({"userId": 1, "amount": "1000"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200, "boot1 admin credit");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        handle.shutdown().await.unwrap();
+    }
+
+    // Corrupt the FIRST record's payload in the (single) WAL segment. Record
+    // layout (crates/exg-wal/src/segment.rs): [seq u64 LE (8)][payload_len u32
+    // LE (4)][payload N][crc u32 LE (4)]. Flipping a payload byte of a fully
+    // flushed record keeps the record length intact, so the reader decodes a
+    // *complete* record and recomputes a mismatching CRC → WalError::Corrupt
+    // (fatal) rather than treating it as a partial-write tail (Incomplete →
+    // silent truncation). Same discipline as boot_panics_on_corrupt_wal_crc:
+    // target a known record, not the unflushed file tail.
+    let mut seg: Option<std::path::PathBuf> = None;
+    for e in std::fs::read_dir(&wal_dir).unwrap() {
+        let p = e.unwrap().path();
+        if p.extension().map(|x| x == "log").unwrap_or(false) {
+            seg = Some(p);
+        }
+    }
+    let seg = seg.expect("a WAL segment exists");
+    let mut bytes = std::fs::read(&seg).unwrap();
+    assert!(bytes.len() > 40, "segment has records");
+    let payload_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    assert!(
+        payload_len > 0 && 12 + payload_len + 4 <= bytes.len(),
+        "first record is complete (payload_len={payload_len}, file={})",
+        bytes.len()
+    );
+    let i = 12 + payload_len / 2; // squarely inside the first record's payload
+    bytes[i] ^= 0xFF;
+    std::fs::write(&seg, &bytes).unwrap();
+
+    // Boot 2 must return Err (fail-fast — corrupt WAL never silently
+    // continues; same discipline as boot_panics_on_corrupt_wal_crc).
+    let cfg2 = base_cfg(tmp.path());
+    let result = exg_server::run_with_config_with_pool(cfg2, Some(pool)).await;
+    assert!(
+        result.is_err(),
+        "corrupted Stage-3 WAL must fail boot, got Ok"
+    );
+}
